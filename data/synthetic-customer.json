@@ -1,0 +1,8 @@
+{
+  "record_type": "synthetic_customer_fixture",
+  "customer_id": "qa-customer-0001",
+  "name": "Example QA Customer",
+  "email": "qa-customer-0001@example.invalid",
+  "plan": "sandbox",
+  "is_real_person": false
+}

@@ -1,0 +1,101 @@
+name: Agent QA CI and deploy
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-ci:
+    name: PR CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run service tests
+        run: python -m unittest discover -s tests -v
+      - name: Build container image
+        run: docker build --build-arg GIT_SHA=${GITHUB_SHA} -t agent-qa:${GITHUB_SHA} .
+
+  publish-image:
+    name: Build and publish image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: pr-ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+      sha: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish commit image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: GIT_SHA=${{ github.sha }}
+          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+
+  deploy-agent-qa:
+    name: Deploy isolated agent-qa service
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AGENT_QA_DEPLOY_ENABLED == 'true'
+    needs: publish-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check deployment secrets
+        env:
+          NETCUP_HOST: ${{ secrets.NETCUP_HOST }}
+          NETCUP_USER: ${{ secrets.NETCUP_USER }}
+          NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
+          NETCUP_KNOWN_HOSTS: ${{ secrets.NETCUP_KNOWN_HOSTS }}
+        run: |
+          for name in NETCUP_HOST NETCUP_USER NETCUP_SSH_KEY NETCUP_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then echo "Missing required secret: $name" >&2; exit 1; fi
+          done
+      - name: Save commit image
+        env:
+          IMAGE: ${{ needs.publish-image.outputs.image }}
+          SHA: ${{ needs.publish-image.outputs.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$IMAGE:$SHA"
+          docker save "$IMAGE:$SHA" -o "$RUNNER_TEMP/agent-qa-$SHA.tar"
+      - name: Configure pinned SSH host key
+        env:
+          NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
+          NETCUP_KNOWN_HOSTS: ${{ secrets.NETCUP_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$NETCUP_SSH_KEY" > "$HOME/.ssh/agent-qa-deploy"
+          printf '%s\n' "$NETCUP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/agent-qa-deploy" "$HOME/.ssh/known_hosts"
+      - name: Transfer image and deploy
+        env:
+          NETCUP_HOST: ${{ secrets.NETCUP_HOST }}
+          NETCUP_USER: ${{ secrets.NETCUP_USER }}
+          SHA: ${{ needs.publish-image.outputs.sha }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$NETCUP_USER@$NETCUP_HOST" "mkdir -p \"\$HOME/agent-qa/releases/$SHA\""
+          scp -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$RUNNER_TEMP/agent-qa-$SHA.tar" "$NETCUP_USER@$NETCUP_HOST:agent-qa/releases/$SHA/image.tar"
+          scp -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" docker-compose.yml scripts/deploy-agent-qa.sh "$NETCUP_USER@$NETCUP_HOST:agent-qa/"
+          ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$NETCUP_USER@$NETCUP_HOST" \
+            "cd agent-qa && docker load -i releases/$SHA/image.tar && chmod +x deploy-agent-qa.sh && ./deploy-agent-qa.sh deploy $SHA"
