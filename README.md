@@ -14,7 +14,7 @@ curl http://127.0.0.1:8080/ready
 
 ## Deployment boundary
 
-The deployment workflow publishes a commit-tagged image to GHCR on pushes to `main`. It deploys only after `AGENT_QA_DEPLOY_ENABLED=true` is set as a repository variable and the Netcup secrets are configured. The workflow transfers the built image to a separately named `agent-qa` service; the Netcup host does not need a GHCR pull credential. The deployment script keeps the last deployed SHA and supports rollback to a previously loaded image.
+Pushes to `main` run CI and publish a commit-tagged image to GHCR. Deployment runs only from a trusted Task Manager `workflow_dispatch` carrying the verified run UUID, PR head SHA, and merge SHA, and only after `AGENT_QA_DEPLOY_ENABLED=true` is set. The action streams the image over a restricted SSH account; the host does not need a GHCR pull credential. The `agent-qa` Compose project keeps previous images loaded and supports rollback by SHA.
 
 Required repository secrets and variables are documented in [docs/deployment.md](docs/deployment.md). No production customer database, token, or container is used by this project.
 

@@ -5,6 +5,30 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Deploy a verified QA run or roll back the QA service
+        default: deploy
+        options: [deploy, rollback]
+        required: true
+        type: choice
+      agent_run_id:
+        description: Task Manager agent run UUID
+        required: false
+        type: string
+      expected_sha:
+        description: Exact PR head SHA already verified by Task Manager
+        required: false
+        type: string
+      merge_sha:
+        description: Exact merged commit SHA to build and deploy
+        required: false
+        type: string
+      rollback_sha:
+        description: Previously loaded image SHA to restore when mode is rollback
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -12,9 +36,12 @@ permissions:
 jobs:
   pr-ci:
     name: PR CI
+    if: github.event_name != 'workflow_dispatch' || inputs.mode == 'deploy'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.merge_sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -25,20 +52,60 @@ jobs:
 
   publish-image:
     name: Build and publish image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.mode == 'deploy')
     needs: pr-ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      pull-requests: read
       packages: write
     outputs:
       image: ${{ steps.image.outputs.name }}
-      sha: ${{ github.sha }}
+      sha: ${{ steps.image.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
       - name: Set image name
         id: image
-        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_MERGE_SHA: ${{ inputs.merge_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          SHA="$GITHUB_SHA"
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$INPUT_MERGE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "merge_sha must be a full 40-character SHA" >&2; exit 1; }
+            SHA="$INPUT_MERGE_SHA"
+          fi
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Check out exact merge commit
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.merge_sha }}
+          path: source
+      - name: Validate Task Manager dispatch against merged PR
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_RUN_ID: ${{ inputs.agent_run_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          MERGE_SHA: ${{ inputs.merge_sha }}
+        run: |
+          [[ "$AGENT_RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "agent_run_id must be a UUID" >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$MERGE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "Both dispatch SHAs must be full commit SHAs" >&2; exit 1; }
+          [[ "$MERGE_SHA" == "$GITHUB_SHA" ]] || { echo "Refusing stale dispatch: merge_sha is not the dispatched main SHA" >&2; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/commits/$MERGE_SHA/pulls" > "$RUNNER_TEMP/associated-pulls.json"
+          python3 - "$RUNNER_TEMP/associated-pulls.json" "$EXPECTED_SHA" "$MERGE_SHA" <<'PY'
+          import json, sys
+          pull_requests = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected_head, expected_merge = sys.argv[2:]
+          matches = [pr for pr in pull_requests if pr.get("base", {}).get("ref") == "main"
+                     and pr.get("state") == "closed" and pr.get("merged_at")
+                     and pr.get("head", {}).get("sha") == expected_head
+                     and pr.get("merge_commit_sha") == expected_merge]
+          if not matches:
+              raise SystemExit("No merged main PR matches agent_run_id inputs and exact head/merge SHAs")
+          PY
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -48,14 +115,14 @@ jobs:
       - name: Build and publish commit image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ github.event_name == 'workflow_dispatch' && 'source' || '.' }}
           push: true
-          build-args: GIT_SHA=${{ github.sha }}
-          tags: ${{ steps.image.outputs.name }}:${{ github.sha }}
+          build-args: GIT_SHA=${{ steps.image.outputs.sha }}
+          tags: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.sha }}
 
   deploy-agent-qa:
     name: Deploy isolated agent-qa service
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AGENT_QA_DEPLOY_ENABLED == 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'deploy' && vars.AGENT_QA_DEPLOY_ENABLED == 'true'
     needs: publish-image
     runs-on: ubuntu-latest
     steps:
@@ -66,11 +133,14 @@ jobs:
           NETCUP_USER: ${{ secrets.NETCUP_USER }}
           NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
           NETCUP_KNOWN_HOSTS: ${{ secrets.NETCUP_KNOWN_HOSTS }}
+          AGENT_QA_CALLBACK_TOKEN: ${{ secrets.AGENT_QA_CALLBACK_TOKEN }}
+          AGENT_QA_CALLBACK_BASE_URL: ${{ vars.AGENT_QA_CALLBACK_BASE_URL }}
         run: |
-          for name in NETCUP_HOST NETCUP_USER NETCUP_SSH_KEY NETCUP_KNOWN_HOSTS; do
+          for name in NETCUP_HOST NETCUP_USER NETCUP_SSH_KEY NETCUP_KNOWN_HOSTS AGENT_QA_CALLBACK_TOKEN AGENT_QA_CALLBACK_BASE_URL; do
             if [[ -z "${!name}" ]]; then echo "Missing required secret: $name" >&2; exit 1; fi
           done
-      - name: Save commit image
+          [[ "$NETCUP_USER" == agentqa ]] || { echo "NETCUP_USER must be the restricted agentqa account" >&2; exit 1; }
+      - name: Pull exact commit image on runner
         env:
           IMAGE: ${{ needs.publish-image.outputs.image }}
           SHA: ${{ needs.publish-image.outputs.sha }}
@@ -78,7 +148,6 @@ jobs:
         run: |
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker pull "$IMAGE:$SHA"
-          docker save "$IMAGE:$SHA" -o "$RUNNER_TEMP/agent-qa-$SHA.tar"
       - name: Configure pinned SSH host key
         env:
           NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
@@ -89,13 +158,73 @@ jobs:
           printf '%s\n' "$NETCUP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/agent-qa-deploy" "$HOME/.ssh/known_hosts"
       - name: Transfer image and deploy
+        id: deploy
         env:
           NETCUP_HOST: ${{ secrets.NETCUP_HOST }}
           NETCUP_USER: ${{ secrets.NETCUP_USER }}
+          IMAGE: ${{ needs.publish-image.outputs.image }}
           SHA: ${{ needs.publish-image.outputs.sha }}
         run: |
-          ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$NETCUP_USER@$NETCUP_HOST" "mkdir -p \"\$HOME/agent-qa/releases/$SHA\""
-          scp -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$RUNNER_TEMP/agent-qa-$SHA.tar" "$NETCUP_USER@$NETCUP_HOST:agent-qa/releases/$SHA/image.tar"
-          scp -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" docker-compose.yml scripts/deploy-agent-qa.sh "$NETCUP_USER@$NETCUP_HOST:agent-qa/"
-          ssh -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$NETCUP_USER@$NETCUP_HOST" \
-            "cd agent-qa && docker load -i releases/$SHA/image.tar && chmod +x deploy-agent-qa.sh && ./deploy-agent-qa.sh deploy $SHA"
+          [[ "$SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "Deploy SHA must be a full commit SHA" >&2; exit 1; }
+          output="$(docker save "$IMAGE:$SHA" | ssh -T -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" "$NETCUP_USER@$NETCUP_HOST" "deploy $SHA")"
+          printf '%s\n' "$output" | sed '/^AGENT_QA_READY=/d'
+          ready_json="$(printf '%s\n' "$output" | sed -n 's/^AGENT_QA_READY=//p' | tail -n 1)"
+          [[ -n "$ready_json" ]] || { echo "Host did not return its /ready response" >&2; exit 1; }
+          ready_sha="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["git_sha"])' "$ready_json")"
+          [[ "$ready_sha" == "$SHA" ]] || { echo "Host /ready returned unexpected SHA: $ready_sha" >&2; exit 1; }
+          echo "ready_sha=$ready_sha" >> "$GITHUB_OUTPUT"
+      - name: Report ready deploy to Task Manager
+        env:
+          CALLBACK_BASE_URL: ${{ vars.AGENT_QA_CALLBACK_BASE_URL }}
+          CALLBACK_TOKEN: ${{ secrets.AGENT_QA_CALLBACK_TOKEN }}
+          AGENT_RUN_ID: ${{ inputs.agent_run_id }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          MERGE_SHA: ${{ needs.publish-image.outputs.sha }}
+          READY_SHA: ${{ steps.deploy.outputs.ready_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [[ -n "$AGENT_RUN_ID" ]] || { echo "Task Manager agent_run_id is missing" >&2; exit 1; }
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$MERGE_SHA" =~ ^[a-f0-9]{40}$ && "$READY_SHA" == "$MERGE_SHA" ]] || {
+            echo "Callback SHA verification failed" >&2; exit 1;
+          }
+          body="$(python3 -c 'import json,os; print(json.dumps({"sha":os.environ["MERGE_SHA"],"github_run_url":os.environ["RUN_URL"],"ready_url":"http://127.0.0.1:18082/ready","ready_status":"ready","ready_sha":os.environ["READY_SHA"]}))')"
+          curl --fail --silent --show-error \
+            -H "X-Agent-QA-Callback-Token: $CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "$CALLBACK_BASE_URL/agent-runs/$AGENT_RUN_ID/qa-deployed"
+
+  rollback-agent-qa:
+    name: Roll back isolated agent-qa service
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'rollback' && vars.AGENT_QA_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check rollback secrets
+        env:
+          NETCUP_HOST: ${{ secrets.NETCUP_HOST }}
+          NETCUP_USER: ${{ secrets.NETCUP_USER }}
+          NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
+          NETCUP_KNOWN_HOSTS: ${{ secrets.NETCUP_KNOWN_HOSTS }}
+        run: |
+          for name in NETCUP_HOST NETCUP_USER NETCUP_SSH_KEY NETCUP_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then echo "Missing required secret: $name" >&2; exit 1; fi
+          done
+          [[ "$NETCUP_USER" == agentqa ]] || { echo "NETCUP_USER must be the restricted agentqa account" >&2; exit 1; }
+      - name: Configure pinned SSH host key
+        env:
+          NETCUP_SSH_KEY: ${{ secrets.NETCUP_SSH_KEY }}
+          NETCUP_KNOWN_HOSTS: ${{ secrets.NETCUP_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$NETCUP_SSH_KEY" > "$HOME/.ssh/agent-qa-deploy"
+          printf '%s\n' "$NETCUP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/agent-qa-deploy" "$HOME/.ssh/known_hosts"
+      - name: Roll back to loaded image
+        env:
+          NETCUP_HOST: ${{ secrets.NETCUP_HOST }}
+          NETCUP_USER: ${{ secrets.NETCUP_USER }}
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          [[ "$ROLLBACK_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "Rollback SHA must be a full 40-character SHA" >&2; exit 1; }
+          ssh -T -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -i "$HOME/.ssh/agent-qa-deploy" \
+            "$NETCUP_USER@$NETCUP_HOST" "rollback $ROLLBACK_SHA"

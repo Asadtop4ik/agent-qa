@@ -3,9 +3,18 @@ services:
     image: ${AGENT_QA_IMAGE:?Set AGENT_QA_IMAGE to the loaded commit image}
     pull_policy: never
     container_name: agent-qa
+    user: "10001:10001"
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=4m
     ports:
-      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18082:8080"
     environment:
       AGENT_QA_GIT_SHA: ${AGENT_QA_SHA:?Set AGENT_QA_SHA to the deployed git SHA}
     healthcheck:

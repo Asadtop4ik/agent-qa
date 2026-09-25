@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 .current_sha
 .previous_sha
+.secrets/
