@@ -44,9 +44,8 @@ case "$action" in
     [[ "$sha" =~ ^[a-f0-9]{40}$ ]] || { echo "Deploy requires a full 40-character SHA" >&2; exit 2; }
     archive="$(mktemp "$APP_DIR/.image.XXXXXXXX.tar")"
     trap 'rm -f "$archive"' EXIT
-    cat > "$archive"
-    size="$(stat -c '%s' "$archive")"
-    (( size <= 209715200 )) || { echo "Image archive exceeds 200 MiB" >&2; exit 1; }
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    python3 "$script_dir/receive_limited_archive.py" "$archive" 209715200
 python3 - "$archive" "$(image_for "$sha")" <<'PY'
 import json
 import sys

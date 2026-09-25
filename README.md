@@ -14,7 +14,7 @@ curl http://127.0.0.1:8080/ready
 
 ## Deployment boundary
 
-Pushes to `main` run CI and publish a commit-tagged image to GHCR. Deployment runs only from a trusted Task Manager `workflow_dispatch` carrying the verified run UUID, PR head SHA, and merge SHA, and only after `AGENT_QA_DEPLOY_ENABLED=true` is set. The action streams the image over a restricted SSH account; the host does not need a GHCR pull credential. The `agent-qa` Compose project keeps previous images loaded and supports rollback by SHA.
+Pushes to `main` run CI and publish a commit-tagged image to GHCR. A deploy `workflow_dispatch` must first be authorized by Task Manager using the QA-only callback token, exact run UUID, completed merge action UUID, PR head SHA, and merge SHA; the workflow checks this before checkout or build. Deployment also requires `AGENT_QA_DEPLOY_ENABLED=true`. The action streams the image over a restricted SSH account with a 200 MiB receive limit; the host does not need a GHCR pull credential. The `agent-qa` Compose project keeps previous images loaded and supports rollback by SHA.
 
 Required repository secrets and variables are documented in [docs/deployment.md](docs/deployment.md). No production customer database, token, or container is used by this project.
 
