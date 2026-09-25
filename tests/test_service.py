@@ -20,7 +20,9 @@ class ServiceTests(unittest.TestCase):
             "APP_PORT": str(cls.port),
         }
         cls.process = subprocess.Popen(
-            [sys.executable, "app.py"], env=env, stdout=subprocess.DEVNULL,
+            [sys.executable, "app.py"],
+            env=env,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         cls.base = f"http://127.0.0.1:{cls.port}"
@@ -42,7 +44,9 @@ class ServiceTests(unittest.TestCase):
     def test_ready_returns_built_sha(self):
         with urlopen(self.base + "/ready", timeout=2) as response:
             self.assertEqual(response.status, 200)
-            self.assertEqual(json.load(response), {"status": "ready", "git_sha": "test-sha-123"})
+            self.assertEqual(
+                json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
+            )
 
     def test_fixture_is_synthetic(self):
         with urlopen(self.base + "/fixture", timeout=2) as response:
