@@ -5,6 +5,7 @@ import sys
 import time
 import unittest
 import socket
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -54,6 +55,20 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fixture["record_type"], "synthetic_customer_fixture")
         self.assertEqual(fixture["email"], "qa-customer-0001@example.invalid")
         self.assertFalse(fixture["is_real_person"])
+
+    def test_fixture_matches_synthetic_customer_file(self):
+        fixture_path = (
+            Path(__file__).resolve().parents[1] / "data" / "synthetic-customer.json"
+        )
+        with fixture_path.open(encoding="utf-8") as fixture_file:
+            expected_fixture = json.load(fixture_file)
+
+        with urlopen(self.base + "/fixture", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            fixture = json.load(response)
+
+        self.assertEqual(fixture, expected_fixture)
+        self.assertEqual(fixture["record_type"], "synthetic_customer_fixture")
 
     def test_unknown_route_is_not_found(self):
         with self.assertRaises(HTTPError) as error:
