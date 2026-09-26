@@ -40,6 +40,7 @@ permissions:
 concurrency:
   group: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'deploy' || inputs.mode == 'rollback') && 'agent-qa-service-mutation' || format('agent-qa-ci-{0}', github.run_id) }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   authorize-task-manager-deploy:
