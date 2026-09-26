@@ -37,6 +37,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && (inputs.mode == 'deploy' || inputs.mode == 'rollback') && 'agent-qa-service-mutation' || format('agent-qa-ci-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 jobs:
   authorize-task-manager-deploy:
     name: Authorize Task Manager QA deployment
@@ -192,6 +196,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+    outputs:
+      failure_code: ${{ steps.failure_summary.outputs.failure_code }}
     steps:
       - uses: actions/checkout@v4
       - name: Check deployment secrets
@@ -270,8 +276,38 @@ jobs:
             -H "Content-Type: application/json" \
             --data "$body" \
             "$CALLBACK_BASE_URL/agent-runs/$AGENT_RUN_ID/qa-deployed"
-      - name: Report safe deployment failure to Task Manager
-        if: ${{ failure() }}
+      - name: Classify deployment failure
+        if: ${{ always() }}
+        id: failure_summary
+        env:
+          IMAGE_PULL_OUTCOME: ${{ steps.pull.outcome }}
+          TRANSFER_OUTCOME: ${{ steps.transfer.outcome }}
+          READINESS_OUTCOME: ${{ steps.readiness.outcome }}
+        run: |
+          failure_code=deploy_failed
+          if [[ "$IMAGE_PULL_OUTCOME" == failure ]]; then
+            failure_code=image_pull_failed
+          elif [[ "$READINESS_OUTCOME" == failure ]]; then
+            failure_code=readiness_failed
+          elif [[ "$TRANSFER_OUTCOME" != failure ]]; then
+            failure_code=
+          fi
+          echo "failure_code=$failure_code" >> "$GITHUB_OUTPUT"
+
+  report-agent-qa-deploy-failure:
+    name: Report authorized QA pipeline failure
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.mode == 'deploy' &&
+      needs.authorize-task-manager-deploy.result == 'success' &&
+      (needs.pr-ci.result == 'failure' || needs.publish-image.result == 'failure' || needs.deploy-agent-qa.result == 'failure')
+    needs: [authorize-task-manager-deploy, pr-ci, publish-image, deploy-agent-qa]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Report fixed failure status to Task Manager
         env:
           CALLBACK_BASE_URL: ${{ vars.AGENT_QA_CALLBACK_BASE_URL }}
           CALLBACK_TOKEN: ${{ secrets.AGENT_QA_CALLBACK_TOKEN }}
@@ -280,19 +316,16 @@ jobs:
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           MERGE_SHA: ${{ inputs.merge_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          IMAGE_PULL_OUTCOME: ${{ steps.pull.outcome }}
-          TRANSFER_OUTCOME: ${{ steps.transfer.outcome }}
-          READINESS_OUTCOME: ${{ steps.readiness.outcome }}
+          DEPLOY_RESULT: ${{ needs.deploy-agent-qa.result }}
+          DEPLOY_FAILURE_CODE: ${{ needs.deploy-agent-qa.outputs.failure_code }}
         run: |
           [[ -n "$CALLBACK_TOKEN" && -n "$CALLBACK_BASE_URL" ]] || { echo "QA failure callback is not configured" >&2; exit 1; }
           [[ "$AGENT_RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "Missing valid Task Manager run UUID" >&2; exit 1; }
           [[ "$ACTION_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "Missing valid Task Manager action UUID" >&2; exit 1; }
           [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$MERGE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "Missing exact Task Manager SHA inputs" >&2; exit 1; }
           failure_code=deploy_failed
-          if [[ "$IMAGE_PULL_OUTCOME" == failure ]]; then
-            failure_code=image_pull_failed
-          elif [[ "$READINESS_OUTCOME" == failure ]]; then
-            failure_code=readiness_failed
+          if [[ "$DEPLOY_RESULT" == failure && "$DEPLOY_FAILURE_CODE" =~ ^(image_pull_failed|deploy_failed|readiness_failed)$ ]]; then
+            failure_code="$DEPLOY_FAILURE_CODE"
           fi
           body="$(FAILURE_CODE="$failure_code" python3 -c 'import json,os; print(json.dumps({"action_id":os.environ["ACTION_ID"],"expected_head_sha":os.environ["EXPECTED_SHA"],"merge_sha":os.environ["MERGE_SHA"],"github_run_url":os.environ["RUN_URL"],"failure_code":os.environ["FAILURE_CODE"]}))')"
           if ! curl --fail --silent --show-error -o /dev/null \
