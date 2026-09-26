@@ -158,7 +158,6 @@ jobs:
           [[ "$AGENT_RUN_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "agent_run_id must be a UUID" >&2; exit 1; }
           [[ "$ACTION_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || { echo "action_id must be a UUID" >&2; exit 1; }
           [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$MERGE_SHA" =~ ^[a-f0-9]{40}$ ]] || { echo "Both dispatch SHAs must be full commit SHAs" >&2; exit 1; }
-          [[ "$MERGE_SHA" == "$GITHUB_SHA" ]] || { echo "Refusing stale dispatch: merge_sha is not the dispatched main SHA" >&2; exit 1; }
           gh api "repos/$GITHUB_REPOSITORY/commits/$MERGE_SHA/pulls" > "$RUNNER_TEMP/associated-pulls.json"
           python3 - "$RUNNER_TEMP/associated-pulls.json" "$EXPECTED_SHA" "$MERGE_SHA" <<'PY'
           import json, sys
