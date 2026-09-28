@@ -21,3 +21,7 @@ Required repository secrets and variables are documented in [docs/deployment.md]
 ## Cross-private checkout credential
 
 Task Manager Actions need a repository-scoped token to read this private repository. Follow [docs/credentials.md](docs/credentials.md) and run `scripts/setup-task-manager-secret.sh <task-manager-owner/repository>`. The script prompts for the fine-grained token without echoing it and writes it to the named repository's `AGENT_QA_READ_TOKEN` Actions secret. It never reads or copies local `gh` authentication credentials.
+
+## agent-svc sinovi
+
+2026-09-28
