@@ -144,7 +144,11 @@ def about(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return the service name and build revision."""
-    return 200, {"service": "agent-qa", "git_sha": GIT_SHA}, {}
+    return (
+        200,
+        {"service": "agent-qa", "git_sha": GIT_SHA, "environment": "qa"},
+        {"X-Service": "agent-qa"},
+    )
 
 
 def openapi(
