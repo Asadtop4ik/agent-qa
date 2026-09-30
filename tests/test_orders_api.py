@@ -108,6 +108,24 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["customer_id"], customer_id)
         self.assertEqual(body["status"], "new")
         self.assertTrue(body["created_at"].endswith("Z"))
+        self.assertEqual(body["items"], [])
+        return body
+
+    def create_product(self, *, stock=10, active=True, price_cents=123, name="Widget"):
+        sku = "Q" + uuid.uuid4().hex[:10].upper()
+        status, _, body = self.request(
+            "POST",
+            "/products",
+            {
+                "sku": sku,
+                "name": name,
+                "category": "tools",
+                "price_cents": price_cents,
+                "stock": stock,
+                "active": active,
+            },
+        )
+        self.assertEqual(status, 201)
         return body
 
     def assert_error(self, response, status, code):
@@ -175,6 +193,33 @@ class OrdersApiTests(unittest.TestCase):
                     [item["field"] for item in error["details"]],
                     sorted(item["field"] for item in error["details"]),
                 )
+
+        missing_choice = self.assert_error(
+            self.request("POST", "/orders", {"customer_id": customer}),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            missing_choice["details"],
+            [{"field": "items", "message": "Either items or total_cents is required"}],
+        )
+        combined_choice = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": customer,
+                    "items": [{"product_id": 1, "quantity": 1}],
+                    "total_cents": 1,
+                },
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            combined_choice["details"],
+            [{"field": "items", "message": "Cannot be combined with total_cents"}],
+        )
 
         status, _, body = self.request("POST", "/orders", raw_body=b"not json")
         self.assert_error((status, _, body), 400, "invalid_json")
@@ -255,6 +300,135 @@ class OrdersApiTests(unittest.TestCase):
             self.request("PATCH", f"/orders/{fresh['id']}", {}),
             400,
             "validation_error",
+        )
+
+    def test_item_order_errors_and_snapshot_response(self):
+        customer = self.customer_id()
+        product = self.create_product(name="Before", price_cents=123, stock=10)
+        payload = {
+            "customer_id": customer,
+            "items": [{"product_id": product["id"], "quantity": 2}],
+        }
+        status, _, order = self.request("POST", "/orders", payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(order["total_cents"], 246)
+        self.assertEqual(
+            order["items"],
+            [
+                {
+                    "product_id": product["id"],
+                    "sku": product["sku"],
+                    "name": "Before",
+                    "quantity": 2,
+                    "unit_price_cents": 123,
+                    "line_total_cents": 246,
+                }
+            ],
+        )
+        status, _, updated_product = self.request(
+            "PATCH",
+            f"/products/{product['id']}",
+            {"name": "After", "price_cents": 999},
+        )
+        self.assertEqual(status, 200)
+        status, _, fetched = self.request("GET", f"/orders/{order['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["items"][0]["name"], "Before")
+        self.assertEqual(fetched["items"][0]["unit_price_cents"], 123)
+        self.assertEqual(updated_product["stock"], 8)
+        computed_total = self.assert_error(
+            self.request("PATCH", f"/orders/{order['id']}", {"total_cents": 10}),
+            409,
+            "total_computed",
+        )
+        self.assertEqual(computed_total["code"], "total_computed")
+        status, _, cancelled = self.request(
+            "PATCH", f"/orders/{order['id']}", {"status": "cancelled"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(cancelled["status"], "cancelled")
+        status, _, restored = self.request("GET", f"/products/{product['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(restored["stock"], 10)
+        status, _, body = self.request("DELETE", f"/orders/{order['id']}")
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+        status, _, restored_again = self.request("GET", f"/products/{product['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(restored_again["stock"], 10)
+
+        duplicate = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [
+                        {"product_id": product["id"], "quantity": 1},
+                        {"product_id": product["id"], "quantity": 1},
+                    ],
+                },
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            duplicate["details"],
+            [{"field": "items[1].product_id", "message": "Duplicate product"}],
+        )
+        unknown = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [{"product_id": 999999, "quantity": 1}],
+                },
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            unknown["details"],
+            [{"field": "items[0].product_id", "message": "Unknown product"}],
+        )
+        inactive = self.create_product(active=False)
+        unavailable = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [{"product_id": inactive["id"], "quantity": 1}],
+                },
+            ),
+            409,
+            "product_unavailable",
+        )
+        self.assertEqual(
+            unavailable["details"],
+            [{"field": "items[0].product_id", "message": "Product is unavailable"}],
+        )
+
+    def test_insufficient_stock_details_keep_numeric_item_order(self):
+        products = [self.create_product(stock=0) for _ in range(11)]
+        response = self.request(
+            "POST",
+            "/orders",
+            {
+                "customer_id": self.customer_id(),
+                "items": [
+                    {"product_id": product["id"], "quantity": 1} for product in products
+                ],
+            },
+        )
+        error = self.assert_error(response, 409, "insufficient_stock")
+        self.assertEqual(
+            error["details"],
+            [
+                {"field": f"items[{index}].quantity", "message": "Only 0 in stock"}
+                for index in range(11)
+            ],
         )
 
     def test_get_missing_and_delete_id_is_not_reused(self):

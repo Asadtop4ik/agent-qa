@@ -21,6 +21,36 @@ ROOT = Path(__file__).resolve().parents[1]
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
+class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_order_schemas_export_item_and_exactly_one_limits(self):
+        spec = build_openapi(ROUTES, "order-schema-test")
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        create = spec["paths"]["/orders"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        self.assertEqual(create["x-exactlyOne"], ["items", "total_cents"])
+        self.assertEqual(create["properties"]["items"]["minItems"], 1)
+        self.assertEqual(
+            create["properties"]["items"]["maxItems"], schemas.MAX_ORDER_ITEMS
+        )
+        self.assertEqual(
+            create["properties"]["items"]["items"]["properties"]["quantity"]["maximum"],
+            schemas.MAX_ORDER_QUANTITY,
+        )
+        self.assertIn("items", SCHEMAS["Order"]["required"])
+        self.assertEqual(
+            set(SCHEMAS["Order"]["properties"]["items"]["items"]["required"]),
+            {
+                "product_id",
+                "sku",
+                "name",
+                "quantity",
+                "unit_price_cents",
+                "line_total_cents",
+            },
+        )
+
+
 class OpenApiDriftTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -175,6 +205,30 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(customer_schema["maxLength"], orders.MAX_CUSTOMER_ID_LENGTH)
         self.assertEqual(total_schema["minimum"], orders.MIN_TOTAL_CENTS)
         self.assertEqual(total_schema["maximum"], orders.MAX_TOTAL_CENTS)
+        self.assertEqual(create_schema["x-exactlyOne"], ["items", "total_cents"])
+        items_schema = create_schema["properties"]["items"]
+        self.assertEqual(items_schema["minItems"], 1)
+        self.assertEqual(items_schema["maxItems"], schemas.MAX_ORDER_ITEMS)
+        item_schema = items_schema["items"]
+        self.assertEqual(item_schema["properties"]["product_id"]["minimum"], 1)
+        self.assertEqual(item_schema["properties"]["quantity"]["minimum"], 1)
+        self.assertEqual(
+            item_schema["properties"]["quantity"]["maximum"],
+            schemas.MAX_ORDER_QUANTITY,
+        )
+        order_item_schema = SCHEMAS["Order"]["properties"]["items"]["items"]
+        self.assertEqual(
+            set(order_item_schema["properties"]),
+            {
+                "product_id",
+                "sku",
+                "name",
+                "quantity",
+                "unit_price_cents",
+                "line_total_cents",
+            },
+        )
+        self.assertIn("items", SCHEMAS["Order"]["required"])
 
         patch_schema = spec["paths"]["/orders/{id}"]["patch"]["requestBody"]
         patch_schema = patch_schema["content"]["application/json"]["schema"]

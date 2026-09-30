@@ -9,6 +9,8 @@ MIN_OFFSET = 0
 DEFAULT_OFFSET = 0
 MIN_TOTAL_CENTS = 0
 MAX_TOTAL_CENTS = 100_000_000
+MAX_ORDER_ITEMS = 20
+MAX_ORDER_QUANTITY = 1000
 MIN_CUSTOMER_ID_LENGTH = 1
 MAX_CUSTOMER_ID_LENGTH = 64
 MAX_ORDERS = 1000
@@ -44,6 +46,15 @@ _TOTAL_CENTS = {
     "type": "integer",
     "minimum": MIN_TOTAL_CENTS,
     "maximum": MAX_TOTAL_CENTS,
+}
+_ORDER_ITEM_INPUT = {
+    "type": "object",
+    "required": ["product_id", "quantity"],
+    "properties": {
+        "product_id": {"type": "integer", "minimum": 1},
+        "quantity": {"type": "integer", "minimum": 1, "maximum": MAX_ORDER_QUANTITY},
+    },
+    "additionalProperties": False,
 }
 _STATUS = {"type": "string", "enum": list(STATUSES)}
 _SKU = {
@@ -86,6 +97,26 @@ _TAGS = {
     "items": _TAG,
 }
 _ACTIVE = {"type": "boolean"}
+_ORDER_ITEM = {
+    "type": "object",
+    "required": [
+        "product_id",
+        "sku",
+        "name",
+        "quantity",
+        "unit_price_cents",
+        "line_total_cents",
+    ],
+    "properties": {
+        "product_id": {"type": "integer", "minimum": 1},
+        "sku": _SKU,
+        "name": _PRODUCT_NAME,
+        "quantity": {"type": "integer", "minimum": 1, "maximum": MAX_ORDER_QUANTITY},
+        "unit_price_cents": _PRICE_CENTS,
+        "line_total_cents": _TOTAL_CENTS,
+    },
+    "additionalProperties": False,
+}
 _PRODUCT_FIELDS = {
     "name": _PRODUCT_NAME,
     "category": _CATEGORY,
@@ -121,8 +152,18 @@ _PRODUCT = {
 SCHEMAS = {
     "CreateOrder": {
         "type": "object",
-        "required": ["customer_id", "total_cents"],
-        "properties": {"customer_id": _CUSTOMER_ID, "total_cents": _TOTAL_CENTS},
+        "required": ["customer_id"],
+        "properties": {
+            "customer_id": _CUSTOMER_ID,
+            "total_cents": _TOTAL_CENTS,
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_ORDER_ITEMS,
+                "items": _ORDER_ITEM_INPUT,
+            },
+        },
+        "x-exactlyOne": ["items", "total_cents"],
         "additionalProperties": False,
     },
     "UpdateOrder": {
@@ -212,13 +253,21 @@ SCHEMAS = {
     },
     "Order": {
         "type": "object",
-        "required": ["id", "customer_id", "total_cents", "status", "created_at"],
+        "required": [
+            "id",
+            "customer_id",
+            "total_cents",
+            "status",
+            "created_at",
+            "items",
+        ],
         "properties": {
             "id": {"type": "integer", "minimum": 1},
             "customer_id": _CUSTOMER_ID,
             "total_cents": _TOTAL_CENTS,
             "status": _STATUS,
             "created_at": {"type": "string", "format": "date-time"},
+            "items": {"type": "array", "items": _ORDER_ITEM},
         },
         "additionalProperties": False,
     },

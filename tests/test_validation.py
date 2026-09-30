@@ -108,6 +108,7 @@ class SchemaValidationTests(unittest.TestCase):
                     "total_cents": 10,
                     "status": "new",
                     "created_at": "today",
+                    "items": [],
                 }
             ],
             "total": 1,
@@ -202,7 +203,10 @@ class SchemaValidationTests(unittest.TestCase):
                 {},
                 [
                     {"field": "customer_id", "message": "Required"},
-                    {"field": "total_cents", "message": "Required"},
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    },
                 ],
             ),
             (
@@ -246,6 +250,68 @@ class SchemaValidationTests(unittest.TestCase):
         for payload, expected in cases:
             with self.subTest(payload=payload):
                 self.assertEqual(validate(SCHEMAS["CreateOrder"], payload), expected)
+
+        self.assertEqual(
+            validate(SCHEMAS["CreateOrder"], {"customer_id": "x"}),
+            [
+                {
+                    "field": "items",
+                    "message": "Either items or total_cents is required",
+                }
+            ],
+        )
+        self.assertEqual(
+            validate(
+                SCHEMAS["CreateOrder"],
+                {"customer_id": "x", "items": [], "total_cents": 0},
+            ),
+            [
+                {"field": "items", "message": "Cannot be combined with total_cents"},
+                {"field": "items", "message": "Must contain at least 1 items"},
+            ],
+        )
+
+    def test_order_item_quantity_is_bounded_even_for_huge_integers(self):
+        from agent_qa.schemas import MAX_ORDER_ITEMS, MAX_ORDER_QUANTITY, SCHEMAS
+
+        self.assertEqual(
+            validate(
+                SCHEMAS["CreateOrder"],
+                {"customer_id": "x", "items": [{"product_id": 1, "quantity": 1}]},
+            ),
+            [],
+        )
+        self.assertEqual(
+            validate(
+                SCHEMAS["CreateOrder"],
+                {
+                    "customer_id": "x",
+                    "items": [{"product_id": 1, "quantity": MAX_ORDER_QUANTITY + 1}],
+                },
+            ),
+            [
+                {
+                    "field": "items[0].quantity",
+                    "message": f"Must be between 1 and {MAX_ORDER_QUANTITY}",
+                }
+            ],
+        )
+        self.assertEqual(MAX_ORDER_ITEMS, 20)
+        self.assertEqual(
+            validate(
+                SCHEMAS["CreateOrder"],
+                {
+                    "customer_id": "x",
+                    "items": [{"product_id": 1, "quantity": 10**1000}],
+                },
+            ),
+            [
+                {
+                    "field": "items[0].quantity",
+                    "message": f"Must be between 1 and {MAX_ORDER_QUANTITY}",
+                }
+            ],
+        )
 
         self.assertEqual(
             validate(SCHEMAS["UpdateOrder"], {"status": 12}),

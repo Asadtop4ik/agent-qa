@@ -1,6 +1,7 @@
 """HTTP server adapter for the route handlers."""
 
 import json
+import logging
 import math
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,8 @@ from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -266,6 +269,7 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         except Exception:
+            LOGGER.exception("Unhandled request exception")
             self._internal_error()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
