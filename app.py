@@ -5,7 +5,7 @@ import json
 import os
 import platform
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -39,10 +39,46 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if path == "/fixture":
+            query = parse_qsl(urlsplit(self.path).query, keep_blank_values=True)
+            field_values = [value for name, value in query if name == "fields"]
+            invalid_param = next((name for name, _ in query if name != "fields"), None)
+            if invalid_param is not None:
+                self._invalid_query(
+                    invalid_param, f"Unsupported query parameter: {invalid_param}"
+                )
+                return
+            if len(field_values) > 1:
+                self._invalid_query("fields", "The fields parameter may appear once")
+                return
             with FIXTURE_PATH.open(encoding="utf-8") as fixture:
-                self._json(200, json.load(fixture))
+                data = json.load(fixture)
+            if field_values:
+                requested_fields = field_values[0].split(",")
+                if any(not field for field in requested_fields):
+                    self._invalid_query("fields", "Fields must not be empty")
+                    return
+                unknown_fields = [
+                    field for field in requested_fields if field not in data
+                ]
+                if unknown_fields:
+                    self._invalid_query("fields", f"Unknown field: {unknown_fields[0]}")
+                    return
+                data = {field: data[field] for field in dict.fromkeys(requested_fields)}
+            self._json(200, data)
             return
         self._json(404, {"error": "not found"})
+
+    def _invalid_query(self, param: str, message: str) -> None:
+        self._json(
+            400,
+            {
+                "error": {
+                    "code": "invalid_query",
+                    "message": message,
+                    "details": [{"param": param, "message": message}],
+                }
+            },
+        )
 
     def log_message(self, fmt: str, *args: object) -> None:
         # Keep logs concise and avoid echoing request payloads.
