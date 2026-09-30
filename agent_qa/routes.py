@@ -6,7 +6,23 @@ import platform
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.errors import ApiError
 from agent_qa.metrics import REGISTRY
-from agent_qa.orders import OrderStore, validate_create, validate_patch, validate_query
+from agent_qa.openapi import build_openapi
+from agent_qa.orders import (
+    DEFAULT_LIMIT,
+    DEFAULT_OFFSET,
+    MAX_CUSTOMER_ID_LENGTH,
+    MAX_LIMIT,
+    MAX_TOTAL_CENTS,
+    MIN_CUSTOMER_ID_LENGTH,
+    MIN_LIMIT,
+    MIN_OFFSET,
+    MIN_TOTAL_CENTS,
+    STATUSES,
+    OrderStore,
+    validate_create,
+    validate_patch,
+    validate_query,
+)
 
 
 ORDER_STORE = OrderStore()
@@ -98,6 +114,15 @@ def version(
     )
 
 
+def openapi(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the OpenAPI document generated from the route table."""
+    return 200, build_openapi(ROUTES, GIT_SHA), {}
+
+
 def create_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -178,16 +203,145 @@ def delete_order(
     return 204, None, {"Content-Length": "0"}
 
 
+_ORDER_ID = {
+    "name": "id",
+    "in": "path",
+    "required": True,
+    "description": "Positive order identifier.",
+    "schema": {"type": "integer", "minimum": 1},
+}
+_CUSTOMER_ID_SCHEMA = {
+    "type": "string",
+    "minLength": MIN_CUSTOMER_ID_LENGTH,
+    "maxLength": MAX_CUSTOMER_ID_LENGTH,
+}
+_TOTAL_CENTS_SCHEMA = {
+    "type": "integer",
+    "minimum": MIN_TOTAL_CENTS,
+    "maximum": MAX_TOTAL_CENTS,
+}
+_STATUS_SCHEMA = {"type": "string", "enum": list(STATUSES)}
+_CREATE_ORDER_SCHEMA = {
+    "type": "object",
+    "required": ["customer_id", "total_cents"],
+    "properties": {
+        "customer_id": _CUSTOMER_ID_SCHEMA,
+        "total_cents": _TOTAL_CENTS_SCHEMA,
+    },
+    "additionalProperties": False,
+}
+_UPDATE_ORDER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": _STATUS_SCHEMA,
+        "total_cents": _TOTAL_CENTS_SCHEMA,
+    },
+    "minProperties": 1,
+    "additionalProperties": False,
+}
+
 ROUTES = (
-    {"method": "GET", "path": "/ready", "handler": ready, "auth_required": False},
-    {"method": "GET", "path": "/metrics", "handler": metrics, "auth_required": False},
-    {"method": "GET", "path": "/fixture", "handler": fixture, "auth_required": False},
-    {"method": "GET", "path": "/version", "handler": version, "auth_required": False},
+    {
+        "method": "GET",
+        "path": "/ready",
+        "handler": ready,
+        "auth_required": False,
+        "operation_id": "getReady",
+        "summary": "Check service readiness",
+        "responses": ["200"],
+    },
+    {
+        "method": "GET",
+        "path": "/metrics",
+        "handler": metrics,
+        "auth_required": False,
+        "operation_id": "getMetrics",
+        "summary": "Read service metrics",
+        "responses": ["200"],
+    },
+    {
+        "method": "GET",
+        "path": "/fixture",
+        "handler": fixture,
+        "auth_required": False,
+        "operation_id": "getFixture",
+        "summary": "Read the synthetic fixture",
+        "parameters": [
+            {
+                "name": "fields",
+                "in": "query",
+                "required": False,
+                "description": "Comma-separated fixture fields to return.",
+                "schema": {"type": "string"},
+            }
+        ],
+        "responses": ["200", "400"],
+    },
+    {
+        "method": "GET",
+        "path": "/version",
+        "handler": version,
+        "auth_required": False,
+        "operation_id": "getVersion",
+        "summary": "Read service version details",
+        "responses": ["200"],
+    },
+    {
+        "method": "GET",
+        "path": "/openapi.json",
+        "handler": openapi,
+        "auth_required": False,
+        "operation_id": "getOpenapi",
+        "summary": "Read the OpenAPI document",
+        "responses": ["200"],
+    },
     {
         "method": "GET",
         "path": "/orders",
         "handler": list_orders,
         "auth_required": False,
+        "operation_id": "listOrders",
+        "summary": "List orders",
+        "parameters": [
+            {
+                "name": "status",
+                "in": "query",
+                "required": False,
+                "description": "Filter by order status.",
+                "schema": _STATUS_SCHEMA,
+            },
+            {
+                "name": "customer_id",
+                "in": "query",
+                "required": False,
+                "description": "Filter by customer identifier.",
+                "schema": {"type": "string"},
+            },
+            {
+                "name": "limit",
+                "in": "query",
+                "required": False,
+                "description": "Maximum number of orders to return.",
+                "schema": {
+                    "type": "integer",
+                    "minimum": MIN_LIMIT,
+                    "maximum": MAX_LIMIT,
+                    "default": DEFAULT_LIMIT,
+                },
+            },
+            {
+                "name": "offset",
+                "in": "query",
+                "required": False,
+                "description": "Number of matching orders to skip.",
+                "schema": {
+                    "type": "integer",
+                    "minimum": MIN_OFFSET,
+                    "default": DEFAULT_OFFSET,
+                },
+            },
+        ],
+        "responses": ["200", "400"],
     },
     {
         "method": "POST",
@@ -195,18 +349,30 @@ ROUTES = (
         "handler": create_order,
         "body": True,
         "auth_required": True,
+        "operation_id": "createOrder",
+        "summary": "Create an order",
+        "request_schema": _CREATE_ORDER_SCHEMA,
+        "responses": ["201", "400", "401", "409", "411", "413", "415"],
     },
     {
         "method": "DELETE",
         "path": "/orders/{id}",
         "handler": delete_order,
         "auth_required": True,
+        "operation_id": "deleteOrder",
+        "summary": "Delete an order",
+        "parameters": [_ORDER_ID],
+        "responses": ["204", "401", "404"],
     },
     {
         "method": "GET",
         "path": "/orders/{id}",
         "handler": get_order,
         "auth_required": False,
+        "operation_id": "getOrder",
+        "summary": "Read an order",
+        "parameters": [_ORDER_ID],
+        "responses": ["200", "404"],
     },
     {
         "method": "PATCH",
@@ -214,5 +380,10 @@ ROUTES = (
         "handler": patch_order,
         "body": True,
         "auth_required": True,
+        "operation_id": "updateOrder",
+        "summary": "Update an order",
+        "parameters": [_ORDER_ID],
+        "request_schema": _UPDATE_ORDER_SCHEMA,
+        "responses": ["200", "400", "401", "404", "409", "413", "415"],
     },
 )

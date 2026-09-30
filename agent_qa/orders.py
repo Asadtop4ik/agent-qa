@@ -6,8 +6,16 @@ from datetime import datetime, timezone
 import threading
 from typing import Any
 
-ORDER_STATUSES = frozenset({"new", "paid", "shipped", "cancelled"})
+STATUSES = ("new", "paid", "shipped", "cancelled")
+ORDER_STATUSES = frozenset(STATUSES)
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_LIMIT = 20
+MIN_OFFSET = 0
+DEFAULT_OFFSET = 0
+MIN_TOTAL_CENTS = 0
 MAX_TOTAL_CENTS = 100_000_000
+MIN_CUSTOMER_ID_LENGTH = 1
 MAX_CUSTOMER_ID_LENGTH = 64
 MAX_ORDERS = 1000
 
@@ -32,9 +40,12 @@ def _validation_error(details: list[dict[str, str]]) -> OrderError:
 def _check_total_cents(value: Any, field: str, errors: list[dict[str, str]]) -> None:
     if isinstance(value, bool) or not isinstance(value, int):
         errors.append({"field": field, "message": "Must be an integer"})
-    elif not 0 <= value <= MAX_TOTAL_CENTS:
+    elif not MIN_TOTAL_CENTS <= value <= MAX_TOTAL_CENTS:
         errors.append(
-            {"field": field, "message": f"Must be between 0 and {MAX_TOTAL_CENTS}"}
+            {
+                "field": field,
+                "message": (f"Must be between {MIN_TOTAL_CENTS} and {MAX_TOTAL_CENTS}"),
+            }
         )
 
 
@@ -60,11 +71,14 @@ def validate_create(payload: Any) -> dict[str, Any]:
         errors.append({"field": "customer_id", "message": "Required"})
     elif not isinstance(customer_id, str):
         errors.append({"field": "customer_id", "message": "Must be a string"})
-    elif not 1 <= len(customer_id) <= MAX_CUSTOMER_ID_LENGTH:
+    elif not MIN_CUSTOMER_ID_LENGTH <= len(customer_id) <= MAX_CUSTOMER_ID_LENGTH:
         errors.append(
             {
                 "field": "customer_id",
-                "message": f"Must contain 1 to {MAX_CUSTOMER_ID_LENGTH} characters",
+                "message": (
+                    f"Must contain {MIN_CUSTOMER_ID_LENGTH} to "
+                    f"{MAX_CUSTOMER_ID_LENGTH} characters"
+                ),
             }
         )
     elif not customer_id.strip():
@@ -132,25 +146,31 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
     if "limit" in values:
         try:
             limit = int(values["limit"])
-            if not 1 <= limit <= 100:
+            if not MIN_LIMIT <= limit <= MAX_LIMIT:
                 raise ValueError
         except ValueError:
             errors.append(
-                {"field": "limit", "message": "Must be an integer from 1 to 100"}
+                {
+                    "field": "limit",
+                    "message": (f"Must be an integer from {MIN_LIMIT} to {MAX_LIMIT}"),
+                }
             )
     else:
-        limit = 20
+        limit = DEFAULT_LIMIT
     if "offset" in values:
         try:
             offset = int(values["offset"])
-            if offset < 0:
+            if offset < MIN_OFFSET:
                 raise ValueError
         except ValueError:
             errors.append(
-                {"field": "offset", "message": "Must be a non-negative integer"}
+                {
+                    "field": "offset",
+                    "message": "Must be a non-negative integer",
+                }
             )
     else:
-        offset = 0
+        offset = DEFAULT_OFFSET
 
     if errors:
         errors.sort(key=lambda item: item["field"])
