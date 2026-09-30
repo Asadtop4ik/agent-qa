@@ -186,6 +186,21 @@ class OpenApiDriftTests(unittest.TestCase):
     def test_response_content_documents_json_and_preserves_bodyless_responses(self):
         spec = self.live_spec()
 
+        about_response = spec["paths"]["/about"]["get"]["responses"]["200"]
+        about_schema = about_response["content"]["application/json"]["schema"]
+        self.assertEqual(
+            about_schema["required"], ["service", "git_sha", "environment"]
+        )
+        self.assertEqual(
+            about_schema["properties"],
+            {
+                "service": {"type": "string", "enum": ["agent-qa"]},
+                "git_sha": {"type": "string"},
+                "environment": {"type": "string", "enum": ["qa"]},
+            },
+        )
+        self.assertFalse(about_schema["additionalProperties"])
+
         ping_response = spec["paths"]["/ping"]["get"]["responses"]["200"]
         ping_schema = ping_response["content"]["application/json"]["schema"]
         self.assertEqual(ping_schema["required"], ["pong"])
