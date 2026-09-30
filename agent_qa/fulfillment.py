@@ -146,6 +146,8 @@ class FulfillmentService:
                 raise
 
     def delete(self, order_id: int) -> bool:
+        if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
+            return False
         with self._lock, self._products._lock, self._orders._lock:
             current = self._orders._orders.get(order_id)
             if current is None:

@@ -29,6 +29,10 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             "application/json"
         ]["schema"]
         self.assertEqual(create["x-exactlyOne"], ["items", "total_cents"])
+        self.assertEqual(
+            create["oneOf"],
+            [{"required": ["items"]}, {"required": ["total_cents"]}],
+        )
         self.assertEqual(create["properties"]["items"]["minItems"], 1)
         self.assertEqual(
             create["properties"]["items"]["maxItems"], schemas.MAX_ORDER_ITEMS

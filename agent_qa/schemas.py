@@ -163,6 +163,10 @@ SCHEMAS = {
                 "items": _ORDER_ITEM_INPUT,
             },
         },
+        "oneOf": [
+            {"required": ["items"]},
+            {"required": ["total_cents"]},
+        ],
         "x-exactlyOne": ["items", "total_cents"],
         "additionalProperties": False,
     },

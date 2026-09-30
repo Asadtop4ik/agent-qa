@@ -218,6 +218,20 @@ class FulfillmentTests(unittest.TestCase):
         self.assertTrue(self.service.delete(order["id"]))
         self.assertEqual(self.products.get(product["id"])["stock"], 4)
 
+    def test_invalid_delete_ids_do_not_release_inventory(self):
+        product = self.products.create(**product_fields(stock=4))
+        order = self.create(product["id"], 2)
+
+        for invalid_id in (True, 1.0):
+            for _ in range(2):
+                self.assertFalse(self.service.delete(invalid_id))
+            self.assertEqual(self.orders.get(order["id"])["status"], "new")
+            self.assertEqual(self.products.get(product["id"])["stock"], 2)
+
+        self.assertTrue(self.service.delete(order["id"]))
+        self.assertFalse(self.service.delete(order["id"]))
+        self.assertEqual(self.products.get(product["id"])["stock"], 4)
+
     def test_failed_release_keeps_order_and_all_stock_unchanged(self):
         first = self.products.create(**product_fields(stock=5))
         second = self.products.create(**product_fields(sku="ITEM-2", stock=5))
