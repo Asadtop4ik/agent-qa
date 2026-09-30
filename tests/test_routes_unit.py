@@ -1,12 +1,14 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_qa.config import GIT_SHA
 from agent_qa.errors import ApiError, envelope
-from agent_qa.routes import ROUTES, fixture, ready, version
+from agent_qa.routes import ROUTES, fixture, ready, status, version
 
 
 class RouteUnitTests(unittest.TestCase):
@@ -14,6 +16,33 @@ class RouteUnitTests(unittest.TestCase):
         status, body, headers = ready([])
         self.assertEqual(status, 200)
         self.assertEqual(body, {"status": "ready", "git_sha": GIT_SHA})
+        self.assertEqual(headers, {})
+
+    def test_status_handler_with_valid_fixture(self):
+        code, body, headers = status([])
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            body,
+            {"status": "ok", "service": "agent-qa", "checks": {"fixture": True}},
+        )
+        self.assertEqual(headers, {})
+
+    def test_status_handler_with_invalid_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / "invalid.json"
+            fixture_path.write_text("{invalid json", encoding="utf-8")
+            with patch("agent_qa.routes.FIXTURE_PATH", fixture_path):
+                code, body, headers = status([])
+
+        self.assertEqual(code, 200)
+        self.assertEqual(
+            body,
+            {
+                "status": "degraded",
+                "service": "agent-qa",
+                "checks": {"fixture": False},
+            },
+        )
         self.assertEqual(headers, {})
 
     def test_fixture_handler_and_projection(self):

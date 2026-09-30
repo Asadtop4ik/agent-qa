@@ -61,6 +61,21 @@ class ServiceTests(unittest.TestCase):
                 json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
             )
 
+    def test_status_returns_fixture_health(self):
+        with urlopen(self.base + "/status", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertEqual(
+                json.load(response),
+                {
+                    "status": "ok",
+                    "service": "agent-qa",
+                    "checks": {"fixture": True},
+                },
+            )
+
     def test_version_returns_service_details(self):
         with urlopen(self.base + "/version", timeout=2) as response:
             self.assertEqual(response.status, 200)
