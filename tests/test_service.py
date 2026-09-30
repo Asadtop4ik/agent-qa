@@ -49,6 +49,7 @@ class ServiceTests(unittest.TestCase):
     def test_ready_returns_built_sha(self):
         with urlopen(self.base + "/ready", timeout=2) as response:
             self.assertEqual(response.status, 200)
+            self.assertRegex(response.headers["X-Request-Id"], r"^[0-9a-f]{32}$")
             self.assertEqual(
                 json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
             )
@@ -134,6 +135,10 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 400)
                 body = json.load(error.exception)
                 self.assertEqual(body["error"]["code"], "invalid_query")
+                self.assertEqual(
+                    body["error"]["request_id"],
+                    error.exception.headers["X-Request-Id"],
+                )
                 self.assertTrue(body["error"]["details"])
                 self.assertTrue(body["error"]["details"][0]["param"])
                 self.assertTrue(body["error"]["details"][0]["message"])
@@ -150,10 +155,54 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             urlopen(self.base + "/missing", timeout=2)
         self.assertEqual(error.exception.code, 404)
+        self.assertRegex(error.exception.headers["X-Request-Id"], r"^[0-9a-f]{32}$")
         self.assertEqual(
             json.load(error.exception),
-            {"error": {"code": "not_found", "message": "Route not found"}},
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": "Route not found",
+                    "request_id": error.exception.headers["X-Request-Id"],
+                }
+            },
         )
+
+    def test_supplied_request_id_is_used_in_header_and_error(self):
+        request = Request(self.base + "/nope", headers={"X-Request-Id": "abc-123"})
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        self.assertEqual(error.exception.headers["X-Request-Id"], "abc-123")
+        self.assertEqual(json.load(error.exception)["error"]["request_id"], "abc-123")
+
+    def test_invalid_request_id_is_replaced(self):
+        for invalid_id in ("a" * 65, "bad id"):
+            with self.subTest(invalid_id=invalid_id):
+                request = Request(
+                    self.base + "/ready", headers={"X-Request-Id": invalid_id}
+                )
+                with urlopen(request, timeout=2) as response:
+                    self.assertRegex(
+                        response.headers["X-Request-Id"], r"^[0-9a-f]{32}$"
+                    )
+
+    def test_requests_without_id_receive_distinct_ids(self):
+        request_ids = []
+        for _ in range(2):
+            with urlopen(self.base + "/ready", timeout=2) as response:
+                request_ids.append(response.headers["X-Request-Id"])
+        self.assertNotEqual(*request_ids)
+
+    def test_method_error_has_matching_request_id(self):
+        request = Request(
+            self.base + "/ready",
+            method="POST",
+            headers={"X-Request-Id": "method-1"},
+        )
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        self.assertEqual(error.exception.code, 405)
+        self.assertEqual(error.exception.headers["X-Request-Id"], "method-1")
+        self.assertEqual(json.load(error.exception)["error"]["request_id"], "method-1")
 
     def test_unsupported_methods_on_known_routes_are_not_allowed(self):
         unsupported_requests = (
@@ -174,12 +223,14 @@ class ServiceTests(unittest.TestCase):
                 if method == "HEAD":
                     self.assertEqual(error.exception.read(), b"")
                     continue
+                request_id = error.exception.headers["X-Request-Id"]
                 self.assertEqual(
                     json.load(error.exception),
                     {
                         "error": {
                             "code": "method_not_allowed",
                             "message": "Method not allowed",
+                            "request_id": request_id,
                         }
                     },
                 )
@@ -189,17 +240,26 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             urlopen(request, timeout=2)
         self.assertEqual(error.exception.code, 404)
+        request_id = error.exception.headers["X-Request-Id"]
         self.assertEqual(
             json.load(error.exception),
-            {"error": {"code": "not_found", "message": "Route not found"}},
+            {
+                "error": {
+                    "code": "not_found",
+                    "message": "Route not found",
+                    "request_id": request_id,
+                }
+            },
         )
 
     def test_unexpected_handler_exception_returns_safe_internal_error(self):
         handler = object.__new__(Handler)
+        handler.request_id = "test-request"
         expected_error = {
             "error": {
                 "code": "internal_error",
                 "message": "Internal server error",
+                "request_id": "test-request",
             }
         }
         with (

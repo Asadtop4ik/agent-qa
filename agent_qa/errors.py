@@ -22,9 +22,12 @@ def envelope(
     code: str,
     message: str,
     details: list[dict[str, str]] | None = None,
+    request_id: str | None = None,
 ) -> dict[str, object]:
     """Build the service's standard error response body."""
     error: dict[str, object] = {"code": code, "message": message}
+    if request_id is not None:
+        error["request_id"] = request_id
     if details is not None:
         error["details"] = details
     return {"error": error}
