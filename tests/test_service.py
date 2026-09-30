@@ -161,6 +161,8 @@ class ServiceTests(unittest.TestCase):
             ("PUT", "/fixture"),
             ("PATCH", "/version"),
             ("DELETE", "/ready"),
+            ("HEAD", "/ready"),
+            ("OPTIONS", "/fixture"),
         )
         for method, path in unsupported_requests:
             with self.subTest(method=method, path=path):
@@ -169,6 +171,9 @@ class ServiceTests(unittest.TestCase):
                     urlopen(request, timeout=2)
                 self.assertEqual(error.exception.code, 405)
                 self.assertEqual(error.exception.headers["Allow"], "GET")
+                if method == "HEAD":
+                    self.assertEqual(error.exception.read(), b"")
+                    continue
                 self.assertEqual(
                     json.load(error.exception),
                     {

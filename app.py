@@ -27,7 +27,8 @@ class Handler(BaseHTTPRequestHandler):
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(encoded)
+        if self.command != "HEAD":
+            self.wfile.write(encoded)
 
     def _not_found(self) -> None:
         self._json(
@@ -126,6 +127,12 @@ class Handler(BaseHTTPRequestHandler):
         self._handle_unsupported_method()
 
     def do_DELETE(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._handle_unsupported_method()
+
+    def do_HEAD(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self._handle_unsupported_method()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._handle_unsupported_method()
 
     def _invalid_query(self, param: str, message: str) -> None:
