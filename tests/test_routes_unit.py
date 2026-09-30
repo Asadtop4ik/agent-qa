@@ -28,8 +28,11 @@ class RouteUnitTests(unittest.TestCase):
         route = next(route for route in ROUTES if route["path"] == "/about")
         status, body, headers = route["handler"]([])
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"service": "agent-qa", "git_sha": GIT_SHA})
-        self.assertEqual(headers, {})
+        self.assertEqual(
+            body,
+            {"service": "agent-qa", "git_sha": GIT_SHA, "environment": "qa"},
+        )
+        self.assertEqual(headers, {"X-Service": "agent-qa"})
 
     def test_status_handler_with_valid_fixture(self):
         code, body, headers = status([])

@@ -105,9 +105,14 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(
                 response.headers["Content-Type"], "application/json; charset=utf-8"
             )
+            self.assertEqual(response.headers["X-Service"], "agent-qa")
             self.assertEqual(
                 json.load(response),
-                {"service": "agent-qa", "git_sha": "test-sha-123"},
+                {
+                    "service": "agent-qa",
+                    "git_sha": "test-sha-123",
+                    "environment": "qa",
+                },
             )
 
     def test_version_accepts_query_string(self):

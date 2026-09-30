@@ -43,7 +43,11 @@ def about(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return the service name and build SHA."""
-    return 200, {"service": "agent-qa", "git_sha": GIT_SHA}, {}
+    return (
+        200,
+        {"service": "agent-qa", "git_sha": GIT_SHA, "environment": "qa"},
+        {"X-Service": "agent-qa"},
+    )
 
 
 def ping(
@@ -347,10 +351,11 @@ ROUTES = (
         "response_schemas": {
             "200": {
                 "type": "object",
-                "required": ["service", "git_sha"],
+                "required": ["service", "git_sha", "environment"],
                 "properties": {
                     "service": {"type": "string", "enum": ["agent-qa"]},
                     "git_sha": {"type": "string"},
+                    "environment": {"type": "string", "enum": ["qa"]},
                 },
                 "additionalProperties": False,
             }
