@@ -5,6 +5,7 @@ import platform
 
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.errors import ApiError
+from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderStore, validate_create, validate_patch, validate_query
 
 
@@ -18,6 +19,20 @@ def ready(
 ) -> tuple[int, object, dict[str, str]]:
     """Return the service readiness document."""
     return 200, {"status": "ready", "git_sha": GIT_SHA}, {}
+
+
+def metrics(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return a Prometheus snapshot of service metrics."""
+    order_count = ORDER_STORE.list(limit=1)[1]
+    return (
+        200,
+        REGISTRY.render(order_count, GIT_SHA),
+        {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+    )
 
 
 def fixture(
@@ -165,6 +180,7 @@ def delete_order(
 
 ROUTES = (
     {"method": "GET", "path": "/ready", "handler": ready},
+    {"method": "GET", "path": "/metrics", "handler": metrics},
     {"method": "GET", "path": "/fixture", "handler": fixture},
     {"method": "GET", "path": "/version", "handler": version},
     {"method": "GET", "path": "/orders", "handler": list_orders},

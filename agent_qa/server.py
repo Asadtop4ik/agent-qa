@@ -3,10 +3,13 @@
 import json
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from time import perf_counter
 from urllib.parse import parse_qsl, urlsplit
 
+from agent_qa.accesslog import write_access_log
 from agent_qa import config
 from agent_qa.errors import ApiError, envelope
+from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
@@ -48,6 +51,8 @@ def allowed_methods(path: str) -> str:
 class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         self.request_id = request_id(None)
+        self._request_started = perf_counter()
+        self._response_recorded = False
         super().handle_one_request()
 
     def parse_request(self) -> bool:
@@ -64,21 +69,52 @@ class Handler(BaseHTTPRequestHandler):
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
         is_empty = status == 204
-        encoded = (
-            b"" if is_empty else json.dumps(body, separators=(",", ":")).encode("utf-8")
-        )
+        response_headers = headers or {}
+        content_type = response_headers.get("Content-Type")
+        if is_empty:
+            encoded = b""
+        elif content_type and isinstance(body, str):
+            encoded = body.encode("utf-8")
+        else:
+            encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        self._record_response(status)
         self.send_response(status)
         if not is_empty:
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header(
+                "Content-Type", content_type or "application/json; charset=utf-8"
+            )
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-Id", self.request_id)
-        for name, value in (headers or {}).items():
-            if name.lower() != "content-length":
+        for name, value in response_headers.items():
+            if name.lower() not in {"content-length", "content-type"}:
                 self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD" and encoded:
             self.wfile.write(encoded)
+
+    def _record_response(self, status: int) -> None:
+        if self._response_recorded:
+            return
+        self._response_recorded = True
+        raw_path = getattr(self, "path", "") or ""
+        try:
+            path = urlsplit(raw_path).path
+        except ValueError:
+            path = ""
+        matches = _path_routes(path)
+        route = str(matches[0][0]["path"]) if matches else "unmatched"
+        method = getattr(self, "command", "") or ""
+        duration = perf_counter() - self._request_started
+        REGISTRY.record(method, route, status, duration)
+        write_access_log(
+            method,
+            path,
+            route,
+            status,
+            duration,
+            getattr(self, "request_id", ""),
+        )
 
     def _not_found(self) -> None:
         self._json(
@@ -224,7 +260,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, fmt: str, *args: object) -> None:
-        print("agent-qa: " + fmt % args)
+        return
 
 
 def main() -> None:
