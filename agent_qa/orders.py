@@ -1,0 +1,254 @@
+"""In-memory order storage and HTTP-independent validation."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import threading
+from typing import Any
+
+ORDER_STATUSES = frozenset({"new", "paid", "shipped", "cancelled"})
+MAX_TOTAL_CENTS = 100_000_000
+MAX_CUSTOMER_ID_LENGTH = 64
+MAX_ORDERS = 1000
+
+
+class OrderError(Exception):
+    """Domain error raised by order validation and storage operations."""
+
+    def __init__(
+        self, code: str, message: str, details: list[dict[str, str]] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+def _validation_error(details: list[dict[str, str]]) -> OrderError:
+    details.sort(key=lambda item: item["field"])
+    return OrderError("validation_error", "Request validation failed", details)
+
+
+def _check_total_cents(value: Any, field: str, errors: list[dict[str, str]]) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        errors.append({"field": field, "message": "Must be an integer"})
+    elif not 0 <= value <= MAX_TOTAL_CENTS:
+        errors.append(
+            {"field": field, "message": f"Must be between 0 and {MAX_TOTAL_CENTS}"}
+        )
+
+
+def validate_create(payload: Any) -> dict[str, Any]:
+    """Validate and return normalized fields for creating an order."""
+    if not isinstance(payload, dict):
+        raise _validation_error(
+            [
+                {"field": "customer_id", "message": "Required"},
+                {"field": "total_cents", "message": "Required"},
+            ]
+        )
+
+    errors: list[dict[str, str]] = []
+    for name in sorted(
+        (name for name in payload if name not in {"customer_id", "total_cents"}),
+        key=str,
+    ):
+        errors.append({"field": str(name), "message": "Unknown field"})
+
+    customer_id = payload.get("customer_id")
+    if "customer_id" not in payload:
+        errors.append({"field": "customer_id", "message": "Required"})
+    elif not isinstance(customer_id, str):
+        errors.append({"field": "customer_id", "message": "Must be a string"})
+    elif not 1 <= len(customer_id) <= MAX_CUSTOMER_ID_LENGTH:
+        errors.append(
+            {
+                "field": "customer_id",
+                "message": f"Must contain 1 to {MAX_CUSTOMER_ID_LENGTH} characters",
+            }
+        )
+    elif not customer_id.strip():
+        errors.append({"field": "customer_id", "message": "Must not be blank"})
+
+    if "total_cents" not in payload:
+        errors.append({"field": "total_cents", "message": "Required"})
+    else:
+        _check_total_cents(payload["total_cents"], "total_cents", errors)
+
+    if errors:
+        raise _validation_error(errors)
+    return {"customer_id": customer_id, "total_cents": payload["total_cents"]}
+
+
+def validate_patch(payload: Any) -> dict[str, Any]:
+    """Validate and return normalized fields for updating an order."""
+    if not isinstance(payload, dict):
+        raise _validation_error([{"field": "body", "message": "Must be a JSON object"}])
+
+    errors: list[dict[str, str]] = []
+    for name in sorted(
+        (name for name in payload if name not in {"status", "total_cents"}),
+        key=str,
+    ):
+        errors.append({"field": str(name), "message": "Unknown field"})
+    if not payload:
+        errors.append({"field": "body", "message": "At least one field is required"})
+
+    if "status" in payload and (
+        not isinstance(payload["status"], str)
+        or payload["status"] not in ORDER_STATUSES
+    ):
+        errors.append(
+            {
+                "field": "status",
+                "message": "Must be one of: cancelled, new, paid, shipped",
+            }
+        )
+    if "total_cents" in payload:
+        _check_total_cents(payload["total_cents"], "total_cents", errors)
+
+    if errors:
+        raise _validation_error(errors)
+    return dict(payload)
+
+
+def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
+    """Validate order-list query pairs and return their effective values."""
+    allowed = {"status", "customer_id", "limit", "offset"}
+    values: dict[str, str] = {}
+    errors: list[dict[str, str]] = []
+    for name, value in query:
+        if name not in allowed:
+            errors.append({"field": name, "message": "Unsupported query parameter"})
+        elif name in values:
+            errors.append({"field": name, "message": "Parameter may appear once"})
+        else:
+            values[name] = value
+
+    if "status" in values and values["status"] not in ORDER_STATUSES:
+        errors.append(
+            {"field": "status", "message": "Must be a supported order status"}
+        )
+    if "limit" in values:
+        try:
+            limit = int(values["limit"])
+            if not 1 <= limit <= 100:
+                raise ValueError
+        except ValueError:
+            errors.append(
+                {"field": "limit", "message": "Must be an integer from 1 to 100"}
+            )
+    else:
+        limit = 20
+    if "offset" in values:
+        try:
+            offset = int(values["offset"])
+            if offset < 0:
+                raise ValueError
+        except ValueError:
+            errors.append(
+                {"field": "offset", "message": "Must be a non-negative integer"}
+            )
+    else:
+        offset = 0
+
+    if errors:
+        errors.sort(key=lambda item: item["field"])
+        raise OrderError("invalid_query", "Invalid query parameters", errors)
+    result: dict[str, Any] = {"limit": limit, "offset": offset}
+    if "status" in values:
+        result["status"] = values["status"]
+    if "customer_id" in values:
+        result["customer_id"] = values["customer_id"]
+    return result
+
+
+class OrderStore:
+    """Thread-safe, process-local order storage with never-reused IDs."""
+
+    def __init__(self, capacity: int = MAX_ORDERS) -> None:
+        if not 1 <= capacity <= MAX_ORDERS:
+            raise ValueError(f"capacity must be between 1 and {MAX_ORDERS}")
+        self._capacity = capacity
+        self._orders: dict[int, dict[str, Any]] = {}
+        self._next_id = 1
+        self._lock = threading.Lock()
+
+    def create(self, customer_id: str, total_cents: int) -> dict[str, Any]:
+        fields = validate_create(
+            {"customer_id": customer_id, "total_cents": total_cents}
+        )
+        with self._lock:
+            if len(self._orders) >= self._capacity:
+                raise OrderError("store_full", "Order store is full")
+            order_id = self._next_id
+            self._next_id += 1
+            order = {
+                "id": order_id,
+                **fields,
+                "status": "new",
+                "created_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+            self._orders[order_id] = order
+            return dict(order)
+
+    def list(
+        self,
+        status: str | None = None,
+        customer_id: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        with self._lock:
+            matched = [
+                self._orders[order_id]
+                for order_id in sorted(self._orders)
+                if (status is None or self._orders[order_id]["status"] == status)
+                and (
+                    customer_id is None
+                    or self._orders[order_id]["customer_id"] == customer_id
+                )
+            ]
+            total = len(matched)
+            return [dict(order) for order in matched[offset : offset + limit]], total
+
+    def get(self, order_id: int) -> dict[str, Any] | None:
+        if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
+            return None
+        with self._lock:
+            order = self._orders.get(order_id)
+            return dict(order) if order is not None else None
+
+    def update(self, order_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
+        fields = validate_patch(changes)
+        with self._lock:
+            current = self._orders.get(order_id)
+            if current is None:
+                return None
+            if "total_cents" in fields and current["status"] != "new":
+                raise OrderError(
+                    "order_locked", "Order total can only change while new"
+                )
+            if "status" in fields:
+                allowed_transitions = {
+                    "new": {"paid", "cancelled"},
+                    "paid": {"shipped", "cancelled"},
+                    "shipped": set(),
+                    "cancelled": set(),
+                }
+                if fields["status"] not in allowed_transitions[current["status"]]:
+                    raise OrderError(
+                        "invalid_transition",
+                        "Order status transition is not allowed",
+                    )
+            updated = {**current, **fields}
+            self._orders[order_id] = updated
+            return dict(updated)
+
+    def delete(self, order_id: int) -> bool:
+        if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
+            return False
+        with self._lock:
+            return self._orders.pop(order_id, None) is not None
