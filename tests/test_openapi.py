@@ -183,6 +183,22 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(patch_total["maximum"], orders.MAX_TOTAL_CENTS)
         self.assertEqual(patch_status, list(orders.STATUSES))
 
+    def test_response_content_documents_json_and_preserves_bodyless_responses(self):
+        spec = self.live_spec()
+
+        orders_response = spec["paths"]["/orders"]["get"]["responses"]["200"]
+        json_content = orders_response["content"]["application/json"]
+        schema = json_content["schema"]
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["properties"]["items"]["type"], "array")
+        self.assertEqual(schema["properties"]["items"]["items"]["type"], "object")
+
+        delete_response = spec["paths"]["/orders/{id}"]["delete"]["responses"]["204"]
+        self.assertNotIn("content", delete_response)
+
+        metrics_response = spec["paths"]["/metrics"]["get"]["responses"]["200"]
+        self.assertNotIn("application/json", metrics_response.get("content", {}))
+
     def test_operation_ids_are_unique(self):
         spec = self.live_spec()
         operation_ids = [

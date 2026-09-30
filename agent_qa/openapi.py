@@ -10,11 +10,25 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
     for route in routes:
         method = route["method"].lower()
         path = route["path"]
+        response_schemas = route.get("response_schemas", {})
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
             "responses": {
-                status: {"description": f"HTTP {status} response"}
+                status: {
+                    "description": f"HTTP {status} response",
+                    **(
+                        {
+                            "content": {
+                                "application/json": {
+                                    "schema": deepcopy(response_schemas[status])
+                                }
+                            }
+                        }
+                        if status in response_schemas
+                        else {}
+                    ),
+                }
                 for status in route["responses"]
             },
         }

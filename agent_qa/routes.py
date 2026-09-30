@@ -239,6 +239,59 @@ _UPDATE_ORDER_SCHEMA = {
     "minProperties": 1,
     "additionalProperties": False,
 }
+_ORDER_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["id", "customer_id", "total_cents", "status", "created_at"],
+    "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "customer_id": _CUSTOMER_ID_SCHEMA,
+        "total_cents": _TOTAL_CENTS_SCHEMA,
+        "status": _STATUS_SCHEMA,
+        "created_at": {"type": "string", "format": "date-time"},
+    },
+    "additionalProperties": False,
+}
+_ORDER_LIST_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["items", "total", "limit", "offset"],
+    "properties": {
+        "items": {"type": "array", "items": _ORDER_RESPONSE_SCHEMA},
+        "total": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
+        "offset": {"type": "integer", "minimum": MIN_OFFSET},
+    },
+    "additionalProperties": False,
+}
+_OPENAPI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["openapi", "info", "paths", "components"],
+    "properties": {
+        "openapi": {"type": "string", "enum": ["3.0.3"]},
+        "info": {
+            "type": "object",
+            "required": ["title", "version", "x-git-sha"],
+            "properties": {
+                "title": {"type": "string", "enum": ["agent-qa"]},
+                "version": {"type": "string"},
+                "x-git-sha": {"type": "string"},
+            },
+        },
+        "paths": {"type": "object"},
+        "components": {"type": "object"},
+    },
+}
+_FIXTURE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "record_type": {"type": "string", "enum": ["synthetic_customer_fixture"]},
+        "customer_id": _CUSTOMER_ID_SCHEMA,
+        "name": {"type": "string"},
+        "email": {"type": "string", "format": "email"},
+        "plan": {"type": "string"},
+        "is_real_person": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
 
 ROUTES = (
     {
@@ -249,6 +302,17 @@ ROUTES = (
         "operation_id": "getReady",
         "summary": "Check service readiness",
         "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["status", "git_sha"],
+                "properties": {
+                    "status": {"type": "string", "enum": ["ready"]},
+                    "git_sha": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+        },
     },
     {
         "method": "GET",
@@ -276,6 +340,7 @@ ROUTES = (
             }
         ],
         "responses": ["200", "400"],
+        "response_schemas": {"200": _FIXTURE_RESPONSE_SCHEMA},
     },
     {
         "method": "GET",
@@ -285,6 +350,18 @@ ROUTES = (
         "operation_id": "getVersion",
         "summary": "Read service version details",
         "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["service", "git_sha", "python_version"],
+                "properties": {
+                    "service": {"type": "string", "enum": ["agent-qa"]},
+                    "git_sha": {"type": "string"},
+                    "python_version": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+        },
     },
     {
         "method": "GET",
@@ -294,6 +371,7 @@ ROUTES = (
         "operation_id": "getOpenapi",
         "summary": "Read the OpenAPI document",
         "responses": ["200"],
+        "response_schemas": {"200": _OPENAPI_RESPONSE_SCHEMA},
     },
     {
         "method": "GET",
@@ -342,6 +420,7 @@ ROUTES = (
             },
         ],
         "responses": ["200", "400"],
+        "response_schemas": {"200": _ORDER_LIST_RESPONSE_SCHEMA},
     },
     {
         "method": "POST",
@@ -353,6 +432,7 @@ ROUTES = (
         "summary": "Create an order",
         "request_schema": _CREATE_ORDER_SCHEMA,
         "responses": ["201", "400", "401", "409", "411", "413", "415"],
+        "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
     },
     {
         "method": "DELETE",
@@ -373,6 +453,7 @@ ROUTES = (
         "summary": "Read an order",
         "parameters": [_ORDER_ID],
         "responses": ["200", "404"],
+        "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
     },
     {
         "method": "PATCH",
@@ -385,5 +466,6 @@ ROUTES = (
         "parameters": [_ORDER_ID],
         "request_schema": _UPDATE_ORDER_SCHEMA,
         "responses": ["200", "400", "401", "404", "409", "413", "415"],
+        "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
     },
 )
