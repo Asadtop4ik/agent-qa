@@ -31,10 +31,14 @@ class ObservabilityApiTests(unittest.TestCase):
         def request(method, path, body=None, headers=None):
             nonlocal completed_requests
             data = json.dumps(body).encode("utf-8") if body is not None else None
+            request_headers = {"Content-Type": "application/json"}
+            if method in {"POST", "PATCH", "DELETE"}:
+                request_headers["X-API-Key"] = "qa-synthetic-key"
+            request_headers.update(headers or {})
             req = Request(
                 base + path,
                 data=data,
-                headers={"Content-Type": "application/json", **(headers or {})},
+                headers=request_headers,
                 method=method,
             )
             try:
@@ -162,6 +166,7 @@ class ObservabilityApiTests(unittest.TestCase):
         )
         self.assertNotIn("secret", output)
         self.assertNotIn("header-secret", output)
+        self.assertNotIn("qa-synthetic-key", output)
         self.assertNotIn("body-secret", output)
 
 

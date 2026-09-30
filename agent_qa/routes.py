@@ -179,18 +179,40 @@ def delete_order(
 
 
 ROUTES = (
-    {"method": "GET", "path": "/ready", "handler": ready},
-    {"method": "GET", "path": "/metrics", "handler": metrics},
-    {"method": "GET", "path": "/fixture", "handler": fixture},
-    {"method": "GET", "path": "/version", "handler": version},
-    {"method": "GET", "path": "/orders", "handler": list_orders},
-    {"method": "POST", "path": "/orders", "handler": create_order, "body": True},
-    {"method": "DELETE", "path": "/orders/{id}", "handler": delete_order},
-    {"method": "GET", "path": "/orders/{id}", "handler": get_order},
+    {"method": "GET", "path": "/ready", "handler": ready, "auth_required": False},
+    {"method": "GET", "path": "/metrics", "handler": metrics, "auth_required": False},
+    {"method": "GET", "path": "/fixture", "handler": fixture, "auth_required": False},
+    {"method": "GET", "path": "/version", "handler": version, "auth_required": False},
+    {
+        "method": "GET",
+        "path": "/orders",
+        "handler": list_orders,
+        "auth_required": False,
+    },
+    {
+        "method": "POST",
+        "path": "/orders",
+        "handler": create_order,
+        "body": True,
+        "auth_required": True,
+    },
+    {
+        "method": "DELETE",
+        "path": "/orders/{id}",
+        "handler": delete_order,
+        "auth_required": True,
+    },
+    {
+        "method": "GET",
+        "path": "/orders/{id}",
+        "handler": get_order,
+        "auth_required": False,
+    },
     {
         "method": "PATCH",
         "path": "/orders/{id}",
         "handler": patch_order,
         "body": True,
+        "auth_required": True,
     },
 )
