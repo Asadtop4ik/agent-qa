@@ -103,6 +103,46 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(fixture, expected_fixture)
         self.assertEqual(fixture["record_type"], "synthetic_customer_fixture")
 
+    def test_fixture_fields_projection(self):
+        with urlopen(self.base + "/fixture?fields=name,plan", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                json.load(response),
+                {"name": "Example QA Customer", "plan": "sandbox"},
+            )
+
+    def test_fixture_duplicate_field_is_returned_once(self):
+        with urlopen(self.base + "/fixture?fields=name,name", timeout=2) as response:
+            self.assertEqual(json.load(response), {"name": "Example QA Customer"})
+
+    def test_fixture_fields_reject_invalid_queries(self):
+        invalid_queries = (
+            "fields=",
+            "fields=name,,plan",
+            "fields=name,%20plan",
+            "fields=nope",
+            "fields=name&fields=plan",
+            "x=1",
+        )
+        for query in invalid_queries:
+            with self.subTest(query=query):
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self.base + "/fixture?" + query, timeout=2)
+                self.assertEqual(error.exception.code, 400)
+                body = json.load(error.exception)
+                self.assertEqual(body["error"]["code"], "invalid_query")
+                self.assertTrue(body["error"]["details"])
+                self.assertTrue(body["error"]["details"][0]["param"])
+                self.assertTrue(body["error"]["details"][0]["message"])
+                if query == "fields=nope":
+                    self.assertEqual(body["error"]["details"][0]["param"], "fields")
+
+    def test_fixture_single_field_excludes_other_fields(self):
+        with urlopen(self.base + "/fixture?fields=email", timeout=2) as response:
+            self.assertEqual(
+                json.load(response), {"email": "qa-customer-0001@example.invalid"}
+            )
+
     def test_unknown_route_is_not_found(self):
         with self.assertRaises(HTTPError) as error:
             urlopen(self.base + "/missing", timeout=2)
