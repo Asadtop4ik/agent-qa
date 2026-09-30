@@ -9,6 +9,10 @@ _REQUESTS_NAME = "agent_qa_http_requests_total"
 _DURATION_NAME = "agent_qa_http_request_duration_seconds"
 _ORDERS_NAME = "agent_qa_orders"
 _BUILD_NAME = "agent_qa_build_info"
+_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
+)
+_OTHER_METHOD = "OTHER"
 MetricSample = tuple[str, tuple[tuple[str, str], ...], str]
 
 
@@ -38,7 +42,10 @@ class MetricsRegistry:
         self, method: str, route: str, status: int, duration_seconds: float
     ) -> None:
         """Record one completed request and its elapsed time."""
-        request_labels = (str(method), str(route), str(status))
+        method_label = str(method).upper()
+        if method_label not in _HTTP_METHODS:
+            method_label = _OTHER_METHOD
+        request_labels = (method_label, str(route), str(status))
         duration_labels = request_labels[:2]
         with self._lock:
             self._requests[request_labels] = self._requests.get(request_labels, 0) + 1

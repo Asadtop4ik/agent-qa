@@ -48,7 +48,7 @@ class MetricsRegistryTests(unittest.TestCase):
 
     def test_labels_escape_backslash_quote_and_newline(self):
         registry = MetricsRegistry()
-        registry.record('G"ET', "line\n\\path", 500, 0.125)
+        registry.record('G"ET', 'line\n"\\path', 500, 0.125)
 
         rendered = registry.render(0, 'sha"\\\n')
         self.assertEqual(
@@ -57,10 +57,31 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertIn('git_sha="sha\\"\\\\\\n"', rendered)
         self.assertIn(
-            'method="G\\"ET",route="line\\n\\\\path",status="500"',
+            'method="OTHER",route="line\\n\\"\\\\path",status="500"',
             rendered,
         )
         self.assertTrue(rendered.endswith("\n"))
+
+    def test_unrecognized_methods_share_a_bounded_series(self):
+        registry = MetricsRegistry()
+        for index in range(100):
+            registry.record(f"CUSTOM-{index}", "/ready", 200, 0.01)
+        registry.record("GET", "/ready", 200, 0.5)
+
+        rendered = registry.render(0, "test")
+        self.assertIn(
+            'agent_qa_http_requests_total{method="GET",route="/ready",'
+            'status="200"} 1',
+            rendered,
+        )
+        self.assertIn(
+            'agent_qa_http_requests_total{method="OTHER",route="/ready",'
+            'status="200"} 100',
+            rendered,
+        )
+        self.assertNotIn("CUSTOM-", rendered)
+        self.assertEqual(rendered.count('method="'), 6)
+        self.assertLess(len(rendered), 1000)
 
     def test_render_uses_a_consistent_request_snapshot(self):
         registry = MetricsRegistry()
