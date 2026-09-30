@@ -188,12 +188,15 @@ class OpenApiDriftTests(unittest.TestCase):
 
         about_response = spec["paths"]["/about"]["get"]["responses"]["200"]
         about_schema = about_response["content"]["application/json"]["schema"]
-        self.assertEqual(about_schema["required"], ["service", "git_sha"])
+        self.assertEqual(
+            about_schema["required"], ["service", "git_sha", "environment"]
+        )
         self.assertEqual(
             about_schema["properties"],
             {
                 "service": {"type": "string", "enum": ["agent-qa"]},
                 "git_sha": {"type": "string"},
+                "environment": {"type": "string", "enum": ["qa"]},
             },
         )
         self.assertFalse(about_schema["additionalProperties"])
