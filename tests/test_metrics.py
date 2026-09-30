@@ -94,6 +94,14 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertIn("agent_qa_http_requests_total", snapshot)
 
+    def test_products_gauge_is_omitted_without_a_value_and_rendered_at_zero(self):
+        registry = MetricsRegistry()
+
+        self.assertNotIn("agent_qa_products", registry.render(0, "test"))
+        rendered = registry.render(0, "test", products=0)
+        self.assertIn("# TYPE agent_qa_products gauge\n", rendered)
+        self.assertIn("agent_qa_products 0\n", rendered)
+
     def test_concurrent_recording_is_thread_safe(self):
         registry = MetricsRegistry()
         thread_count = 8

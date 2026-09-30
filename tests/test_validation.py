@@ -282,6 +282,33 @@ class SchemaValidationTests(unittest.TestCase):
             ],
         )
 
+    def test_pattern_full_match_is_an_explicit_extension(self):
+        self.assertEqual(validate({"type": "string", "pattern": "cat"}, "catalog"), [])
+        self.assertTrue(
+            validate(
+                {"type": "string", "pattern": "cat", "x-fullMatch": True},
+                "catalog",
+            )
+        )
+
+    def test_product_pattern_and_nonzero_extensions_are_enforced(self):
+        from agent_qa.schemas import SCHEMAS
+
+        product = {
+            "sku": "ITEM-1\n",
+            "name": "Item",
+            "category": "items",
+            "price_cents": 0,
+        }
+        self.assertEqual(
+            validate(SCHEMAS["CreateProduct"], product),
+            [{"field": "sku", "message": "Must match the required pattern"}],
+        )
+        self.assertEqual(
+            validate(SCHEMAS["AdjustStock"], {"delta": 0}),
+            [{"field": "delta", "message": "Must not be zero"}],
+        )
+
 
 class QueryValidationTests(unittest.TestCase):
     PARAMETERS = [

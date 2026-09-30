@@ -14,6 +14,22 @@ curl http://127.0.0.1:8080/ready
 
 Order write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before starting the service to configure the key. If the variable is unset or empty, the service uses the documented synthetic fallback `qa-synthetic-key`; this fallback is for synthetic QA environments only. Read endpoints and `POST /schemas/{name}/validate` remain public.
 
+## Products
+
+`GET /products` searches and filters the in-memory product catalog;
+`GET /products/{id}` reads a product, and `GET /categories` returns category
+totals. Create, update, delete, and stock adjustment requests require
+`X-API-Key`. Product creation accepts `sku`, `name`, `category`, and
+`price_cents`, with optional `stock`, `tags`, and `active`. Use
+`POST /products/{id}/adjust-stock` with `{"delta":1}` to change stock
+atomically. The store holds up to 500 products and resets when the service
+restarts.
+
+For example, `GET /products?category=tools&in_stock=true&sort=-price_cents&limit=20`
+lists available tools by descending price. Filters include `category`, `tag`,
+`active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`; pagination
+uses `limit` and `offset`.
+
 ## JSON schemas
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.

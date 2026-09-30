@@ -11,7 +11,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from agent_qa import orders
+from agent_qa import orders, products, schemas
 from agent_qa.openapi import build_openapi
 from agent_qa.routes import ROUTES
 from agent_qa.schemas import SCHEMAS
@@ -203,6 +203,112 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertIn("/schemas/{name}", spec["paths"])
         self.assertIn("/schemas/{name}/validate", spec["paths"])
         self.assertIn("requestBody", spec["paths"]["/schemas/{name}/validate"]["post"])
+
+    def test_product_routes_schemas_and_query_limits_are_documented(self):
+        spec = self.live_spec()
+        paths = spec["paths"]
+        self.assertTrue(
+            {
+                ("post", "/products"),
+                ("get", "/products"),
+                ("get", "/products/{id}"),
+                ("patch", "/products/{id}"),
+                ("delete", "/products/{id}"),
+                ("post", "/products/{id}/adjust-stock"),
+                ("get", "/categories"),
+            }.issubset(
+                {(method, path) for path, item in paths.items() for method in item}
+            )
+        )
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+
+        create_body = paths["/products"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        patch_body = paths["/products/{id}"]["patch"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        adjust_body = paths["/products/{id}/adjust-stock"]["post"]["requestBody"][
+            "content"
+        ]["application/json"]["schema"]
+        self.assertEqual(create_body, SCHEMAS["CreateProduct"])
+        self.assertEqual(patch_body, SCHEMAS["UpdateProduct"])
+        self.assertEqual(adjust_body, SCHEMAS["AdjustStock"])
+
+        product_properties = create_body["properties"]
+        self.assertEqual(
+            product_properties["price_cents"]["minimum"], schemas.MIN_PRICE_CENTS
+        )
+        self.assertEqual(
+            product_properties["price_cents"]["maximum"], schemas.MAX_PRICE_CENTS
+        )
+        self.assertEqual(product_properties["stock"]["minimum"], schemas.MIN_STOCK)
+        self.assertEqual(product_properties["stock"]["maximum"], schemas.MAX_STOCK)
+        self.assertEqual(product_properties["sku"]["minLength"], 2)
+        self.assertEqual(product_properties["sku"]["maxLength"], schemas.MAX_SKU_LENGTH)
+        self.assertEqual(
+            product_properties["sku"]["pattern"], "^[A-Z0-9][A-Z0-9-]{1,31}$"
+        )
+        self.assertTrue(product_properties["sku"]["x-fullMatch"])
+        self.assertEqual(
+            product_properties["name"]["minLength"], schemas.MIN_PRODUCT_NAME_LENGTH
+        )
+        self.assertEqual(
+            product_properties["name"]["maxLength"], schemas.MAX_PRODUCT_NAME_LENGTH
+        )
+        self.assertTrue(product_properties["name"]["x-nonBlank"])
+        self.assertEqual(
+            product_properties["category"]["maxLength"], schemas.MAX_CATEGORY_LENGTH
+        )
+        self.assertEqual(
+            product_properties["category"]["pattern"],
+            "^[a-z0-9][a-z0-9-]{0,31}$",
+        )
+        self.assertTrue(product_properties["category"]["x-fullMatch"])
+        tags_schema = product_properties["tags"]
+        self.assertEqual(tags_schema["maxItems"], schemas.MAX_PRODUCT_TAGS)
+        self.assertTrue(tags_schema["uniqueItems"])
+        self.assertEqual(
+            tags_schema["items"]["maxLength"], schemas.MAX_PRODUCT_TAG_LENGTH
+        )
+        self.assertTrue(tags_schema["items"]["x-fullMatch"])
+        self.assertEqual(product_properties["active"]["type"], "boolean")
+        self.assertEqual(
+            SCHEMAS["ProductList"]["properties"]["total"]["maximum"],
+            products.MAX_PRODUCTS,
+        )
+        self.assertEqual(
+            SCHEMAS["CategoryList"]["properties"]["total"]["maximum"],
+            products.MAX_PRODUCTS,
+        )
+        self.assertEqual(schemas.MAX_PRODUCTS, products.MAX_PRODUCTS)
+
+        parameters = {
+            parameter["name"]: parameter["schema"]
+            for parameter in paths["/products"]["get"]["parameters"]
+        }
+        self.assertEqual(parameters["sort"]["enum"], list(schemas.PRODUCT_SORTS))
+        self.assertEqual(parameters["q"]["maxLength"], schemas.MAX_PRODUCT_QUERY_LENGTH)
+        self.assertEqual(parameters["limit"]["minimum"], orders.MIN_LIMIT)
+        self.assertEqual(parameters["limit"]["maximum"], orders.MAX_LIMIT)
+        self.assertEqual(parameters["limit"]["default"], orders.DEFAULT_LIMIT)
+        self.assertEqual(parameters["offset"]["minimum"], orders.MIN_OFFSET)
+        self.assertEqual(parameters["offset"]["default"], orders.DEFAULT_OFFSET)
+        delta_schema = SCHEMAS["AdjustStock"]["properties"]["delta"]
+        self.assertEqual(delta_schema["minimum"], -schemas.MAX_STOCK)
+        self.assertEqual(delta_schema["maximum"], schemas.MAX_STOCK)
+        self.assertTrue(delta_schema["x-nonZero"])
+
+        for path, method in (
+            ("/products", "post"),
+            ("/products/{id}", "patch"),
+            ("/products/{id}", "delete"),
+            ("/products/{id}/adjust-stock", "post"),
+        ):
+            self.assertTrue(paths[path][method].get("security"))
+        self.assertNotIn(
+            "content", paths["/products/{id}"]["delete"]["responses"]["204"]
+        )
 
     def test_response_content_documents_json_and_preserves_bodyless_responses(self):
         spec = self.live_spec()

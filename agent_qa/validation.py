@@ -69,7 +69,8 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
 
     Supported keywords are type, required, properties, additionalProperties,
     enum, minimum, maximum, minLength, maxLength, pattern, items, minItems,
-    maxItems, minProperties, and x-nonBlank.
+    maxItems, uniqueItems for bounded arrays, minProperties, x-fullMatch,
+    x-nonBlank, and x-nonZero.
     """
     errors: list[dict[str, str]] = []
 
@@ -128,7 +129,11 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
             pattern = current_schema.get("pattern")
             if isinstance(pattern, str):
                 try:
-                    if re.search(pattern, value) is None:
+                    if current_schema.get("x-fullMatch") is True:
+                        matcher = re.fullmatch
+                    else:
+                        matcher = re.search
+                    if matcher(pattern, value) is None:
                         add(field, "Must match the required pattern")
                         return
                 except re.error:
@@ -141,6 +146,9 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             if isinstance(value, float) and not math.isfinite(value):
                 add(field, "Must be a number")
+                return
+            if current_schema.get("x-nonZero") is True and value == 0:
+                add(field, "Must not be zero")
                 return
             minimum = current_schema.get("minimum")
             maximum = current_schema.get("maximum")
@@ -201,6 +209,18 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
             if isinstance(maximum_items, int) and not isinstance(maximum_items, bool):
                 if len(value) > maximum_items:
                     add(field, f"Must contain at most {maximum_items} items")
+            if (
+                current_schema.get("uniqueItems") is True
+                and isinstance(maximum_items, int)
+                and not isinstance(maximum_items, bool)
+                and len(value) <= maximum_items
+            ):
+                try:
+                    if len(value) != len(set(value)):
+                        add(field, "Items must be unique")
+                except TypeError:
+                    # Invalid item types are reported by their item schemas.
+                    pass
             item_schema = current_schema.get("items")
             if isinstance(item_schema, dict):
                 for index, item in enumerate(value):
