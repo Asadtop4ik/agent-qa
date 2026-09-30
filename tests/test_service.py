@@ -61,6 +61,14 @@ class ServiceTests(unittest.TestCase):
                 json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
             )
 
+    def test_ping_returns_pong(self):
+        with urlopen(self.base + "/ping", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertEqual(json.load(response), {"pong": True})
+
     def test_status_returns_fixture_health(self):
         with urlopen(self.base + "/status", timeout=2) as response:
             self.assertEqual(response.status, 200)
