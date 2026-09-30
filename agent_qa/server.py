@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa import config
 from agent_qa.errors import ApiError, envelope
+from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
 
 
@@ -19,6 +20,20 @@ def allowed_methods(path: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def handle_one_request(self) -> None:
+        self.request_id = request_id(None)
+        super().handle_one_request()
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        self._use_header_request_id()
+        return parsed
+
+    def _use_header_request_id(self) -> None:
+        headers = getattr(self, "headers", None)
+        if headers is not None:
+            self.request_id = request_id(headers.get("X-Request-Id"))
+
     def _json(
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
@@ -27,6 +42,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-Id", self.request_id)
         for name, value in (headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -34,10 +50,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
     def _not_found(self) -> None:
-        self._json(404, envelope("not_found", "Route not found"))
+        self._json(
+            404, envelope("not_found", "Route not found", request_id=self.request_id)
+        )
 
     def _internal_error(self) -> None:
-        self._json(500, envelope("internal_error", "Internal server error"))
+        self._json(
+            500,
+            envelope(
+                "internal_error", "Internal server error", request_id=self.request_id
+            ),
+        )
 
     def _handle_get(self) -> None:
         parsed = urlsplit(self.path)
@@ -69,14 +92,24 @@ class Handler(BaseHTTPRequestHandler):
             result = route["handler"](parse_qsl(parsed.query, keep_blank_values=True))
             self._json(*result)
         except ApiError as error:
-            self._json(error.status, envelope(error.code, error.message, error.details))
+            self._json(
+                error.status,
+                envelope(
+                    error.code,
+                    error.message,
+                    error.details,
+                    request_id=self.request_id,
+                ),
+            )
         except Exception:
             self._internal_error()
 
     def _method_not_allowed(self, routes: list[dict[str, object]]) -> None:
         self._json(
             405,
-            envelope("method_not_allowed", "Method not allowed"),
+            envelope(
+                "method_not_allowed", "Method not allowed", request_id=self.request_id
+            ),
             {"Allow": allowed_methods(str(routes[0]["path"]))},
         )
 
@@ -84,7 +117,15 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._handle_get()
         except ApiError as error:
-            self._json(error.status, envelope(error.code, error.message, error.details))
+            self._json(
+                error.status,
+                envelope(
+                    error.code,
+                    error.message,
+                    error.details,
+                    request_id=self.request_id,
+                ),
+            )
         except Exception:
             self._internal_error()
 
@@ -105,6 +146,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._handle_unsupported_method()
+
+    def send_error(
+        self,
+        code: int,
+        message: str | None = None,
+        explain: str | None = None,
+    ) -> None:
+        self._use_header_request_id()
+        safe_message = "Bad request" if code < 500 else "Internal server error"
+        self._json(
+            code,
+            envelope("http_error", safe_message, request_id=self.request_id),
+        )
 
     def log_message(self, fmt: str, *args: object) -> None:
         print("agent-qa: " + fmt % args)
