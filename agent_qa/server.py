@@ -90,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
     def _json(
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
-        is_empty = status == 204
+        is_empty = status in {204, 304}
         response_headers = headers or {}
         content_type = response_headers.get("Content-Type")
         if is_empty:
@@ -293,7 +293,18 @@ class Handler(BaseHTTPRequestHandler):
                         "Request validation failed",
                         errors,
                     )
-            status, body, headers = route["handler"](query, path_params, payload)
+            conditional_headers = route.get("conditional_headers")
+            if conditional_headers:
+                request_headers = {}
+                for name in conditional_headers:
+                    values = self.headers.get_all(name, [])
+                    if values:
+                        request_headers[name] = ", ".join(values)
+                status, body, headers = route["handler"](
+                    query, path_params, payload, request_headers=request_headers
+                )
+            else:
+                status, body, headers = route["handler"](query, path_params, payload)
         except Exception:
             if idempotency_scope is not None:
                 IDEMPOTENCY_STORE.abort(idempotency_scope)
@@ -329,6 +340,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             (dispatch or self._dispatch)()
         except ApiError as error:
+            response_headers = {}
+            current_etag = getattr(error, "current_etag", None)
+            if current_etag is not None:
+                response_headers["ETag"] = current_etag
             self._json(
                 error.status,
                 envelope(
@@ -337,6 +352,7 @@ class Handler(BaseHTTPRequestHandler):
                     error.details,
                     request_id=self.request_id,
                 ),
+                response_headers,
             )
         except OrderError as error:
             status = {

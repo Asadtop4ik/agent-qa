@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import threading
 from typing import Any
 
+from agent_qa.conditional import check_expected_version
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
@@ -132,17 +133,26 @@ class OrderStore:
         self._lock = threading.RLock()
 
     @staticmethod
-    def _copy_order(order: dict[str, Any]) -> dict[str, Any]:
-        return {**order, "items": [dict(item) for item in order.get("items", [])]}
+    def _copy_order(
+        order: dict[str, Any], include_version: bool = False
+    ) -> dict[str, Any]:
+        copied = {**order, "items": [dict(item) for item in order.get("items", [])]}
+        if not include_version:
+            copied.pop("version", None)
+        return copied
 
-    def create(self, customer_id: str, total_cents: int) -> dict[str, Any]:
+    def create(
+        self, customer_id: str, total_cents: int, *, include_version: bool = False
+    ) -> dict[str, Any]:
         fields = validate_create(
             {"customer_id": customer_id, "total_cents": total_cents}
         )
         with self._lock:
-            return self._create_locked({**fields, "items": []})
+            return self._create_locked({**fields, "items": []}, include_version)
 
-    def _create_locked(self, fields: dict[str, Any]) -> dict[str, Any]:
+    def _create_locked(
+        self, fields: dict[str, Any], include_version: bool = False
+    ) -> dict[str, Any]:
         """Create a previously validated order while ``_lock`` is held."""
         if len(self._orders) >= self._capacity:
             raise OrderError("store_full", "Order store is full")
@@ -153,10 +163,11 @@ class OrderStore:
             **fields,
             "items": [dict(item) for item in fields.get("items", [])],
             "status": "new",
+            "version": 1,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         self._orders[order_id] = order
-        return self._copy_order(order)
+        return self._copy_order(order, include_version)
 
     def list(
         self,
@@ -181,19 +192,33 @@ class OrderStore:
                 total,
             )
 
-    def get(self, order_id: int) -> dict[str, Any] | None:
+    def get(
+        self, order_id: int, *, include_version: bool = False
+    ) -> dict[str, Any] | None:
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
             return None
         with self._lock:
             order = self._orders.get(order_id)
-            return self._copy_order(order) if order is not None else None
+            return (
+                self._copy_order(order, include_version) if order is not None else None
+            )
 
-    def update(self, order_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
+    def update(
+        self,
+        order_id: int,
+        changes: dict[str, Any],
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+        include_version: bool = False,
+    ) -> dict[str, Any] | None:
         fields = validate_patch(changes)
         with self._lock:
             current = self._orders.get(order_id)
             if current is None:
                 return None
+            check_expected_version(
+                expected_version, "order", order_id, current["version"]
+            )
             if "total_cents" in fields and current.get("items"):
                 from agent_qa.errors import ApiError
 
@@ -216,12 +241,24 @@ class OrderStore:
                         "invalid_transition",
                         "Order status transition is not allowed",
                     )
-            updated = {**current, **fields}
+            updated = {**current, **fields, "version": current["version"] + 1}
             self._orders[order_id] = updated
-            return self._copy_order(updated)
+            return self._copy_order(updated, include_version)
 
-    def delete(self, order_id: int) -> bool:
+    def delete(
+        self,
+        order_id: int,
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+    ) -> bool:
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
             return False
         with self._lock:
-            return self._orders.pop(order_id, None) is not None
+            current = self._orders.get(order_id)
+            if current is None:
+                return False
+            check_expected_version(
+                expected_version, "order", order_id, current["version"]
+            )
+            del self._orders[order_id]
+            return True

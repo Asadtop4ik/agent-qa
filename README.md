@@ -30,6 +30,22 @@ lists available tools by descending price. Filters include `category`, `tag`,
 `active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`; pagination
 uses `limit` and `offset`.
 
+## Conditional requests
+
+Order and product item responses include version ETags such as `"o12.3"` and
+`"p4.2"`; versions begin at 1, increase after changes, and are not included in
+JSON. Stock reservations and releases also advance the product version. List
+responses use weak ETags derived from the canonical response body. Send
+`If-None-Match` on GET requests; it uses weak comparison, accepts a tag list or
+`*`, and returns a bodyless `304` on a match. Send `If-Match` on PATCH, DELETE,
+or stock adjustment to prevent a write based on an old version. It uses strong
+comparison, accepts a tag list or `*`, and never matches a weak tag. A mismatch
+returns `412` with the current ETag. A malformed condition returns `400`.
+`If-Match` is optional by default. Set `AGENT_QA_REQUIRE_IF_MATCH=true` to
+require it for those writes; a missing required header returns `428`.
+Request checks run in this order: authentication, body parsing and validation,
+resource lookup, precondition format, precondition match, then domain rules.
+
 ## Orders
 
 `POST /orders` accepts either the legacy `{"customer_id":"...","total_cents":1500}`

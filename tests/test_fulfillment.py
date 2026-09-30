@@ -4,6 +4,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+from agent_qa.conditional import PreconditionFailed
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.orders import OrderError, OrderStore
@@ -25,6 +26,26 @@ def product_fields(sku="ITEM-1", **changes):
 
 
 class FulfillmentTests(unittest.TestCase):
+    def test_reserve_release_versions_and_delete_precondition(self):
+        product = self.products.create(**product_fields(stock=4), include_version=True)
+        order = self.service.create(
+            customer_id="customer",
+            items=[{"product_id": product["id"], "quantity": 1}],
+            include_version=True,
+        )
+        self.assertEqual(order["version"], 1)
+        self.assertEqual(
+            self.products.get(product["id"], include_version=True)["version"], 2
+        )
+        with self.assertRaises(PreconditionFailed):
+            self.service.delete(order["id"], expected_version=('"o1.2"',))
+        self.assertEqual(self.products.get(product["id"])["stock"], 3)
+
+        self.service.update(order["id"], {"status": "cancelled"})
+        self.assertEqual(
+            self.products.get(product["id"], include_version=True)["version"], 3
+        )
+
     def setUp(self):
         self.orders = OrderStore()
         self.products = ProductStore()
@@ -87,7 +108,10 @@ class FulfillmentTests(unittest.TestCase):
     def test_multi_line_shortage_reports_all_lines_without_mutation(self):
         first = self.products.create(**product_fields(stock=5))
         second = self.products.create(**product_fields(sku="ITEM-2", stock=1))
-        before = [self.products.get(first["id"]), self.products.get(second["id"])]
+        before = [
+            self.products.get(first["id"], include_version=True),
+            self.products.get(second["id"], include_version=True),
+        ]
         with self.assertRaises(ApiError) as error:
             self.service.create(
                 customer_id="customer",
@@ -102,7 +126,11 @@ class FulfillmentTests(unittest.TestCase):
             [{"field": "items[1].quantity", "message": "Only 1 in stock"}],
         )
         self.assertEqual(
-            [self.products.get(first["id"]), self.products.get(second["id"])], before
+            [
+                self.products.get(first["id"], include_version=True),
+                self.products.get(second["id"], include_version=True),
+            ],
+            before,
         )
         self.assertEqual(self.orders.list()[1], 0)
         self.assertEqual(self.orders._next_id, 1)
@@ -128,7 +156,7 @@ class FulfillmentTests(unittest.TestCase):
         product = self.products.create(
             **product_fields(price_cents=100_000_000, stock=3)
         )
-        before = self.products.get(product["id"])
+        before = self.products.get(product["id"], include_version=True)
 
         with self.assertRaises(ApiError) as error:
             self.create(product["id"], 2)
@@ -138,13 +166,16 @@ class FulfillmentTests(unittest.TestCase):
             error.exception.details,
             [{"field": "items", "message": "Order total exceeds maximum"}],
         )
-        self.assertEqual(self.products.get(product["id"]), before)
+        self.assertEqual(self.products.get(product["id"], include_version=True), before)
         self.assertEqual(self.orders._next_id, 1)
 
     def test_second_reservation_write_failure_restores_all_state(self):
         first = self.products.create(**product_fields(stock=3))
         second = self.products.create(**product_fields(sku="ITEM-2", stock=4))
-        before = [self.products.get(first["id"]), self.products.get(second["id"])]
+        before = [
+            self.products.get(first["id"], include_version=True),
+            self.products.get(second["id"], include_version=True),
+        ]
         change_stock = self.products._change_stock_locked
         calls = 0
 
@@ -168,14 +199,18 @@ class FulfillmentTests(unittest.TestCase):
         self.products._change_stock_locked = change_stock
 
         self.assertEqual(
-            [self.products.get(first["id"]), self.products.get(second["id"])], before
+            [
+                self.products.get(first["id"], include_version=True),
+                self.products.get(second["id"], include_version=True),
+            ],
+            before,
         )
         self.assertEqual(self.orders._next_id, 1)
         self.assertEqual(self.orders.list()[1], 0)
 
     def test_unexpected_create_failure_rolls_back_order_id_and_inventory(self):
         product = self.products.create(**product_fields(stock=3))
-        before = self.products.get(product["id"])
+        before = self.products.get(product["id"], include_version=True)
         create_locked = self.orders._create_locked
 
         def fail_after_insert(fields):
@@ -186,7 +221,7 @@ class FulfillmentTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.create(product["id"])
         self.orders._create_locked = create_locked
-        self.assertEqual(self.products.get(product["id"]), before)
+        self.assertEqual(self.products.get(product["id"], include_version=True), before)
         self.assertEqual(self.orders.list()[1], 0)
         self.assertEqual(self.orders._next_id, 1)
 
@@ -243,13 +278,24 @@ class FulfillmentTests(unittest.TestCase):
             ],
         )
         self.products.adjust_stock(first["id"], 1_000_000 - 4)
-        before = [self.products.get(first["id"]), self.products.get(second["id"])]
+        before = [
+            self.products.get(first["id"], include_version=True),
+            self.products.get(second["id"], include_version=True),
+        ]
+        order_before = self.orders.get(order["id"], include_version=True)
 
         with self.assertRaises(ApiError):
             self.service.update(order["id"], {"status": "cancelled"})
         self.assertEqual(self.orders.get(order["id"])["status"], "new")
         self.assertEqual(
-            [self.products.get(first["id"]), self.products.get(second["id"])], before
+            self.orders.get(order["id"], include_version=True), order_before
+        )
+        self.assertEqual(
+            [
+                self.products.get(first["id"], include_version=True),
+                self.products.get(second["id"], include_version=True),
+            ],
+            before,
         )
 
     def test_total_computed_error_precedes_cancel_release_failure(self):
@@ -275,7 +321,11 @@ class FulfillmentTests(unittest.TestCase):
                 {"product_id": second["id"], "quantity": 1},
             ],
         )
-        before = [self.products.get(first["id"]), self.products.get(second["id"])]
+        before = [
+            self.products.get(first["id"], include_version=True),
+            self.products.get(second["id"], include_version=True),
+        ]
+        order_before = self.orders.get(order["id"], include_version=True)
         change_stock = self.products._change_stock_locked
         calls = 0
 
@@ -294,7 +344,14 @@ class FulfillmentTests(unittest.TestCase):
 
         self.assertEqual(self.orders.get(order["id"])["status"], "new")
         self.assertEqual(
-            [self.products.get(first["id"]), self.products.get(second["id"])], before
+            self.orders.get(order["id"], include_version=True), order_before
+        )
+        self.assertEqual(
+            [
+                self.products.get(first["id"], include_version=True),
+                self.products.get(second["id"], include_version=True),
+            ],
+            before,
         )
 
     def test_concurrent_reservations_never_oversell(self):

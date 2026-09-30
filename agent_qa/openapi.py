@@ -34,6 +34,59 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 for status in route["responses"]
             },
         }
+        if route.get("conditional_headers"):
+            conditional_errors = {
+                "400": (
+                    "Malformed conditional header (invalid_precondition) or request."
+                ),
+                "412": (
+                    "The supplied If-Match value does not match "
+                    "(precondition_failed)."
+                ),
+                "428": (
+                    "If-Match is required when AGENT_QA_REQUIRE_IF_MATCH=true "
+                    "(precondition_required)."
+                ),
+            }
+            for status, description in conditional_errors.items():
+                if status in operation["responses"]:
+                    operation["responses"][status].update(
+                        {
+                            "description": description,
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Error"}
+                                }
+                            },
+                        }
+                    )
+            etag_header = {
+                "description": (
+                    "The current entity tag for the returned representation."
+                ),
+                "schema": {"type": "string"},
+            }
+            for status in ("200", "201", "304", "412"):
+                if status in operation["responses"]:
+                    operation["responses"][status].setdefault("headers", {})["ETag"] = (
+                        deepcopy(etag_header)
+                    )
+            if "304" in operation["responses"]:
+                operation["responses"]["304"].setdefault("headers", {})[
+                    "X-Request-Id"
+                ] = {
+                    "description": "Request ID for this response.",
+                    "schema": {"type": "string"},
+                }
+        elif route.get("etag_response"):
+            for status in ("200", "201"):
+                if status in operation["responses"]:
+                    operation["responses"][status].setdefault("headers", {})["ETag"] = {
+                        "description": (
+                            "The current entity tag for the returned representation."
+                        ),
+                        "schema": {"type": "string"},
+                    }
         if route.get("idempotent") and method == "post":
             parameter = {
                 "name": "Idempotency-Key",

@@ -456,6 +456,193 @@ class OrdersApiTests(unittest.TestCase):
                 self.assert_error(response, 405, "method_not_allowed")
                 self.assertEqual(response[1]["Allow"], expected)
 
+    def test_conditional_order_reads_and_writes(self):
+        order = self.create_order()
+        path = f"/orders/{order['id']}"
+        status, headers, fetched = self.request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["ETag"], f'"o{order["id"]}.1"')
+        self.assertNotIn("version", fetched)
+
+        status, headers, body = self.request(
+            "GET", path, headers={"If-None-Match": f'W/"o{order["id"]}.1"'}
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+        self.assertEqual(headers["ETag"], f'"o{order["id"]}.1"')
+        self.assertNotIn("Content-Type", headers)
+
+        stale = self.request(
+            "PATCH", path, {"status": "paid"}, headers={"If-Match": '"o1.0"'}
+        )
+        self.assertEqual(stale[0], 412)
+        self.assertEqual(stale[1]["ETag"], f'"o{order["id"]}.1"')
+        self.assertEqual(stale[2]["error"]["code"], "precondition_failed")
+        invalid = self.request(
+            "PATCH", path, {"status": "paid"}, headers={"If-Match": "o1.1"}
+        )
+        self.assert_error(invalid, 400, "invalid_precondition")
+
+        status, headers, paid = self.request(
+            "PATCH", path, {"status": "paid"}, headers={"If-Match": headers["ETag"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["ETag"], f'"o{order["id"]}.2"')
+        self.assertEqual(paid["status"], "paid")
+
+    def test_conditional_lists_and_product_stock(self):
+        status, headers, _ = self.request("GET", "/orders")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers["ETag"].startswith('W/"'))
+        status, _, body = self.request(
+            "GET",
+            "/orders",
+            headers={"If-None-Match": f'"unrelated", {headers["ETag"]}'},
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+
+        product = self.create_product(stock=4)
+        path = f"/products/{product['id']}"
+        status, headers, current = self.request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+        self.assertNotIn("version", current)
+        status, headers, changed = self.request(
+            "POST",
+            path + "/adjust-stock",
+            {"delta": 1},
+            headers={"If-Match": f'"p{product["id"]}.1"'},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(changed["stock"], 5)
+        self.assertEqual(headers["ETag"], f'"p{product["id"]}.2"')
+
+    def test_item_order_stock_changes_product_etag_and_replay_keeps_create_etag(self):
+        product = self.create_product(stock=3)
+        path = f"/products/{product['id']}"
+        status, headers, _ = self.request("GET", path)
+        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+
+        order_payload = {
+            "customer_id": self.customer_id(),
+            "items": [{"product_id": product["id"], "quantity": 1}],
+        }
+        status, order_headers, order = self.request(
+            "POST",
+            "/orders",
+            order_payload,
+            headers={"Idempotency-Key": "conditional-order-replay"},
+        )
+        self.assertEqual(status, 201)
+        first_etag = order_headers["ETag"]
+        replay = self.request(
+            "POST",
+            "/orders",
+            order_payload,
+            headers={"Idempotency-Key": "conditional-order-replay"},
+        )
+        self.assertEqual(replay[0], 201)
+        self.assertEqual(replay[1]["ETag"], first_etag)
+        self.assertEqual(replay[1]["Idempotent-Replay"], "true")
+
+        status, product_headers, reserved = self.request("GET", path)
+        self.assertEqual(reserved["stock"], 2)
+        self.assertEqual(product_headers["ETag"], f'"p{product["id"]}.2"')
+        changed = self.request(
+            "PATCH", f"/orders/{order['id']}", {"status": "cancelled"}
+        )
+        self.assertEqual(changed[0], 200)
+        self.assertNotEqual(changed[1]["ETag"], first_etag)
+        replay = self.request(
+            "POST",
+            "/orders",
+            order_payload,
+            headers={"Idempotency-Key": "conditional-order-replay"},
+        )
+        self.assertEqual(replay[1]["ETag"], first_etag)
+        self.assertEqual(replay[2], order)
+        status, product_headers, released = self.request("GET", path)
+        self.assertEqual(released["stock"], 3)
+        self.assertEqual(product_headers["ETag"], f'"p{product["id"]}.3"')
+
+        second_payload = {
+            "customer_id": self.customer_id(),
+            "items": [{"product_id": product["id"], "quantity": 1}],
+        }
+        status, _, second_order = self.request("POST", "/orders", second_payload)
+        self.assertEqual(status, 201)
+        self.assertEqual(self.request("GET", path)[1]["ETag"], f'"p{product["id"]}.4"')
+        status, _, body = self.request("DELETE", f"/orders/{second_order['id']}")
+        self.assertEqual(status, 204)
+        self.assertIsNone(body)
+        self.assertEqual(self.request("GET", path)[1]["ETag"], f'"p{product["id"]}.5"')
+
+    def test_conditional_header_missing_can_be_required_in_subprocess(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        env = {
+            "APP_PORT": str(port),
+            "AGENT_QA_GIT_SHA": "if-match-required-test",
+            "AGENT_QA_REQUIRE_IF_MATCH": "true",
+        }
+        process = subprocess.Popen(
+            [sys.executable, "app.py"],
+            cwd=os.path.dirname(os.path.dirname(__file__)),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    urlopen(base + "/ready", timeout=0.2).close()
+                    break
+                except Exception:
+                    if time.monotonic() >= deadline:
+                        self.fail("required-header service did not start")
+                    time.sleep(0.05)
+            product_body = {
+                "sku": "REQ-1",
+                "name": "Required",
+                "category": "tools",
+                "price_cents": 1,
+            }
+            request = Request(
+                base + "/products",
+                data=json.dumps(product_body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-Key": "qa-synthetic-key",
+                },
+                method="POST",
+            )
+            created = urlopen(request, timeout=2)
+            product = json.loads(created.read())
+            created.close()
+            request = Request(
+                base + f"/products/{product['id']}",
+                data=b'{"name":"Changed"}',
+                headers={
+                    "Content-Type": "application/json",
+                    "X-API-Key": "qa-synthetic-key",
+                },
+                method="PATCH",
+            )
+            with self.assertRaises(HTTPError) as response:
+                urlopen(request, timeout=2)
+            self.assertEqual(response.exception.code, 428)
+            self.assertEqual(
+                json.loads(response.exception.read())["error"]["code"],
+                "precondition_required",
+            )
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,41 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_conditional_request_headers_and_responses_are_documented(self):
+        spec = build_openapi(ROUTES, "conditional-test")
+        cases = (
+            ("/orders", "get", "If-None-Match", {"200", "304", "400"}),
+            ("/orders/{id}", "get", "If-None-Match", {"200", "304", "400", "404"}),
+            ("/orders/{id}", "patch", "If-Match", {"200", "400", "412", "428"}),
+            ("/products", "get", "If-None-Match", {"200", "304", "400"}),
+            ("/products/{id}", "delete", "If-Match", {"204", "400", "412", "428"}),
+            (
+                "/products/{id}/adjust-stock",
+                "post",
+                "If-Match",
+                {"200", "400", "412", "428"},
+            ),
+        )
+        for path, method, header, response_codes in cases:
+            with self.subTest(path=path, method=method):
+                operation = spec["paths"][path][method]
+                parameters = operation["parameters"]
+                self.assertIn(
+                    header,
+                    [parameter["name"] for parameter in parameters],
+                )
+                self.assertTrue(response_codes.issubset(operation["responses"]))
+                if "412" in response_codes:
+                    self.assertIn(
+                        "#/components/schemas/Error",
+                        json.dumps(operation["responses"]["412"]),
+                    )
+        self.assertNotIn("content", spec["paths"]["/orders"]["get"]["responses"]["304"])
+        self.assertIn(
+            "ETag",
+            spec["paths"]["/products"]["get"]["responses"]["304"]["headers"],
+        )
+
     def test_order_schemas_export_item_and_exactly_one_limits(self):
         spec = build_openapi(ROUTES, "order-schema-test")
         self.assertEqual(spec["components"]["schemas"], SCHEMAS)
@@ -80,7 +115,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         success_headers = create["responses"]["201"]["headers"]
         self.assertEqual(
             set(success_headers),
-            {"Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+            {"ETag", "Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
         )
 
         future_route = copy.deepcopy(ROUTES[0])

@@ -1,9 +1,12 @@
 """Pure route handlers for the agent QA HTTP service."""
 
+import hashlib
 import json
+import os
 import platform
 
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
+from agent_qa.conditional import etag_for, parse_etag_list, weak_match
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
@@ -36,6 +39,34 @@ from agent_qa.products import (
 
 ORDER_STORE = OrderStore()
 PRODUCT_STORE = ProductStore()
+
+
+def _header(headers: dict[str, str] | None, name: str) -> str | None:
+    if not headers:
+        return None
+    return next(
+        (value for key, value in headers.items() if key.lower() == name.lower()), None
+    )
+
+
+def _list_etag(body: object) -> str:
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f'W/"{digest}"'
+
+
+def _if_none_match(headers: dict[str, str] | None, current: str) -> bool:
+    raw = _header(headers, "If-None-Match")
+    return raw is not None and weak_match(parse_etag_list(raw), current)
+
+
+def _expected_version(headers: dict[str, str] | None) -> tuple[str, ...] | str | None:
+    raw = _header(headers, "If-Match")
+    if raw is None:
+        if os.environ.get("AGENT_QA_REQUIRE_IF_MATCH", "").lower() == "true":
+            raise ApiError(428, "precondition_required", "If-Match is required")
+        return None
+    return parse_etag_list(raw)
 
 
 def ready(
@@ -230,28 +261,40 @@ def create_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create an order."""
     values = validate_create(payload)
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create(**values)
-    return 201, order, {"Location": f"/orders/{order['id']}"}
+    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create(
+        **values, include_version=True
+    )
+    version = order.pop("version")
+    return (
+        201,
+        order,
+        {
+            "Location": f"/orders/{order['id']}",
+            "ETag": etag_for("order", order["id"], version),
+        },
+    )
 
 
 def list_orders(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated orders."""
     filters = validate_query(query)
     items, total = ORDER_STORE.list(**filters)
-    return (
-        200,
-        {
-            "items": items,
-            "total": total,
-            "limit": filters["limit"],
-            "offset": filters["offset"],
-        },
-        {},
-    )
+    body = {
+        "items": items,
+        "total": total,
+        "limit": filters["limit"],
+        "offset": filters["offset"],
+    }
+    etag = _list_etag(body)
+    headers = {"ETag": etag}
+    if _if_none_match(request_headers, etag):
+        return 304, None, headers
+    return 200, body, headers
 
 
 def _order_id(path_params: dict[str, str] | None) -> int | None:
@@ -269,40 +312,60 @@ def get_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return one order or the standard missing-order error."""
     order_id = _order_id(path_params)
-    order = ORDER_STORE.get(order_id) if order_id is not None else None
+    order = (
+        ORDER_STORE.get(order_id, include_version=True)
+        if order_id is not None
+        else None
+    )
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    return 200, order, {}
+    version = order.pop("version")
+    etag = etag_for("order", order_id, version)
+    if _if_none_match(request_headers, etag):
+        return 304, None, {"ETag": etag}
+    return 200, order, {"ETag": etag}
 
 
 def patch_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and update an order."""
+    changes = validate_patch(payload)
     order_id = _order_id(path_params)
     if order_id is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    changes = validate_patch(payload)
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).update(order_id, changes)
+    if ORDER_STORE.get(order_id) is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    expected_version = _expected_version(request_headers)
+    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).update(
+        order_id, changes, expected_version=expected_version, include_version=True
+    )
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    return 200, order, {}
+    version = order.pop("version")
+    return 200, order, {"ETag": etag_for("order", order_id, version)}
 
 
 def delete_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order and return an empty response body."""
     order_id = _order_id(path_params)
-    if order_id is None or not FulfillmentService(ORDER_STORE, PRODUCT_STORE).delete(
-        order_id
+    if order_id is None or ORDER_STORE.get(order_id) is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    expected_version = _expected_version(request_headers)
+    if not FulfillmentService(ORDER_STORE, PRODUCT_STORE).delete(
+        order_id, expected_version=expected_version
     ):
         raise ApiError(404, "order_not_found", "Order not found")
     return 204, None, {"Content-Length": "0"}
@@ -314,28 +377,40 @@ def create_product(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create a product."""
-    product = PRODUCT_STORE.create(**validate_product_create(payload))
-    return 201, product, {"Location": f"/products/{product['id']}"}
+    product = PRODUCT_STORE.create(
+        **validate_product_create(payload), include_version=True
+    )
+    version = product.pop("version")
+    return (
+        201,
+        product,
+        {
+            "Location": f"/products/{product['id']}",
+            "ETag": etag_for("product", product["id"], version),
+        },
+    )
 
 
 def list_products(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated products."""
     filters = validate_product_query(query)
     items, total = PRODUCT_STORE.list(**filters)
-    return (
-        200,
-        {
-            "items": items,
-            "total": total,
-            "limit": filters["limit"],
-            "offset": filters["offset"],
-        },
-        {},
-    )
+    body = {
+        "items": items,
+        "total": total,
+        "limit": filters["limit"],
+        "offset": filters["offset"],
+    }
+    etag = _list_etag(body)
+    headers = {"ETag": etag}
+    if _if_none_match(request_headers, etag):
+        return 304, None, headers
+    return 200, body, headers
 
 
 def _product_id(path_params: dict[str, str] | None) -> int | None:
@@ -353,39 +428,59 @@ def get_product(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return one product or the standard missing-product error."""
     product_id = _product_id(path_params)
-    product = PRODUCT_STORE.get(product_id) if product_id is not None else None
+    product = (
+        PRODUCT_STORE.get(product_id, include_version=True)
+        if product_id is not None
+        else None
+    )
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    return 200, product, {}
+    version = product.pop("version")
+    etag = etag_for("product", product_id, version)
+    if _if_none_match(request_headers, etag):
+        return 304, None, {"ETag": etag}
+    return 200, product, {"ETag": etag}
 
 
 def patch_product(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and update a product."""
+    changes = validate_product_patch(payload)
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    changes = validate_product_patch(payload)
-    product = PRODUCT_STORE.update(product_id, changes)
+    if PRODUCT_STORE.get(product_id) is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    expected_version = _expected_version(request_headers)
+    product = PRODUCT_STORE.update(
+        product_id, changes, expected_version=expected_version, include_version=True
+    )
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    return 200, product, {}
+    version = product.pop("version")
+    return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
 def delete_product(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Delete a product and return an empty response body."""
     product_id = _product_id(path_params)
-    if product_id is None or not PRODUCT_STORE.delete(product_id):
+    if product_id is None or PRODUCT_STORE.get(product_id) is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    expected_version = _expected_version(request_headers)
+    if not PRODUCT_STORE.delete(product_id, expected_version=expected_version):
         raise ApiError(404, "product_not_found", "Product not found")
     return 204, None, {"Content-Length": "0"}
 
@@ -394,16 +489,26 @@ def adjust_product_stock(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
     payload: object = None,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Atomically adjust one product's stock."""
+    values = validate_adjust_stock(payload)
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    values = validate_adjust_stock(payload)
-    product = PRODUCT_STORE.adjust_stock(product_id, values["delta"])
+    if PRODUCT_STORE.get(product_id) is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    expected_version = _expected_version(request_headers)
+    product = PRODUCT_STORE.adjust_stock(
+        product_id,
+        values["delta"],
+        expected_version=expected_version,
+        include_version=True,
+    )
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    return 200, product, {}
+    version = product.pop("version")
+    return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
 def categories(
@@ -435,6 +540,23 @@ _PRODUCT_ID = {
     "required": True,
     "description": "Positive product identifier.",
     "schema": {"type": "integer", "minimum": 1},
+}
+_IF_NONE_MATCH = {
+    "name": "If-None-Match",
+    "in": "header",
+    "required": False,
+    "description": "Return 304 when the current ETag weakly matches this value.",
+    "schema": {"type": "string"},
+}
+_IF_MATCH = {
+    "name": "If-Match",
+    "in": "header",
+    "required": False,
+    "description": (
+        "Apply the change only when a strong ETag matches; server configuration "
+        "may require this header."
+    ),
+    "schema": {"type": "string"},
 }
 _CREATE_PRODUCT_SCHEMA = SCHEMAS["CreateProduct"]
 _UPDATE_PRODUCT_SCHEMA = SCHEMAS["UpdateProduct"]
@@ -798,6 +920,7 @@ ROUTES = (
         "operation_id": "listOrders",
         "summary": "List orders",
         "parameters": [
+            _IF_NONE_MATCH,
             {
                 "name": "status",
                 "in": "query",
@@ -836,8 +959,9 @@ ROUTES = (
                 },
             },
         ],
-        "responses": ["200", "400"],
+        "responses": ["200", "304", "400"],
         "response_schemas": {"200": _ORDER_LIST_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
     },
     {
         "method": "POST",
@@ -848,6 +972,7 @@ ROUTES = (
         "operation_id": "createOrder",
         "summary": "Create an order",
         "idempotent": True,
+        "etag_response": True,
         "request_schema": _CREATE_ORDER_SCHEMA,
         "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
         "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
@@ -859,8 +984,9 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "deleteOrder",
         "summary": "Delete an order",
-        "parameters": [_ORDER_ID],
-        "responses": ["204", "401", "404"],
+        "parameters": [_ORDER_ID, _IF_MATCH],
+        "responses": ["204", "400", "401", "404", "412", "428"],
+        "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
@@ -869,9 +995,10 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getOrder",
         "summary": "Read an order",
-        "parameters": [_ORDER_ID],
-        "responses": ["200", "404"],
+        "parameters": [_ORDER_ID, _IF_NONE_MATCH],
+        "responses": ["200", "304", "400", "404"],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
     },
     {
         "method": "PATCH",
@@ -881,10 +1008,11 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "updateOrder",
         "summary": "Update an order",
-        "parameters": [_ORDER_ID],
+        "parameters": [_ORDER_ID, _IF_MATCH],
         "request_schema": _UPDATE_ORDER_SCHEMA,
-        "responses": ["200", "400", "401", "404", "409", "413", "415"],
+        "responses": ["200", "400", "401", "404", "409", "412", "413", "415", "428"],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-Match"],
     },
     {
         "method": "POST",
@@ -895,6 +1023,7 @@ ROUTES = (
         "operation_id": "createProduct",
         "summary": "Create a product",
         "idempotent": True,
+        "etag_response": True,
         "request_schema": _CREATE_PRODUCT_SCHEMA,
         "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
         "response_schemas": {"201": _PRODUCT_RESPONSE_SCHEMA},
@@ -906,9 +1035,10 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "listProducts",
         "summary": "Search and list products",
-        "parameters": _PRODUCT_QUERY_PARAMETERS,
-        "responses": ["200", "400"],
+        "parameters": [*_PRODUCT_QUERY_PARAMETERS, _IF_NONE_MATCH],
+        "responses": ["200", "304", "400"],
         "response_schemas": {"200": _PRODUCT_LIST_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
     },
     {
         "method": "DELETE",
@@ -917,8 +1047,9 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "deleteProduct",
         "summary": "Delete a product",
-        "parameters": [_PRODUCT_ID],
-        "responses": ["204", "401", "404"],
+        "parameters": [_PRODUCT_ID, _IF_MATCH],
+        "responses": ["204", "400", "401", "404", "412", "428"],
+        "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
@@ -927,9 +1058,10 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getProduct",
         "summary": "Read a product",
-        "parameters": [_PRODUCT_ID],
-        "responses": ["200", "404"],
+        "parameters": [_PRODUCT_ID, _IF_NONE_MATCH],
+        "responses": ["200", "304", "400", "404"],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
     },
     {
         "method": "PATCH",
@@ -939,10 +1071,22 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "updateProduct",
         "summary": "Update a product",
-        "parameters": [_PRODUCT_ID],
+        "parameters": [_PRODUCT_ID, _IF_MATCH],
         "request_schema": _UPDATE_PRODUCT_SCHEMA,
-        "responses": ["200", "400", "401", "404", "409", "411", "413", "415"],
+        "responses": [
+            "200",
+            "400",
+            "401",
+            "404",
+            "409",
+            "411",
+            "412",
+            "413",
+            "415",
+            "428",
+        ],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-Match"],
     },
     {
         "method": "POST",
@@ -952,10 +1096,22 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "adjustProductStock",
         "summary": "Adjust product stock atomically",
-        "parameters": [_PRODUCT_ID],
+        "parameters": [_PRODUCT_ID, _IF_MATCH],
         "request_schema": _ADJUST_STOCK_SCHEMA,
-        "responses": ["200", "400", "401", "404", "409", "411", "413", "415"],
+        "responses": [
+            "200",
+            "400",
+            "401",
+            "404",
+            "409",
+            "411",
+            "412",
+            "413",
+            "415",
+            "428",
+        ],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
