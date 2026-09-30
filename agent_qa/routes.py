@@ -138,6 +138,15 @@ def version(
     )
 
 
+def about(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the service name and build revision."""
+    return 200, {"service": "agent-qa", "git_sha": GIT_SHA}, {}
+
+
 def openapi(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -408,6 +417,26 @@ ROUTES = (
                     "service": {"type": "string", "enum": ["agent-qa"]},
                     "git_sha": {"type": "string"},
                     "python_version": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/about",
+        "handler": about,
+        "auth_required": False,
+        "operation_id": "getAbout",
+        "summary": "Read service name and build revision",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["service", "git_sha"],
+                "properties": {
+                    "service": {"type": "string", "enum": ["agent-qa"]},
+                    "git_sha": {"type": "string"},
                 },
                 "additionalProperties": False,
             }

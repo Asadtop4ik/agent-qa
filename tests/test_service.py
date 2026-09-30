@@ -91,6 +91,17 @@ class ServiceTests(unittest.TestCase):
                 },
             )
 
+    def test_about_returns_service_and_built_sha(self):
+        with urlopen(self.base + "/about", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertEqual(
+                json.load(response),
+                {"service": "agent-qa", "git_sha": "test-sha-123"},
+            )
+
     def test_version_accepts_query_string(self):
         with urlopen(self.base + "/version?a=b", timeout=2) as response:
             self.assertEqual(response.status, 200)
