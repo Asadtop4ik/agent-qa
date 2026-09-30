@@ -12,6 +12,19 @@ curl http://127.0.0.1:8080/ready
 
 `GET /ready` returns `200` with `{"status":"ready","git_sha":"..."}`. The SHA comes from the image build argument. `GET /fixture` returns the synthetic fixture in `data/synthetic-customer.json`.
 
+Write requests (`POST /orders`, `PATCH /orders/{id}`, and `DELETE /orders/{id}`)
+require an `X-API-Key` header. Set `AGENT_QA_API_KEY` when starting the service;
+if it is unset or empty, the synthetic QA service uses the documented default
+`qa-synthetic-key`. This default is only for the synthetic QA environment and is
+not a production credential. Read endpoints remain public.
+
+```sh
+curl -H 'X-API-Key: qa-synthetic-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"local-test","total_cents":1500}' \
+  http://127.0.0.1:8080/orders
+```
+
 ## Layout
 
 - `app.py` starts the HTTP service.
