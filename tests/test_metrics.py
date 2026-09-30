@@ -94,6 +94,25 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertIn("agent_qa_http_requests_total", snapshot)
 
+    def test_idempotency_metric_is_lazy_and_uses_fixed_result_labels(self):
+        registry = MetricsRegistry()
+
+        self.assertNotIn("agent_qa_idempotency_total", registry.render(0, "test"))
+        registry.record_idempotency("stored")
+        registry.record_idempotency("replayed")
+        registry.record_idempotency("mismatch")
+        registry.record_idempotency("in_progress")
+
+        rendered = registry.render(0, "test")
+        self.assertIn(
+            "# TYPE agent_qa_idempotency_total counter\n"
+            'agent_qa_idempotency_total{result="in_progress"} 1\n'
+            'agent_qa_idempotency_total{result="mismatch"} 1\n'
+            'agent_qa_idempotency_total{result="replayed"} 1\n'
+            'agent_qa_idempotency_total{result="stored"} 1\n',
+            rendered,
+        )
+
     def test_products_gauge_is_omitted_without_a_value_and_rendered_at_zero(self):
         registry = MetricsRegistry()
 

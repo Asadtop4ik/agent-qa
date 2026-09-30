@@ -38,6 +38,15 @@ Item orders reserve stock atomically and include product name and price snapshot
 their `total_cents` is computed from the line totals. Cancelling an item order
 releases its reservation once.
 
+`POST /orders` and `POST /products` accept an optional `Idempotency-Key` header
+(1–64 ASCII letters, digits, `.`, `_`, `:`, or `-`). The key is scoped to the API
+key, method, and exact path. Repeating the same JSON request replays its saved
+2xx response with `Idempotent-Replay: true`; only 2xx responses are saved. An
+invalid key returns `400`, reuse with a different request returns `422`, and a
+concurrent request returns `409`. Saved responses expire after 600 seconds by
+default (`AGENT_QA_IDEMPOTENCY_TTL_SECONDS`, range 1–86400), with a maximum of
+500 saved keys.
+
 ## JSON schemas
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.

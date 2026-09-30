@@ -54,6 +54,68 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             },
         )
 
+    def test_idempotent_post_documents_key_errors_and_replay_headers(self):
+        spec = build_openapi(ROUTES, "idempotency-test")
+        create = spec["paths"]["/orders"]["post"]
+
+        key_parameter = next(
+            parameter
+            for parameter in create["parameters"]
+            if parameter["name"] == "Idempotency-Key"
+        )
+        self.assertEqual(key_parameter["in"], "header")
+        self.assertFalse(key_parameter["required"])
+        self.assertEqual(
+            key_parameter["schema"],
+            {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9._:-]+$",
+            },
+        )
+        self.assertIn("idempotency_key_reused", json.dumps(create["responses"]["422"]))
+        self.assertIn("idempotency_in_progress", json.dumps(create["responses"]["409"]))
+        self.assertIn("invalid_idempotency_key", json.dumps(create["responses"]["400"]))
+        success_headers = create["responses"]["201"]["headers"]
+        self.assertEqual(
+            set(success_headers),
+            {"Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+        )
+
+        future_route = copy.deepcopy(ROUTES[0])
+        future_route.update(
+            {
+                "method": "POST",
+                "path": "/orders/bulk",
+                "idempotent": True,
+                "operation_id": "createOrdersBulk",
+                "summary": "Create orders in bulk",
+                "responses": ["201"],
+            }
+        )
+        future = build_openapi([future_route], "idempotency-test")
+        future_operation = future["paths"]["/orders/bulk"]["post"]
+        future_parameters = future_operation["parameters"]
+        future_parameter_names = [parameter["name"] for parameter in future_parameters]
+        self.assertIn("Idempotency-Key", future_parameter_names)
+        self.assertIn("409", future_operation["responses"])
+        self.assertIn("422", future_operation["responses"])
+        self.assertIn("400", future_operation["responses"])
+
+        product = spec["paths"]["/products"]["post"]
+        product_parameter_names = [
+            parameter["name"] for parameter in product["parameters"]
+        ]
+        self.assertIn("Idempotency-Key", product_parameter_names)
+
+        non_post = copy.deepcopy(future_route)
+        non_post.update({"method": "GET", "path": "/orders/bulk", "responses": ["200"]})
+        non_post_spec = build_openapi([non_post], "idempotency-test")
+        non_post_operation = non_post_spec["paths"]["/orders/bulk"]["get"]
+        self.assertNotIn("parameters", non_post_operation)
+        self.assertNotIn("409", non_post_operation["responses"])
+
 
 class OpenApiDriftTests(unittest.TestCase):
     @classmethod

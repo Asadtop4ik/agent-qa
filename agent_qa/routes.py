@@ -847,8 +847,9 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "createOrder",
         "summary": "Create an order",
+        "idempotent": True,
         "request_schema": _CREATE_ORDER_SCHEMA,
-        "responses": ["201", "400", "401", "409", "411", "413", "415"],
+        "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
         "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
     },
     {
@@ -893,8 +894,9 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "createProduct",
         "summary": "Create a product",
+        "idempotent": True,
         "request_schema": _CREATE_PRODUCT_SCHEMA,
-        "responses": ["201", "400", "401", "409", "411", "413", "415"],
+        "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
         "response_schemas": {"201": _PRODUCT_RESPONSE_SCHEMA},
     },
     {
