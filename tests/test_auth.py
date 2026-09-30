@@ -216,7 +216,7 @@ class AuthApiTests(unittest.TestCase):
             serialized_headers = json.dumps(dict(response[1]))
             self.assertNotIn(marker, serialized_headers)
             self.assertNotIn(DEFAULT_KEY, serialized_headers)
-            metrics = server.request("GET", "/metrics")[2]
+            metrics = server.request("GET", "/metrics")[2].decode("utf-8")
         finally:
             logs = server.stop()
         self.assertIn(
