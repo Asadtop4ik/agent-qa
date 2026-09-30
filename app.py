@@ -3,7 +3,9 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import platform
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -22,10 +24,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path == "/ready":
+        path = urlsplit(self.path).path
+        if path == "/ready":
             self._json(200, {"status": "ready", "git_sha": GIT_SHA})
             return
-        if self.path == "/fixture":
+        if path == "/version":
+            self._json(
+                200,
+                {
+                    "service": "agent-qa",
+                    "git_sha": GIT_SHA,
+                    "python_version": platform.python_version(),
+                },
+            )
+            return
+        if path == "/fixture":
             with FIXTURE_PATH.open(encoding="utf-8") as fixture:
                 self._json(200, json.load(fixture))
             return

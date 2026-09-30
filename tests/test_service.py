@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -48,6 +49,38 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(
                 json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
             )
+
+    def test_ready_accepts_query_string(self):
+        with urlopen(self.base + "/ready?x=1", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
+            )
+
+    def test_version_returns_service_details(self):
+        with urlopen(self.base + "/version", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertEqual(
+                json.load(response),
+                {
+                    "service": "agent-qa",
+                    "git_sha": "test-sha-123",
+                    "python_version": platform.python_version(),
+                },
+            )
+
+    def test_version_accepts_query_string(self):
+        with urlopen(self.base + "/version?a=b", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)["service"], "agent-qa")
+
+    def test_version_trailing_slash_is_not_found(self):
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self.base + "/version/", timeout=2)
+        self.assertEqual(error.exception.code, 404)
 
     def test_fixture_is_synthetic(self):
         with urlopen(self.base + "/fixture", timeout=2) as response:
