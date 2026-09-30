@@ -6,18 +6,22 @@ from datetime import datetime, timezone
 import threading
 from typing import Any
 
-STATUSES = ("new", "paid", "shipped", "cancelled")
-ORDER_STATUSES = frozenset(STATUSES)
-MIN_LIMIT = 1
-MAX_LIMIT = 100
-DEFAULT_LIMIT = 20
-MIN_OFFSET = 0
-DEFAULT_OFFSET = 0
-MIN_TOTAL_CENTS = 0
-MAX_TOTAL_CENTS = 100_000_000
-MIN_CUSTOMER_ID_LENGTH = 1
-MAX_CUSTOMER_ID_LENGTH = 64
-MAX_ORDERS = 1000
+from agent_qa.schemas import (
+    DEFAULT_LIMIT,
+    DEFAULT_OFFSET,
+    MAX_CUSTOMER_ID_LENGTH as MAX_CUSTOMER_ID_LENGTH,
+    MAX_LIMIT,
+    MAX_ORDERS,
+    MAX_TOTAL_CENTS as MAX_TOTAL_CENTS,
+    MIN_CUSTOMER_ID_LENGTH as MIN_CUSTOMER_ID_LENGTH,
+    MIN_LIMIT,
+    MIN_OFFSET,
+    MIN_TOTAL_CENTS as MIN_TOTAL_CENTS,
+    ORDER_STATUSES,
+    SCHEMAS,
+    STATUSES as STATUSES,
+)
+from agent_qa.validation import validate
 
 
 class OrderError(Exception):
@@ -37,90 +41,21 @@ def _validation_error(details: list[dict[str, str]]) -> OrderError:
     return OrderError("validation_error", "Request validation failed", details)
 
 
-def _check_total_cents(value: Any, field: str, errors: list[dict[str, str]]) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        errors.append({"field": field, "message": "Must be an integer"})
-    elif not MIN_TOTAL_CENTS <= value <= MAX_TOTAL_CENTS:
-        errors.append(
-            {
-                "field": field,
-                "message": (f"Must be between {MIN_TOTAL_CENTS} and {MAX_TOTAL_CENTS}"),
-            }
-        )
-
-
 def validate_create(payload: Any) -> dict[str, Any]:
     """Validate and return normalized fields for creating an order."""
-    if not isinstance(payload, dict):
-        raise _validation_error(
-            [
-                {"field": "customer_id", "message": "Required"},
-                {"field": "total_cents", "message": "Required"},
-            ]
-        )
-
-    errors: list[dict[str, str]] = []
-    for name in sorted(
-        (name for name in payload if name not in {"customer_id", "total_cents"}),
-        key=str,
-    ):
-        errors.append({"field": str(name), "message": "Unknown field"})
-
-    customer_id = payload.get("customer_id")
-    if "customer_id" not in payload:
-        errors.append({"field": "customer_id", "message": "Required"})
-    elif not isinstance(customer_id, str):
-        errors.append({"field": "customer_id", "message": "Must be a string"})
-    elif not MIN_CUSTOMER_ID_LENGTH <= len(customer_id) <= MAX_CUSTOMER_ID_LENGTH:
-        errors.append(
-            {
-                "field": "customer_id",
-                "message": (
-                    f"Must contain {MIN_CUSTOMER_ID_LENGTH} to "
-                    f"{MAX_CUSTOMER_ID_LENGTH} characters"
-                ),
-            }
-        )
-    elif not customer_id.strip():
-        errors.append({"field": "customer_id", "message": "Must not be blank"})
-
-    if "total_cents" not in payload:
-        errors.append({"field": "total_cents", "message": "Required"})
-    else:
-        _check_total_cents(payload["total_cents"], "total_cents", errors)
-
+    candidate = payload if isinstance(payload, dict) else {}
+    errors = validate(SCHEMAS["CreateOrder"], candidate)
     if errors:
         raise _validation_error(errors)
-    return {"customer_id": customer_id, "total_cents": payload["total_cents"]}
+    return {
+        "customer_id": candidate["customer_id"],
+        "total_cents": candidate["total_cents"],
+    }
 
 
 def validate_patch(payload: Any) -> dict[str, Any]:
     """Validate and return normalized fields for updating an order."""
-    if not isinstance(payload, dict):
-        raise _validation_error([{"field": "body", "message": "Must be a JSON object"}])
-
-    errors: list[dict[str, str]] = []
-    for name in sorted(
-        (name for name in payload if name not in {"status", "total_cents"}),
-        key=str,
-    ):
-        errors.append({"field": str(name), "message": "Unknown field"})
-    if not payload:
-        errors.append({"field": "body", "message": "At least one field is required"})
-
-    if "status" in payload and (
-        not isinstance(payload["status"], str)
-        or payload["status"] not in ORDER_STATUSES
-    ):
-        errors.append(
-            {
-                "field": "status",
-                "message": "Must be one of: cancelled, new, paid, shipped",
-            }
-        )
-    if "total_cents" in payload:
-        _check_total_cents(payload["total_cents"], "total_cents", errors)
-
+    errors = validate(SCHEMAS["UpdateOrder"], payload)
     if errors:
         raise _validation_error(errors)
     return dict(payload)

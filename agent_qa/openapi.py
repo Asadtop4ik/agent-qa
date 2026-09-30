@@ -3,6 +3,8 @@
 from copy import deepcopy
 from typing import Any, Iterable
 
+from agent_qa.schemas import SCHEMAS
+
 
 def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, Any]:
     """Build a deterministic OpenAPI 3.0.3 document from route metadata."""
@@ -52,6 +54,7 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         "components": {
             "securitySchemes": {
                 "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
-            }
+            },
+            "schemas": deepcopy(SCHEMAS),
         },
     }
