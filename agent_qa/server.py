@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
 from agent_qa import config
+from agent_qa.auth import is_valid_api_key
 from agent_qa.errors import ApiError, envelope
 from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
@@ -172,6 +173,17 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        if route["auth_required"] and not is_valid_api_key(self.headers):
+            self._json(
+                401,
+                envelope(
+                    "unauthorized",
+                    "Invalid or missing API key",
+                    request_id=self.request_id,
+                ),
+                {"WWW-Authenticate": "X-API-Key"},
+            )
+            return
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = self._read_json_body() if route.get("body") else None
         status, body, headers = route["handler"](query, path_params, payload)

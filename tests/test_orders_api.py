@@ -51,6 +51,8 @@ class OrdersApiTests(unittest.TestCase):
 
     def request(self, method, path, payload=None, headers=None, raw_body=None):
         request_headers = {"Content-Type": "application/json"}
+        if method in {"POST", "PATCH", "DELETE"}:
+            request_headers["X-API-Key"] = "qa-synthetic-key"
         request_headers.update(headers or {})
         if raw_body is not None:
             data = raw_body
@@ -80,6 +82,7 @@ class OrdersApiTests(unittest.TestCase):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
         connection.putrequest(method, path)
         connection.putheader("Content-Type", "application/json")
+        connection.putheader("X-API-Key", "qa-synthetic-key")
         connection.endheaders()
         response = connection.getresponse()
         body = response.read()
