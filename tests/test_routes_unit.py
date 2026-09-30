@@ -8,10 +8,21 @@ from unittest.mock import patch
 
 from agent_qa.config import GIT_SHA
 from agent_qa.errors import ApiError, envelope
-from agent_qa.routes import ROUTES, fixture, ping, ready, status, version
+from agent_qa.routes import ROUTES, fixture, health, ping, ready, status, version
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_health_handler_and_route(self):
+        code, body, headers = health([])
+        self.assertEqual(code, 200)
+        self.assertEqual(body, {"status": "ok"})
+        self.assertEqual(headers, {})
+
+        route = next(route for route in ROUTES if route["path"] == "/health")
+        self.assertEqual(route["method"], "GET")
+        self.assertIs(route["handler"], health)
+        self.assertEqual(route["responses"], ["200"])
+
     def test_ping_handler(self):
         status, body, headers = ping([])
         self.assertEqual(status, 200)

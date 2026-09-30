@@ -186,6 +186,15 @@ class OpenApiDriftTests(unittest.TestCase):
     def test_response_content_documents_json_and_preserves_bodyless_responses(self):
         spec = self.live_spec()
 
+        health_response = spec["paths"]["/health"]["get"]["responses"]["200"]
+        health_schema = health_response["content"]["application/json"]["schema"]
+        self.assertEqual(health_schema["required"], ["status"])
+        self.assertEqual(
+            health_schema["properties"],
+            {"status": {"type": "string", "enum": ["ok"]}},
+        )
+        self.assertFalse(health_schema["additionalProperties"])
+
         about_response = spec["paths"]["/about"]["get"]["responses"]["200"]
         about_schema = about_response["content"]["application/json"]["schema"]
         self.assertEqual(

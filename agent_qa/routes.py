@@ -59,6 +59,15 @@ def ping(
     return 200, {"pong": True}, {}
 
 
+def health(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the service health response."""
+    return 200, {"status": "ok"}, {}
+
+
 def status(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -340,6 +349,23 @@ _FIXTURE_RESPONSE_SCHEMA = {
 }
 
 ROUTES = (
+    {
+        "method": "GET",
+        "path": "/health",
+        "handler": health,
+        "auth_required": False,
+        "operation_id": "getHealth",
+        "summary": "Check service health",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["status"],
+                "properties": {"status": {"type": "string", "enum": ["ok"]}},
+                "additionalProperties": False,
+            }
+        },
+    },
     {
         "method": "GET",
         "path": "/about",
