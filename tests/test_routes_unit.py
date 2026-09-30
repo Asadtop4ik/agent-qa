@@ -8,10 +8,16 @@ from unittest.mock import patch
 
 from agent_qa.config import GIT_SHA
 from agent_qa.errors import ApiError, envelope
-from agent_qa.routes import ROUTES, fixture, ready, status, version
+from agent_qa.routes import ROUTES, fixture, ping, ready, status, version
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_ping_handler(self):
+        status, body, headers = ping([])
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"pong": True})
+        self.assertEqual(headers, {})
+
     def test_ready_handler(self):
         status, body, headers = ready([])
         self.assertEqual(status, 200)

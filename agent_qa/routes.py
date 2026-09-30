@@ -37,6 +37,15 @@ def ready(
     return 200, {"status": "ready", "git_sha": GIT_SHA}, {}
 
 
+def ping(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return a simple liveness response."""
+    return 200, {"pong": True}, {}
+
+
 def status(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -360,6 +369,23 @@ ROUTES = (
                     "status": {"type": "string", "enum": ["ready"]},
                     "git_sha": {"type": "string"},
                 },
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/ping",
+        "handler": ping,
+        "auth_required": False,
+        "operation_id": "getPing",
+        "summary": "Check service liveness",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["pong"],
+                "properties": {"pong": {"type": "boolean", "enum": [True]}},
                 "additionalProperties": False,
             }
         },
