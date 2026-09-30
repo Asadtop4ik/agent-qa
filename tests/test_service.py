@@ -54,6 +54,14 @@ class ServiceTests(unittest.TestCase):
                 json.load(response), {"status": "ready", "git_sha": "test-sha-123"}
             )
 
+    def test_health_returns_ok(self):
+        with urlopen(self.base + "/health", timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(
+                response.headers["Content-Type"], "application/json; charset=utf-8"
+            )
+            self.assertEqual(json.load(response), {"status": "ok"})
+
     def test_ready_accepts_query_string(self):
         with urlopen(self.base + "/ready?x=1", timeout=2) as response:
             self.assertEqual(response.status, 200)
