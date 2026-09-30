@@ -66,6 +66,7 @@ class OrderStoreTests(unittest.TestCase):
         self.assertEqual(first["status"], "new")
         self.assertTrue(first["created_at"].endswith("Z"))
         self.assertIsInstance(first["total_cents"], int)
+        self.assertEqual(first["items"], [])
 
         self.assertTrue(store.delete(first["id"]))
         second = store.create("customer-b", 2000)
@@ -77,7 +78,9 @@ class OrderStoreTests(unittest.TestCase):
         order = store.create("customer-a", 100)
         copy = store.get(order["id"])
         copy["status"] = "paid"
+        copy["items"].append({"name": "external"})
         self.assertEqual(store.get(order["id"])["status"], "new")
+        self.assertEqual(store.get(order["id"])["items"], [])
         for invalid_id in (0, -1, "1", True):
             self.assertIsNone(store.get(invalid_id))
             self.assertFalse(store.delete(invalid_id))

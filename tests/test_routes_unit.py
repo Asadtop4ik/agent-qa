@@ -138,6 +138,28 @@ class RouteUnitTests(unittest.TestCase):
             },
         )
 
+    def test_handler_serializes_fulfillment_api_errors_without_a_socket(self):
+        from agent_qa.server import Handler
+
+        handler, responses = self.make_dispatcher("/orders", b"{}")
+        details = [
+            {"field": "items[2].quantity", "message": "Only 0 in stock"},
+            {"field": "items[10].quantity", "message": "Only 0 in stock"},
+        ]
+
+        def dispatch_error():
+            raise ApiError(409, "insufficient_stock", "Insufficient stock", details)
+
+        Handler._handle(handler, dispatch_error)
+        self.assertEqual(responses[0][0], 409)
+        self.assertEqual(responses[0][1]["error"]["code"], "insufficient_stock")
+        self.assertEqual(responses[0][1]["error"]["details"], details)
+
+    def test_order_id_rejects_unbounded_numeric_path(self):
+        from agent_qa.routes import _order_id
+
+        self.assertIsNone(_order_id({"id": "9" * 5000}))
+
     def test_allow_methods_come_from_routes(self):
         from agent_qa.server import allowed_methods
 
@@ -286,7 +308,7 @@ class RouteUnitTests(unittest.TestCase):
         )
         route_handler.assert_not_called()
 
-    def test_dispatch_keeps_order_validation_details_for_legacy_payloads(self):
+    def test_dispatch_keeps_order_create_and_update_validation_details(self):
         from agent_qa.server import Handler
 
         cases = (
@@ -296,7 +318,50 @@ class RouteUnitTests(unittest.TestCase):
                 {},
                 [
                     {"field": "customer_id", "message": "Required"},
-                    {"field": "total_cents", "message": "Required"},
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    },
+                ],
+            ),
+            (
+                "POST",
+                "/orders",
+                {"customer_id": "customer"},
+                [
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    }
+                ],
+            ),
+            (
+                "POST",
+                "/orders",
+                {
+                    "customer_id": "customer",
+                    "items": [{"product_id": 1, "quantity": 1}],
+                    "total_cents": 1,
+                },
+                [
+                    {
+                        "field": "items",
+                        "message": "Cannot be combined with total_cents",
+                    }
+                ],
+            ),
+            (
+                "POST",
+                "/orders",
+                {
+                    "customer_id": "customer",
+                    "items": [{"product_id": 1, "quantity": 1001}],
+                },
+                [
+                    {
+                        "field": "items[0].quantity",
+                        "message": "Must be between 1 and 1000",
+                    }
                 ],
             ),
             (
@@ -305,7 +370,10 @@ class RouteUnitTests(unittest.TestCase):
                 {"customer_id": None},
                 [
                     {"field": "customer_id", "message": "Must be a string"},
-                    {"field": "total_cents", "message": "Required"},
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    },
                 ],
             ),
             (
@@ -317,7 +385,10 @@ class RouteUnitTests(unittest.TestCase):
                         "field": "customer_id",
                         "message": "Must contain 1 to 64 characters",
                     },
-                    {"field": "total_cents", "message": "Required"},
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    },
                 ],
             ),
             (

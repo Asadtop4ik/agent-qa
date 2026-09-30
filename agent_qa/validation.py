@@ -70,7 +70,7 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
     Supported keywords are type, required, properties, additionalProperties,
     enum, minimum, maximum, minLength, maxLength, pattern, items, minItems,
     maxItems, uniqueItems for bounded arrays, minProperties, x-fullMatch,
-    x-nonBlank, and x-nonZero.
+    x-nonBlank, x-nonZero, and x-exactlyOne.
     """
     errors: list[dict[str, str]] = []
 
@@ -187,6 +187,25 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
                 and len(value) < minimum_properties
             ):
                 add(field, "At least one field is required")
+            exactly_one = current_schema.get("x-exactlyOne")
+            if (
+                isinstance(exactly_one, list)
+                and len(exactly_one) >= 2
+                and all(isinstance(name, str) for name in exactly_one)
+            ):
+                present = [name for name in exactly_one if name in value]
+                if len(present) > 1:
+                    name = next(item for item in exactly_one if item in present)
+                    other = next(item for item in exactly_one if item != name)
+                    add(
+                        name if depth == 0 else f"{field}.{name}",
+                        f"Cannot be combined with {other}",
+                    )
+                elif not present:
+                    add(
+                        exactly_one[0] if depth == 0 else f"{field}.{exactly_one[0]}",
+                        f"Either {' or '.join(exactly_one)} is required",
+                    )
             properties = current_schema.get("properties", {})
             if not isinstance(properties, dict):
                 properties = {}

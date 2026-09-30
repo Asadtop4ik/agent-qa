@@ -281,7 +281,7 @@ class ProductStore:
         self._capacity = capacity
         self._products: dict[int, dict[str, Any]] = {}
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def create(self, **fields: Any) -> dict[str, Any]:
         valid = validate_create(fields)
@@ -347,6 +347,27 @@ class ProductStore:
         with self._lock:
             return self._products.pop(product_id, None) is not None
 
+    def _change_stock_locked(
+        self, product_id: int, delta: int
+    ) -> dict[str, Any] | None:
+        current = self._products.get(product_id)
+        if current is None:
+            return None
+        stock = current["stock"] + delta
+        if stock < 0:
+            raise ApiError(409, "insufficient_stock", "Insufficient stock")
+        if stock > MAX_STOCK:
+            raise _validation_error(
+                [{"field": "stock", "message": f"Must be at most {MAX_STOCK}"}]
+            )
+        updated = {
+            **current,
+            "stock": stock,
+            "updated_at": _next_timestamp(current["updated_at"]),
+        }
+        self._products[product_id] = updated
+        return updated
+
     def adjust_stock(self, product_id: int, delta: int) -> dict[str, Any] | None:
         valid = validate_adjust_stock({"delta": delta})
         if (
@@ -356,20 +377,73 @@ class ProductStore:
         ):
             return None
         with self._lock:
-            current = self._products.get(product_id)
-            if current is None:
-                return None
-            stock = current["stock"] + valid["delta"]
-            if stock < 0:
-                raise ApiError(409, "insufficient_stock", "Insufficient stock")
-            if stock > MAX_STOCK:
-                raise _validation_error(
-                    [{"field": "stock", "message": f"Must be at most {MAX_STOCK}"}]
+            updated = self._change_stock_locked(product_id, valid["delta"])
+            return _copy_product(updated) if updated is not None else None
+
+    def reserve(self, lines: list[dict[str, Any]]) -> None:
+        """Atomically decrement stock for validated order lines.
+
+        Each line contains ``product_id``, ``quantity`` and ``index`` (zero based).
+        The caller holds the product lock for its surrounding transaction.
+        """
+        with self._lock:
+            shortages = []
+            for line in lines:
+                product = self._products.get(line["product_id"])
+                if product is None:
+                    continue
+                if product["stock"] < line["quantity"]:
+                    shortages.append(
+                        {
+                            "field": f"items[{line['index']}].quantity",
+                            "message": f"Only {product['stock']} in stock",
+                        }
+                    )
+            if shortages:
+                raise ApiError(
+                    409,
+                    "insufficient_stock",
+                    "Insufficient stock",
+                    shortages,
                 )
-            updated_at = _next_timestamp(current["updated_at"])
-            updated = {**current, "stock": stock, "updated_at": updated_at}
-            self._products[product_id] = updated
-            return _copy_product(updated)
+            for line in lines:
+                self._change_stock_locked(line["product_id"], -line["quantity"])
+
+    def release(self, lines: list[dict[str, Any]]) -> None:
+        """Atomically return stock for validated order lines.
+
+        Deleted products are skipped because their inventory no longer exists.
+        """
+        with self._lock:
+            products = []
+            for line in lines:
+                product = self._products.get(line["product_id"])
+                if product is not None:
+                    if product["stock"] + line["quantity"] > MAX_STOCK:
+                        raise _validation_error(
+                            [
+                                {
+                                    "field": "stock",
+                                    "message": f"Must be at most {MAX_STOCK}",
+                                }
+                            ]
+                        )
+                    products.append(line)
+            for line in products:
+                self._change_stock_locked(line["product_id"], line["quantity"])
+
+    def _snapshot_stock_locked(
+        self, product_ids: set[int]
+    ) -> dict[int, dict[str, Any]]:
+        return {
+            product_id: dict(self._products[product_id])
+            for product_id in product_ids
+            if product_id in self._products
+        }
+
+    def _restore_stock_locked(self, snapshot: dict[int, dict[str, Any]]) -> None:
+        for product_id, product in snapshot.items():
+            self._products[product_id] = product
 
     def list(self, **query: Any) -> tuple[list[dict[str, Any]], int]:
         _validate_store_query(query)

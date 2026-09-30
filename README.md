@@ -30,6 +30,14 @@ lists available tools by descending price. Filters include `category`, `tag`,
 `active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`; pagination
 uses `limit` and `offset`.
 
+## Orders
+
+`POST /orders` accepts either the legacy `{"customer_id":"...","total_cents":1500}`
+shape or `{"customer_id":"...","items":[{"product_id":1,"quantity":2}]}`.
+Item orders reserve stock atomically and include product name and price snapshots;
+their `total_cents` is computed from the line totals. Cancelling an item order
+releases its reservation once.
+
 ## JSON schemas
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.
