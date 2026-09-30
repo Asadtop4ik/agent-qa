@@ -37,6 +37,30 @@ def ready(
     return 200, {"status": "ready", "git_sha": GIT_SHA}, {}
 
 
+def status(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Report service status and whether the fixture can be read as JSON."""
+    try:
+        with FIXTURE_PATH.open(encoding="utf-8") as fixture_file:
+            json.load(fixture_file)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fixture_ok = False
+    else:
+        fixture_ok = True
+    return (
+        200,
+        {
+            "status": "ok" if fixture_ok else "degraded",
+            "service": "agent-qa",
+            "checks": {"fixture": fixture_ok},
+        },
+        {},
+    )
+
+
 def metrics(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -294,6 +318,32 @@ _FIXTURE_RESPONSE_SCHEMA = {
 }
 
 ROUTES = (
+    {
+        "method": "GET",
+        "path": "/status",
+        "handler": status,
+        "auth_required": False,
+        "operation_id": "getStatus",
+        "summary": "Check service and fixture status",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["status", "service", "checks"],
+                "properties": {
+                    "status": {"type": "string", "enum": ["ok", "degraded"]},
+                    "service": {"type": "string", "enum": ["agent-qa"]},
+                    "checks": {
+                        "type": "object",
+                        "required": ["fixture"],
+                        "properties": {"fixture": {"type": "boolean"}},
+                        "additionalProperties": False,
+                    },
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
     {
         "method": "GET",
         "path": "/ready",
