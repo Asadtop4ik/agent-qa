@@ -37,6 +37,15 @@ def ready(
     return 200, {"status": "ready", "git_sha": GIT_SHA}, {}
 
 
+def about(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the service name and build SHA."""
+    return 200, {"service": "agent-qa", "git_sha": GIT_SHA}, {}
+
+
 def ping(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -327,6 +336,26 @@ _FIXTURE_RESPONSE_SCHEMA = {
 }
 
 ROUTES = (
+    {
+        "method": "GET",
+        "path": "/about",
+        "handler": about,
+        "auth_required": False,
+        "operation_id": "getAbout",
+        "summary": "Read service name and build SHA",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["service", "git_sha"],
+                "properties": {
+                    "service": {"type": "string", "enum": ["agent-qa"]},
+                    "git_sha": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
     {
         "method": "GET",
         "path": "/status",
