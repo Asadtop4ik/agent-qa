@@ -49,9 +49,11 @@ class OrdersApiTests(unittest.TestCase):
     def customer_id(self):
         return "api-test-" + uuid.uuid4().hex
 
-    def request(self, method, path, payload=None, headers=None, raw_body=None):
+    def request(
+        self, method, path, payload=None, headers=None, raw_body=None, public=False
+    ):
         request_headers = {"Content-Type": "application/json"}
-        if method in {"POST", "PATCH", "DELETE"}:
+        if method in {"POST", "PATCH", "DELETE"} and not public:
             request_headers["X-API-Key"] = "qa-synthetic-key"
         request_headers.update(headers or {})
         if raw_body is not None:
@@ -199,6 +201,37 @@ class OrdersApiTests(unittest.TestCase):
             411,
             "length_required",
         )
+
+    def test_schema_api_and_order_validation_compatibility(self):
+        status, _, body = self.request("GET", "/schemas", public=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], sorted(body["items"]))
+        self.assertIn("CreateOrder", body["items"])
+
+        status, _, schema = self.request("GET", "/schemas/CreateOrder", public=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(schema["type"], "object")
+        self.assert_error(
+            self.request("GET", "/schemas/unknown", public=True),
+            404,
+            "schema_not_found",
+        )
+        status, _, result = self.request(
+            "POST",
+            "/schemas/CreateOrder/validate",
+            {"customer_id": "schema-check", "total_cents": 10},
+            public=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result, {"valid": True, "errors": []})
+        status, _, result = self.request(
+            "POST",
+            "/schemas/CreateOrder/validate",
+            raw_body=b"null",
+            public=True,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(result["valid"])
 
     def test_patch_transitions_and_locked_price(self):
         order = self.create_order()

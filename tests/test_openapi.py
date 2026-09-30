@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from agent_qa import orders
 from agent_qa.openapi import build_openapi
 from agent_qa.routes import ROUTES
+from agent_qa.schemas import SCHEMAS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,7 +76,7 @@ class OpenApiDriftTests(unittest.TestCase):
 
     @staticmethod
     def concrete_path(template):
-        return template.replace("{id}", "1")
+        return template.replace("{id}", "1").replace("{name}", "CreateOrder")
 
     def test_route_table_and_spec_have_the_same_method_path_pairs(self):
         spec = self.live_spec()
@@ -182,6 +183,26 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(patch_total["minimum"], orders.MIN_TOTAL_CENTS)
         self.assertEqual(patch_total["maximum"], orders.MAX_TOTAL_CENTS)
         self.assertEqual(patch_status, list(orders.STATUSES))
+
+    def test_named_schemas_are_documented_and_order_bodies_stay_inline(self):
+        spec = self.live_spec()
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        self.assertEqual(
+            spec["paths"]["/orders"]["post"]["requestBody"]["content"][
+                "application/json"
+            ]["schema"],
+            SCHEMAS["CreateOrder"],
+        )
+        self.assertEqual(
+            spec["paths"]["/orders/{id}"]["patch"]["requestBody"]["content"][
+                "application/json"
+            ]["schema"],
+            SCHEMAS["UpdateOrder"],
+        )
+        self.assertIn("/schemas", spec["paths"])
+        self.assertIn("/schemas/{name}", spec["paths"])
+        self.assertIn("/schemas/{name}/validate", spec["paths"])
+        self.assertIn("requestBody", spec["paths"]["/schemas/{name}/validate"]["post"])
 
     def test_response_content_documents_json_and_preserves_bodyless_responses(self):
         spec = self.live_spec()

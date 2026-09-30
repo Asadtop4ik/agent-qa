@@ -1,6 +1,7 @@
 """HTTP server adapter for the route handlers."""
 
 import json
+import math
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -14,6 +15,7 @@ from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
+from agent_qa.validation import validate
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -47,6 +49,17 @@ def allowed_methods(path: str) -> str:
     routes = _path_routes(path)
     methods = {str(route["method"]) for route, _ in routes}
     return ", ".join(sorted(methods))
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("JSON numbers must be finite")
+    return number
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -130,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _read_json_body(self) -> object:
+    def _read_json_body(self, require_object: bool = True) -> object:
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             raise ApiError(411, "length_required", "Content-Length is required")
@@ -151,12 +164,16 @@ class Handler(BaseHTTPRequestHandler):
             )
         try:
             body = self.rfile.read(length).decode("utf-8")
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            payload = json.loads(
+                body,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_finite_float,
+            )
+        except (UnicodeDecodeError, ValueError, RecursionError) as error:
             raise ApiError(
                 400, "invalid_json", "Request body must be valid JSON"
             ) from error
-        if not isinstance(payload, dict):
+        if require_object and not isinstance(payload, dict):
             raise ApiError(400, "invalid_json", "Request body must be a JSON object")
         return payload
 
@@ -185,7 +202,21 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         query = parse_qsl(parsed.query, keep_blank_values=True)
-        payload = self._read_json_body() if route.get("body") else None
+        payload = (
+            self._read_json_body(require_object=route.get("json_object_only", True))
+            if route.get("body")
+            else None
+        )
+        schema = route.get("request_schema")
+        if schema is not None:
+            errors = validate(schema, payload)
+            if errors:
+                raise ApiError(
+                    400,
+                    "validation_error",
+                    "Request validation failed",
+                    errors,
+                )
         status, body, headers = route["handler"](query, path_params, payload)
         self._json(status, body, headers)
 

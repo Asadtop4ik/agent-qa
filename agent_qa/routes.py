@@ -7,17 +7,16 @@ from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.errors import ApiError
 from agent_qa.metrics import REGISTRY
 from agent_qa.openapi import build_openapi
-from agent_qa.orders import (
+from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
-    MAX_CUSTOMER_ID_LENGTH,
     MAX_LIMIT,
-    MAX_TOTAL_CENTS,
-    MIN_CUSTOMER_ID_LENGTH,
     MIN_LIMIT,
     MIN_OFFSET,
-    MIN_TOTAL_CENTS,
-    STATUSES,
+    SCHEMAS,
+)
+from agent_qa.validation import validate
+from agent_qa.orders import (
     OrderStore,
     validate_create,
     validate_patch,
@@ -178,6 +177,40 @@ def openapi(
     return 200, build_openapi(ROUTES, GIT_SHA), {}
 
 
+def list_schemas(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the registered schema names in deterministic order."""
+    return 200, {"items": sorted(SCHEMAS)}, {}
+
+
+def get_schema(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return a named schema or the standard schema-not-found error."""
+    name = (path_params or {}).get("name", "")
+    if name not in SCHEMAS:
+        raise ApiError(404, "schema_not_found", "Schema not found")
+    return 200, SCHEMAS[name], {}
+
+
+def validate_named_schema(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Validate a JSON value against a named schema."""
+    name = (path_params or {}).get("name", "")
+    if name not in SCHEMAS:
+        raise ApiError(404, "schema_not_found", "Schema not found")
+    errors = validate(SCHEMAS[name], payload)
+    return 200, {"valid": not errors, "errors": errors}, {}
+
+
 def create_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -265,58 +298,12 @@ _ORDER_ID = {
     "description": "Positive order identifier.",
     "schema": {"type": "integer", "minimum": 1},
 }
-_CUSTOMER_ID_SCHEMA = {
-    "type": "string",
-    "minLength": MIN_CUSTOMER_ID_LENGTH,
-    "maxLength": MAX_CUSTOMER_ID_LENGTH,
-}
-_TOTAL_CENTS_SCHEMA = {
-    "type": "integer",
-    "minimum": MIN_TOTAL_CENTS,
-    "maximum": MAX_TOTAL_CENTS,
-}
-_STATUS_SCHEMA = {"type": "string", "enum": list(STATUSES)}
-_CREATE_ORDER_SCHEMA = {
-    "type": "object",
-    "required": ["customer_id", "total_cents"],
-    "properties": {
-        "customer_id": _CUSTOMER_ID_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-    },
-    "additionalProperties": False,
-}
-_UPDATE_ORDER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": _STATUS_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-    },
-    "minProperties": 1,
-    "additionalProperties": False,
-}
-_ORDER_RESPONSE_SCHEMA = {
-    "type": "object",
-    "required": ["id", "customer_id", "total_cents", "status", "created_at"],
-    "properties": {
-        "id": {"type": "integer", "minimum": 1},
-        "customer_id": _CUSTOMER_ID_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-        "status": _STATUS_SCHEMA,
-        "created_at": {"type": "string", "format": "date-time"},
-    },
-    "additionalProperties": False,
-}
-_ORDER_LIST_RESPONSE_SCHEMA = {
-    "type": "object",
-    "required": ["items", "total", "limit", "offset"],
-    "properties": {
-        "items": {"type": "array", "items": _ORDER_RESPONSE_SCHEMA},
-        "total": {"type": "integer", "minimum": 0},
-        "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
-        "offset": {"type": "integer", "minimum": MIN_OFFSET},
-    },
-    "additionalProperties": False,
-}
+_CUSTOMER_ID_SCHEMA = SCHEMAS["CreateOrder"]["properties"]["customer_id"]
+_STATUS_SCHEMA = SCHEMAS["UpdateOrder"]["properties"]["status"]
+_CREATE_ORDER_SCHEMA = SCHEMAS["CreateOrder"]
+_UPDATE_ORDER_SCHEMA = SCHEMAS["UpdateOrder"]
+_ORDER_RESPONSE_SCHEMA = SCHEMAS["Order"]
+_ORDER_LIST_RESPONSE_SCHEMA = SCHEMAS["OrderList"]
 _OPENAPI_RESPONSE_SCHEMA = {
     "type": "object",
     "required": ["openapi", "info", "paths", "components"],
@@ -508,6 +495,81 @@ ROUTES = (
         "summary": "Read the OpenAPI document",
         "responses": ["200"],
         "response_schemas": {"200": _OPENAPI_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/schemas",
+        "handler": list_schemas,
+        "auth_required": False,
+        "operation_id": "listSchemas",
+        "summary": "List registered JSON schemas",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/schemas/{name}",
+        "handler": get_schema,
+        "auth_required": False,
+        "operation_id": "getSchema",
+        "summary": "Read a named JSON schema",
+        "parameters": [
+            {
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"},
+            }
+        ],
+        "responses": ["200", "404"],
+        "response_schemas": {"200": {"type": "object"}},
+    },
+    {
+        "method": "POST",
+        "path": "/schemas/{name}/validate",
+        "handler": validate_named_schema,
+        "body": True,
+        "json_object_only": False,
+        "request_schema": {},
+        "auth_required": False,
+        "operation_id": "validateNamedSchema",
+        "summary": "Validate a JSON value against a named schema",
+        "parameters": [
+            {
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"},
+            }
+        ],
+        "responses": ["200", "400", "404", "411", "413", "415"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["valid", "errors"],
+                "properties": {
+                    "valid": {"type": "boolean"},
+                    "errors": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["field", "message"],
+                            "properties": {
+                                "field": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            }
+        },
     },
     {
         "method": "GET",
