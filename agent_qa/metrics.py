@@ -10,6 +10,8 @@ _DURATION_NAME = "agent_qa_http_request_duration_seconds"
 _ORDERS_NAME = "agent_qa_orders"
 _PRODUCTS_NAME = "agent_qa_products"
 _BUILD_NAME = "agent_qa_build_info"
+_IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
+_IDEMPOTENCY_RESULTS = frozenset({"stored", "replayed", "mismatch", "in_progress"})
 _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
 )
@@ -38,6 +40,7 @@ class MetricsRegistry:
         self._lock = threading.Lock()
         self._requests: dict[tuple[str, str, str], int] = {}
         self._durations: dict[tuple[str, str], tuple[float, int]] = {}
+        self._idempotency: dict[str, int] = {}
 
     def record(
         self, method: str, route: str, status: int, duration_seconds: float
@@ -58,11 +61,19 @@ class MetricsRegistry:
                 duration_count + 1,
             )
 
+    def record_idempotency(self, result: str) -> None:
+        """Record a completed idempotency decision using fixed result labels."""
+        if result not in _IDEMPOTENCY_RESULTS:
+            raise ValueError("unknown idempotency result")
+        with self._lock:
+            self._idempotency[result] = self._idempotency.get(result, 0) + 1
+
     def render(self, orders: int, git_sha: str, products: int | None = None) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
             requests = self._requests.copy()
             durations = self._durations.copy()
+            idempotency = self._idempotency.copy()
 
         families: list[tuple[str, str, str, list[MetricSample]]] = [
             (
@@ -119,6 +130,18 @@ class MetricsRegistry:
                     "Current number of products.",
                     "gauge",
                     [(_PRODUCTS_NAME, (), str(products))],
+                )
+            )
+        if idempotency:
+            families.append(
+                (
+                    _IDEMPOTENCY_NAME,
+                    "Total idempotency request outcomes.",
+                    "counter",
+                    [
+                        (_IDEMPOTENCY_NAME, (("result", result),), str(value))
+                        for result, value in idempotency.items()
+                    ],
                 )
             )
 

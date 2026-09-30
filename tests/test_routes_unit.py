@@ -16,6 +16,14 @@ from agent_qa.schemas import SCHEMAS
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_only_requested_post_routes_are_idempotent(self):
+        flagged = {
+            (route["method"], route["path"])
+            for route in ROUTES
+            if route.get("idempotent")
+        }
+        self.assertEqual(flagged, {("POST", "/orders"), ("POST", "/products")})
+
     def test_health_handler_and_route(self):
         code, body, headers = health([])
         self.assertEqual(code, 200)

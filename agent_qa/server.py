@@ -1,8 +1,10 @@
 """HTTP server adapter for the route handlers."""
 
+import hashlib
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -10,8 +12,9 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
 from agent_qa import config
-from agent_qa.auth import is_valid_api_key
+from agent_qa.auth import api_key_from_headers, is_valid_api_key
 from agent_qa.errors import ApiError, envelope
+from agent_qa.idempotency import IdempotencyStore, StoredResponse
 from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
@@ -19,6 +22,8 @@ from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
 
 LOGGER = logging.getLogger(__name__)
+IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -104,7 +109,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-Id", self.request_id)
         for name, value in response_headers.items():
-            if name.lower() not in {"content-length", "content-type"}:
+            if name.lower() not in {
+                "content-length",
+                "content-type",
+                "x-request-id",
+            }:
                 self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD" and encoded:
@@ -178,6 +187,15 @@ class Handler(BaseHTTPRequestHandler):
             ) from error
         if require_object and not isinstance(payload, dict):
             raise ApiError(400, "invalid_json", "Request body must be a JSON object")
+        pending = [(payload, 0)]
+        while pending:
+            value, depth = pending.pop()
+            if depth > 32:
+                raise ApiError(400, "invalid_json", "JSON nesting is too deep")
+            if isinstance(value, dict):
+                pending.extend((child, depth + 1) for child in value.values())
+            elif isinstance(value, list):
+                pending.extend((child, depth + 1) for child in value)
         return payload
 
     def _dispatch(self) -> None:
@@ -204,23 +222,92 @@ class Handler(BaseHTTPRequestHandler):
                 {"WWW-Authenticate": "X-API-Key"},
             )
             return
+        idempotency_key: str | None = None
+        idempotency_scope: tuple[str, ...] | None = None
+        if self.command == "POST" and route.get("idempotent"):
+            idempotency_key = self.headers.get("Idempotency-Key")
+            key_values = self.headers.get_all("Idempotency-Key", [])
+            if len(key_values) > 1 or (
+                idempotency_key is not None
+                and not _IDEMPOTENCY_KEY_PATTERN.fullmatch(idempotency_key)
+            ):
+                raise ApiError(
+                    400,
+                    "invalid_idempotency_key",
+                    "Idempotency-Key must be 1-64 permitted characters",
+                )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = (
             self._read_json_body(require_object=route.get("json_object_only", True))
             if route.get("body")
             else None
         )
-        schema = route.get("request_schema")
-        if schema is not None:
-            errors = validate(schema, payload)
-            if errors:
-                raise ApiError(
-                    400,
-                    "validation_error",
-                    "Request validation failed",
-                    errors,
+        if idempotency_key is not None:
+            canonical_json = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+            payload_fingerprint = hashlib.sha256(canonical_json).hexdigest()
+            api_key = api_key_from_headers(self.headers) or ""
+            api_key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            idempotency_scope = (
+                api_key_fingerprint,
+                self.command,
+                parsed.path,
+                idempotency_key,
+            )
+            decision = IDEMPOTENCY_STORE.begin(idempotency_scope, payload_fingerprint)
+            if decision.kind == "replay":
+                REGISTRY.record_idempotency("replayed")
+                assert decision.response is not None
+                replay_headers = dict(decision.response.headers)
+                replay_headers["Idempotent-Replay"] = "true"
+                replay_headers["Idempotency-Key"] = idempotency_key
+                self._json(
+                    decision.response.status,
+                    decision.response.body,
+                    replay_headers,
                 )
-        status, body, headers = route["handler"](query, path_params, payload)
+                return
+            if decision.kind == "mismatch":
+                REGISTRY.record_idempotency("mismatch")
+                raise ApiError(
+                    422,
+                    "idempotency_key_reused",
+                    "Idempotency-Key was already used with a different request",
+                )
+            if decision.kind == "in_progress":
+                REGISTRY.record_idempotency("in_progress")
+                raise ApiError(
+                    409,
+                    "idempotency_in_progress",
+                    "A request with this Idempotency-Key is already in progress",
+                )
+        try:
+            schema = route.get("request_schema")
+            if schema is not None:
+                errors = validate(schema, payload)
+                if errors:
+                    raise ApiError(
+                        400,
+                        "validation_error",
+                        "Request validation failed",
+                        errors,
+                    )
+            status, body, headers = route["handler"](query, path_params, payload)
+        except Exception:
+            if idempotency_scope is not None:
+                IDEMPOTENCY_STORE.abort(idempotency_scope)
+            raise
+        if idempotency_scope is not None:
+            if 200 <= status < 300:
+                IDEMPOTENCY_STORE.complete(
+                    idempotency_scope, StoredResponse(status, body, headers)
+                )
+                REGISTRY.record_idempotency("stored")
+                headers = dict(headers)
+                headers["Idempotency-Key"] = idempotency_key or ""
+            else:
+                IDEMPOTENCY_STORE.abort(idempotency_scope)
         self._json(status, body, headers)
 
     def _method_not_allowed(
