@@ -120,6 +120,26 @@ class SchemaValidationTests(unittest.TestCase):
             [{"field": "items[0].id", "message": "Must be an integer"}],
         )
 
+    def test_list_schemas_accept_nullable_cursor_and_reject_other_types(self):
+        from agent_qa.schemas import SCHEMAS
+
+        for schema_name in ("OrderList", "ProductList"):
+            with self.subTest(schema=schema_name):
+                response = {
+                    "items": [],
+                    "total": 0,
+                    "limit": 20,
+                    "next_cursor": None,
+                }
+                self.assertEqual(validate(SCHEMAS[schema_name], response), [])
+                response["next_cursor"] = "signed.cursor-token"
+                self.assertEqual(validate(SCHEMAS[schema_name], response), [])
+                response["next_cursor"] = 7
+                self.assertEqual(
+                    validate(SCHEMAS[schema_name], response),
+                    [{"field": "next_cursor", "message": "Must be a string"}],
+                )
+
     def test_property_named_body_keeps_its_nested_path(self):
         schema = {
             "type": "object",

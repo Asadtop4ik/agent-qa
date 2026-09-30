@@ -4,6 +4,7 @@ import json
 import unittest
 from email.message import Message
 from io import BytesIO
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 from agent_qa import schemas
@@ -334,6 +335,81 @@ class ProductApiTests(unittest.TestCase):
         status, page, _ = self.dispatch("GET", "/products")
         self.assertEqual(status, 200)
         self.assertEqual((page["limit"], page["offset"]), (20, 0))
+
+    def test_cursor_pagination_links_and_validation(self):
+        self.create("CURSOR-1", name="one", price_cents=100)
+        self.create("CURSOR-2", name="two", price_cents=100)
+        self.create("CURSOR-3", name="three", price_cents=200)
+
+        status, first_page, headers = self.dispatch(
+            "GET",
+            "/products?category=tools&sort=-price_cents&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(first_page), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(first_page["total"], 3)
+        self.assertEqual(first_page["items"][0]["sku"], "CURSOR-3")
+        self.assertEqual(
+            headers["Link"],
+            "</products?category=tools&sort=-price_cents&limit=1&pagination=cursor"
+            "&cursor=" + first_page["next_cursor"] + '>; rel="next"',
+        )
+
+        status, second_page, _ = self.dispatch(
+            "GET",
+            "/products?category=tools&sort=-price_cents&limit=1&cursor="
+            + first_page["next_cursor"],
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(second_page["items"][0]["sku"], "CURSOR-1")
+        self.assertIsNotNone(second_page["next_cursor"])
+
+        special_query = "Café + &/"
+        self.create("UNICODE-1", name=special_query + " first")
+        self.create("UNICODE-2", name=special_query + " second")
+        status, special_page, special_headers = self.dispatch(
+            "GET",
+            "/products?q=Caf%C3%A9%20%2B%20%26%2F&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        link_target = special_headers["Link"].split(";", 1)[0][1:-1]
+        self.assertEqual(parse_qs(urlsplit(link_target).query)["q"], [special_query])
+        self.assertIn("q=Caf%C3%A9%20%2B%20%26%2F", link_target)
+        status, final_page, final_headers = self.dispatch("GET", link_target)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(final_page["items"]), 1)
+        self.assertIsNone(final_page["next_cursor"])
+        self.assertNotIn("Link", final_headers)
+
+        mismatch = self.dispatch(
+            "GET",
+            "/products?category=other&sort=-price_cents&limit=1&cursor="
+            + first_page["next_cursor"],
+        )
+        self.assertEqual(mismatch[0], 400)
+        self.assertEqual(mismatch[1]["error"]["code"], "cursor_mismatch")
+        sort_mismatch = self.dispatch(
+            "GET",
+            "/products?category=tools&sort=price_cents&limit=1&cursor="
+            + first_page["next_cursor"],
+        )
+        self.assertEqual(sort_mismatch[0], 400)
+        self.assertEqual(sort_mismatch[1]["error"]["code"], "cursor_mismatch")
+        forged = self.dispatch("GET", "/products?pagination=cursor&cursor=forged")
+        self.assertEqual(forged[0], 400)
+        self.assertEqual(forged[1]["error"]["code"], "invalid_cursor")
+        for query in (
+            "pagination=cursor&offset=0",
+            "pagination=offset&cursor=abc",
+            "cursor=abc&offset=0",
+        ):
+            with self.subTest(query=query):
+                status, body, _ = self.dispatch("GET", "/products?" + query)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "invalid_query")
+                self.assertIn(
+                    "cursor", {item["field"] for item in body["error"]["details"]}
+                )
 
     def test_invalid_and_duplicate_query_parameters_are_400(self):
         invalid_queries = (

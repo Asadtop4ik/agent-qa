@@ -13,12 +13,18 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         method = route["method"].lower()
         path = route["path"]
         response_schemas = route.get("response_schemas", {})
+        response_headers = route.get("response_headers", {})
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
             "responses": {
                 status: {
                     "description": f"HTTP {status} response",
+                    **(
+                        {"headers": deepcopy(response_headers[status])}
+                        if status in response_headers
+                        else {}
+                    ),
                     **(
                         {
                             "content": {

@@ -2,12 +2,14 @@
 
 import json
 import platform
+from urllib.parse import quote, urlencode
 
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
 from agent_qa.openapi import build_openapi
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
@@ -241,7 +243,21 @@ def list_orders(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated orders."""
     filters = validate_query(query)
-    items, total = ORDER_STORE.list(**filters)
+    result = ORDER_STORE.list(**filters)
+    if filters["pagination"] == "cursor":
+        items, total, next_cursor = result
+        headers = _next_page_link("/orders", query, next_cursor)
+        return (
+            200,
+            {
+                "items": items,
+                "total": total,
+                "limit": filters["limit"],
+                "next_cursor": next_cursor,
+            },
+            headers,
+        )
+    items, total = result
     return (
         200,
         {
@@ -325,7 +341,21 @@ def list_products(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated products."""
     filters = validate_product_query(query)
-    items, total = PRODUCT_STORE.list(**filters)
+    result = PRODUCT_STORE.list(**filters)
+    if filters["pagination"] == "cursor":
+        items, total, next_cursor = result
+        headers = _next_page_link("/products", query, next_cursor)
+        return (
+            200,
+            {
+                "items": items,
+                "total": total,
+                "limit": filters["limit"],
+                "next_cursor": next_cursor,
+            },
+            headers,
+        )
+    items, total = result
     return (
         200,
         {
@@ -336,6 +366,20 @@ def list_products(
         },
         {},
     )
+
+
+def _next_page_link(
+    path: str, query: list[tuple[str, str]], next_cursor: str | None
+) -> dict[str, str]:
+    """Build a relative Link header while retaining the active query options."""
+    if next_cursor is None:
+        return {}
+    parameters = [
+        (name, value) for name, value in query if name not in {"cursor", "offset"}
+    ]
+    parameters.append(("cursor", next_cursor))
+    link = urlencode(parameters, quote_via=quote, safe="")
+    return {"Link": f'<{path}?{link}>; rel="next"'}
 
 
 def _product_id(path_params: dict[str, str] | None) -> int | None:
@@ -520,6 +564,73 @@ _PRODUCT_QUERY_PARAMETERS = [
             "type": "integer",
             "minimum": MIN_OFFSET,
             "default": DEFAULT_OFFSET,
+        },
+    },
+    {
+        "name": "pagination",
+        "in": "query",
+        "required": False,
+        "description": (
+            "Select cursor mode with pagination=cursor or by supplying cursor. "
+            "Cursor mode cannot be combined with offset (400 invalid_query)."
+        ),
+        "schema": {
+            "type": "string",
+            "enum": ["offset", "cursor"],
+            "default": "offset",
+        },
+    },
+    {
+        "name": "cursor",
+        "in": "query",
+        "required": False,
+        "description": (
+            "Opaque continuation cursor. Malformed, forged, or restart-invalidated "
+            "values return 400 invalid_cursor; changed filters or sort return "
+            "400 cursor_mismatch."
+        ),
+        "schema": {
+            "type": "string",
+            "maxLength": MAX_CURSOR_LENGTH,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+        },
+    },
+]
+_CURSOR_PAGINATION_PARAMETERS = [
+    {
+        "name": "sort",
+        "in": "query",
+        "required": False,
+        "description": "Stable order for the result set.",
+        "schema": {"type": "string", "enum": ["id", "-id"], "default": "id"},
+    },
+    {
+        "name": "pagination",
+        "in": "query",
+        "required": False,
+        "description": (
+            "Select cursor mode with pagination=cursor or by supplying cursor. "
+            "Cursor mode cannot be combined with offset (400 invalid_query)."
+        ),
+        "schema": {
+            "type": "string",
+            "enum": ["offset", "cursor"],
+            "default": "offset",
+        },
+    },
+    {
+        "name": "cursor",
+        "in": "query",
+        "required": False,
+        "description": (
+            "Opaque continuation cursor. Malformed, forged, or restart-invalidated "
+            "values return 400 invalid_cursor; changed filters or sort return "
+            "400 cursor_mismatch."
+        ),
+        "schema": {
+            "type": "string",
+            "maxLength": MAX_CURSOR_LENGTH,
+            "pattern": "^[A-Za-z0-9_.-]+$",
         },
     },
 ]
@@ -835,9 +946,18 @@ ROUTES = (
                     "default": DEFAULT_OFFSET,
                 },
             },
+            *_CURSOR_PAGINATION_PARAMETERS,
         ],
         "responses": ["200", "400"],
         "response_schemas": {"200": _ORDER_LIST_RESPONSE_SCHEMA},
+        "response_headers": {
+            "200": {
+                "Link": {
+                    "description": "Relative link to the next cursor page.",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
     },
     {
         "method": "POST",
@@ -909,6 +1029,14 @@ ROUTES = (
         "parameters": _PRODUCT_QUERY_PARAMETERS,
         "responses": ["200", "400"],
         "response_schemas": {"200": _PRODUCT_LIST_RESPONSE_SCHEMA},
+        "response_headers": {
+            "200": {
+                "Link": {
+                    "description": "Relative link to the next cursor page.",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
     },
     {
         "method": "DELETE",

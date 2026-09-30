@@ -1,6 +1,8 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+from agent_qa.errors import ApiError
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.orders import (
     MAX_ORDERS,
     OrderError,
@@ -41,7 +43,7 @@ class OrderValidationTests(unittest.TestCase):
     def test_query_validates_values_and_repeated_parameters(self):
         self.assertEqual(
             validate_query([("limit", "2"), ("offset", "1")]),
-            {"limit": 2, "offset": 1},
+            {"limit": 2, "offset": 1, "sort": "id", "pagination": "offset"},
         )
         invalid_queries = (
             [("limit", "0")],
@@ -51,11 +53,24 @@ class OrderValidationTests(unittest.TestCase):
             [("status", "foo")],
             [("x", "1")],
             [("limit", "1"), ("limit", "2")],
+            [("cursor", "x"), ("offset", "0")],
+            [("pagination", "cursor"), ("offset", "0")],
+            [("pagination", "offset"), ("cursor", "x")],
+            [("sort", "name")],
         )
         for query in invalid_queries:
             with self.subTest(query=query), self.assertRaises(OrderError) as error:
                 validate_query(query)
             self.assertEqual(error.exception.code, "invalid_query")
+
+        with self.assertRaises(OrderError) as error:
+            validate_query([("cursor", "x" * (MAX_CURSOR_LENGTH + 1)), ("offset", "0")])
+        self.assertEqual(error.exception.code, "invalid_query")
+        self.assertEqual(error.exception.details[0]["field"], "cursor")
+
+        with self.assertRaises(ApiError) as error:
+            validate_query([("cursor", "x" * (MAX_CURSOR_LENGTH + 1))])
+        self.assertEqual(error.exception.code, "invalid_cursor")
 
 
 class OrderStoreTests(unittest.TestCase):
@@ -98,6 +113,42 @@ class OrderStoreTests(unittest.TestCase):
         items, total = store.list(status="paid")
         self.assertEqual(total, 1)
         self.assertEqual(items[0]["id"], one["id"])
+
+    def test_cursor_pages_survive_create_and_delete_without_repeating_or_skipping(self):
+        store = OrderStore()
+        for index in range(50):
+            store.create(f"customer-{index}", index)
+        items, total, cursor = store.list(limit=7, pagination="cursor")
+        self.assertEqual(total, 50)
+        observed = [item["id"] for item in items]
+        self.assertEqual(observed, list(range(1, 8)))
+
+        store.delete(4)
+        created = store.create("created-between-pages", 1)
+        while cursor is not None:
+            items, _total, cursor = store.list(
+                limit=7, pagination="cursor", cursor=cursor
+            )
+            observed.extend(item["id"] for item in items)
+
+        self.assertEqual(len(observed), len(set(observed)))
+        self.assertEqual(observed, [*range(1, 51), created["id"]])
+
+    def test_cursor_rejects_changed_filter_or_sort_and_allows_limit_changes(self):
+        store = OrderStore()
+        for index in range(5):
+            store.create("same", index)
+        _items, _total, cursor = store.list(limit=2, pagination="cursor")
+        self.assertIsNotNone(cursor)
+        items, _total, next_cursor = store.list(limit=1, cursor=cursor)
+        self.assertEqual([item["id"] for item in items], [3])
+        self.assertIsNotNone(next_cursor)
+        with self.assertRaises(ApiError) as error:
+            store.list(status="paid", cursor=cursor)
+        self.assertEqual(error.exception.code, "cursor_mismatch")
+        with self.assertRaises(ApiError) as error:
+            store.list(sort="-id", cursor=cursor)
+        self.assertEqual(error.exception.code, "cursor_mismatch")
 
     def test_transition_rules_and_total_lock(self):
         store = OrderStore()

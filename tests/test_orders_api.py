@@ -11,6 +11,11 @@ import unittest
 import uuid
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from unittest.mock import patch
+
+from agent_qa.errors import ApiError
+from agent_qa.orders import OrderError, OrderStore
+from agent_qa.routes import list_orders
 
 
 class OrdersApiTests(unittest.TestCase):
@@ -157,6 +162,50 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["offset"], 1)
         self.assertEqual(body["items"], [second])
         self.assertNotEqual(other["customer_id"], customer)
+
+    def test_cursor_pagination_shape_link_and_invalid_combinations(self):
+        customer = self.customer_id()
+        first = self.create_order(customer)
+        second = self.create_order(customer, 2500)
+        status, headers, body = self.request(
+            "GET", f"/orders?customer_id={customer}&limit=1&pagination=cursor"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["items"], [first])
+        self.assertIsInstance(body["next_cursor"], str)
+        self.assertEqual(
+            headers["Link"],
+            f"</orders?customer_id={customer}&limit=1&pagination=cursor&cursor="
+            f"{body['next_cursor']}>; rel=\"next\"",
+        )
+
+        status, headers, last_page = self.request(
+            "GET",
+            f"/orders?customer_id={customer}&limit=1&cursor={body['next_cursor']}",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(last_page["items"], [second])
+        self.assertIsNone(last_page["next_cursor"])
+        self.assertNotIn("Link", headers)
+
+        for query in (
+            "pagination=cursor&offset=0",
+            "pagination=offset&cursor=abc",
+            "cursor=abc&offset=0",
+        ):
+            with self.subTest(query=query):
+                error = self.assert_error(
+                    self.request("GET", "/orders?" + query), 400, "invalid_query"
+                )
+                self.assertIn("cursor", {item["field"] for item in error["details"]})
+
+        self.assert_error(
+            self.request("GET", "/orders?pagination=cursor&cursor=forged"),
+            400,
+            "invalid_cursor",
+        )
 
     def test_query_validation(self):
         for query in (
@@ -455,6 +504,78 @@ class OrdersApiTests(unittest.TestCase):
                 response = self.request("PUT", path)
                 self.assert_error(response, 405, "method_not_allowed")
                 self.assertEqual(response[1]["Allow"], expected)
+
+
+class OrdersRoutePaginationUnitTests(unittest.TestCase):
+    def test_cursor_response_and_relative_next_link_without_socket(self):
+        store = OrderStore()
+        first = store.create("route-customer", 100)
+        second = store.create("route-customer", 200)
+        with patch("agent_qa.routes.ORDER_STORE", store):
+            status, body, headers = list_orders(
+                [
+                    ("customer_id", "route-customer"),
+                    ("limit", "1"),
+                    ("pagination", "cursor"),
+                ]
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(body["items"], [first])
+            self.assertEqual(body["total"], 2)
+            self.assertEqual(body["limit"], 1)
+            self.assertNotIn("offset", body)
+            self.assertIsNotNone(body["next_cursor"])
+            self.assertEqual(
+                headers["Link"],
+                "</orders?customer_id=route-customer&limit=1&pagination=cursor&cursor="
+                + body["next_cursor"]
+                + '>; rel="next"',
+            )
+
+            status, final_body, headers = list_orders(
+                [
+                    ("customer_id", "route-customer"),
+                    ("limit", "1"),
+                    ("cursor", body["next_cursor"]),
+                ]
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(final_body["items"], [second])
+            self.assertIsNone(final_body["next_cursor"])
+            self.assertEqual(headers, {})
+
+            status, offset_body, headers = list_orders(
+                [
+                    ("customer_id", "route-customer"),
+                    ("limit", "1"),
+                    ("offset", "1"),
+                ]
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(offset_body["items"], [second])
+            self.assertEqual(set(offset_body), {"items", "total", "limit", "offset"})
+            self.assertEqual(headers, {})
+
+            with self.assertRaises(ApiError) as mismatch:
+                list_orders(
+                    [
+                        ("customer_id", "different-customer"),
+                        ("limit", "1"),
+                        ("cursor", body["next_cursor"]),
+                    ]
+                )
+            self.assertEqual(mismatch.exception.code, "cursor_mismatch")
+
+            with self.assertRaises(OrderError) as invalid_query:
+                list_orders(
+                    [
+                        ("customer_id", "route-customer"),
+                        ("limit", "1"),
+                        ("offset", "0"),
+                        ("cursor", body["next_cursor"]),
+                    ]
+                )
+            self.assertEqual(invalid_query.exception.code, "invalid_query")
 
 
 if __name__ == "__main__":

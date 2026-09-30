@@ -6,6 +6,14 @@ from datetime import datetime, timezone
 import threading
 from typing import Any
 
+from agent_qa.errors import ApiError
+from agent_qa.pagination import (
+    MAX_CURSOR_LENGTH,
+    decode_cursor,
+    encode_cursor,
+    filter_fingerprint,
+    keyset_page,
+)
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
@@ -41,6 +49,15 @@ def _validation_error(details: list[dict[str, str]]) -> OrderError:
     return OrderError("validation_error", "Request validation failed", details)
 
 
+def _store_query_error(field: str, message: str) -> ApiError:
+    return ApiError(
+        400,
+        "invalid_query",
+        "Invalid query parameters",
+        [{"field": field, "message": message}],
+    )
+
+
 def validate_create(payload: Any) -> dict[str, Any]:
     """Validate and return normalized fields for creating an order."""
     candidate = payload if isinstance(payload, dict) else {}
@@ -65,10 +82,44 @@ def validate_patch(payload: Any) -> dict[str, Any]:
 
 def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
     """Validate order-list query pairs and return their effective values."""
-    allowed = {"status", "customer_id", "limit", "offset"}
+    allowed = {
+        "status",
+        "customer_id",
+        "limit",
+        "offset",
+        "sort",
+        "pagination",
+        "cursor",
+    }
     values: dict[str, str] = {}
     errors: list[dict[str, str]] = []
-    for name, value in query:
+    invalid_cursor_input = False
+    pairs = iter(query) if isinstance(query, (list, tuple)) else iter(())
+    for index, pair in enumerate(pairs):
+        if index >= 1000:
+            errors.append({"field": "query", "message": "Too many query parameters"})
+            break
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            errors.append({"field": "query", "message": "Invalid query parameter"})
+            continue
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str):
+            errors.append(
+                {"field": str(name)[:128], "message": "Invalid query parameter"}
+            )
+            continue
+        if name == "cursor" and len(value) > MAX_CURSOR_LENGTH:
+            invalid_cursor_input = True
+            if name in values:
+                errors.append({"field": name, "message": "Parameter may appear once"})
+            else:
+                values[name] = ""
+            continue
+        if len(name) > 128 or len(value) > 4096:
+            errors.append(
+                {"field": name[:128], "message": "Query parameter is too long"}
+            )
+            continue
         if name not in allowed:
             errors.append({"field": name, "message": "Unsupported query parameter"})
         elif name in values:
@@ -80,6 +131,17 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
         errors.append(
             {"field": "status", "message": "Must be a supported order status"}
         )
+    if "customer_id" in values and (
+        not MIN_CUSTOMER_ID_LENGTH
+        <= len(values["customer_id"])
+        <= MAX_CUSTOMER_ID_LENGTH
+        or not values["customer_id"].strip()
+    ):
+        errors.append({"field": "customer_id", "message": "Invalid customer ID"})
+    if "sort" in values and values["sort"] not in {"id", "-id"}:
+        errors.append({"field": "sort", "message": "Unsupported sort order"})
+    if "pagination" in values and values["pagination"] not in {"offset", "cursor"}:
+        errors.append({"field": "pagination", "message": "Must be offset or cursor"})
     if "limit" in values:
         try:
             limit = int(values["limit"])
@@ -109,10 +171,30 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
     else:
         offset = DEFAULT_OFFSET
 
+    cursor_mode = values.get("pagination") == "cursor" or "cursor" in values
+    if cursor_mode and "offset" in values:
+        errors.append(
+            {"field": "cursor", "message": "Offset cannot be used in cursor mode"}
+        )
+    elif "cursor" in values and values.get("pagination") == "offset":
+        errors.append(
+            {"field": "cursor", "message": "Cursor cannot be combined with offset"}
+        )
+
     if errors:
         errors.sort(key=lambda item: item["field"])
         raise OrderError("invalid_query", "Invalid query parameters", errors)
-    result: dict[str, Any] = {"limit": limit, "offset": offset}
+    if invalid_cursor_input:
+        raise ApiError(400, "invalid_cursor", "Invalid cursor")
+    result: dict[str, Any] = {
+        "limit": limit,
+        "sort": values.get("sort", "id"),
+        "pagination": "cursor" if cursor_mode else "offset",
+    }
+    if not cursor_mode:
+        result["offset"] = offset
+    if "cursor" in values:
+        result["cursor"] = values["cursor"]
     if "status" in values:
         result["status"] = values["status"]
     if "customer_id" in values:
@@ -163,8 +245,44 @@ class OrderStore:
         status: str | None = None,
         customer_id: str | None = None,
         limit: int = 20,
-        offset: int = 0,
-    ) -> tuple[list[dict[str, Any]], int]:
+        offset: int | None = None,
+        sort: str = "id",
+        pagination: str | None = None,
+        cursor: str | None = None,
+    ) -> (
+        tuple[list[dict[str, Any]], int] | tuple[list[dict[str, Any]], int, str | None]
+    ):
+        offset_supplied = offset is not None
+        if sort not in {"id", "-id"}:
+            raise _store_query_error("sort", "Unsupported sort order")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not MIN_LIMIT <= limit <= MAX_LIMIT
+        ):
+            raise _store_query_error("limit", "Invalid limit")
+        if offset is None:
+            offset = DEFAULT_OFFSET
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < MIN_OFFSET
+        ):
+            raise _store_query_error("offset", "Invalid offset")
+        explicit_pagination = pagination is not None
+        pagination = pagination or ("cursor" if cursor is not None else "offset")
+        cursor_mode = pagination == "cursor" or cursor is not None
+        if (
+            pagination not in {"offset", "cursor"}
+            or (cursor_mode and offset_supplied)
+            or (explicit_pagination and pagination == "offset" and cursor is not None)
+        ):
+            raise _store_query_error("cursor", "Cursor cannot be combined with offset")
+        filters = {"status": status, "customer_id": customer_id}
+        fingerprint = filter_fingerprint(filters)
+        cursor_key = (
+            decode_cursor(cursor, sort, fingerprint) if cursor is not None else None
+        )
         with self._lock:
             matched = [
                 self._orders[order_id]
@@ -176,6 +294,17 @@ class OrderStore:
                 )
             ]
             total = len(matched)
+            if cursor_mode:
+                page, next_key = keyset_page(matched, sort, cursor_key, limit)
+                items = [self._copy_order(order) for order in page]
+                next_cursor = (
+                    encode_cursor(sort, fingerprint, next_key)
+                    if next_key is not None
+                    else None
+                )
+                return items, total, next_cursor
+            if sort == "-id":
+                matched.reverse()
             return (
                 [self._copy_order(order) for order in matched[offset : offset + limit]],
                 total,

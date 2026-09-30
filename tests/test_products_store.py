@@ -12,6 +12,7 @@ from agent_qa.products import (
     validate_query,
 )
 from agent_qa.errors import ApiError
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.schemas import SCHEMAS
 from agent_qa.validation import validate
 
@@ -79,7 +80,13 @@ class ProductValidationTests(unittest.TestCase):
     def test_query_validates_filters_sort_and_bounds(self):
         self.assertEqual(
             validate_query([("active", "false"), ("limit", "2")]),
-            {"active": False, "limit": 2, "offset": 0, "sort": "id"},
+            {
+                "active": False,
+                "limit": 2,
+                "offset": 0,
+                "sort": "id",
+                "pagination": "offset",
+            },
         )
         invalid_queries = (
             [("active", "yes")],
@@ -91,11 +98,23 @@ class ProductValidationTests(unittest.TestCase):
             [("limit", "999999999999999999999999999999999999")],
             [("unknown", "x")],
             [("limit", "1"), ("limit", "2")],
+            [("cursor", "x"), ("offset", "0")],
+            [("pagination", "cursor"), ("offset", "0")],
+            [("pagination", "offset"), ("cursor", "x")],
         )
         for query in invalid_queries:
             with self.subTest(query=query), self.assertRaises(ApiError) as error:
                 validate_query(query)
             self.assertEqual(error.exception.code, "invalid_query")
+
+        with self.assertRaises(ApiError) as error:
+            validate_query([("cursor", "x" * (MAX_CURSOR_LENGTH + 1)), ("offset", "0")])
+        self.assertEqual(error.exception.code, "invalid_query")
+        self.assertEqual(error.exception.details[0]["field"], "cursor")
+
+        with self.assertRaises(ApiError) as error:
+            validate_query([("cursor", "x" * (MAX_CURSOR_LENGTH + 1))])
+        self.assertEqual(error.exception.code, "invalid_cursor")
 
     def test_product_schema_is_shared_and_bounds_fields(self):
         self.assertEqual(validate(SCHEMAS["CreateProduct"], product_fields()), [])
@@ -208,6 +227,76 @@ class ProductStoreTests(unittest.TestCase):
         descending, _ = store.list(sort="-name", limit=3)
         self.assertEqual([item["id"] for item in ascending], [2, 3, 1])
         self.assertEqual([item["id"] for item in descending], [1, 2, 3])
+
+    def test_cursor_pages_survive_create_and_delete_without_repeating_or_skipping(self):
+        store = ProductStore()
+        for index in range(50):
+            store.create(
+                **product_fields(sku=f"ITEM-{index + 1}", name=f"Item {index}")
+            )
+        items, total, cursor = store.list(limit=7, pagination="cursor")
+        self.assertEqual(total, 50)
+        observed = [item["id"] for item in items]
+        self.assertEqual(observed, list(range(1, 8)))
+
+        store.delete(4)
+        created = store.create(**product_fields(sku="ITEM-51", name="New item"))
+        while cursor is not None:
+            items, _total, cursor = store.list(
+                limit=7, pagination="cursor", cursor=cursor
+            )
+            observed.extend(item["id"] for item in items)
+
+        self.assertEqual(len(observed), len(set(observed)))
+        self.assertEqual(observed, [*range(1, 51), created["id"]])
+
+    def test_cursor_sort_ties_keep_id_ascending_even_when_reversed(self):
+        store = ProductStore()
+        for index in range(4):
+            store.create(**product_fields(sku=f"TIE-{index}", price_cents=20))
+        for sort in ("price_cents", "-price_cents", "name", "-name"):
+            with self.subTest(sort=sort):
+                items, _total, cursor = store.list(
+                    sort=sort, limit=2, pagination="cursor"
+                )
+                observed = [item["id"] for item in items]
+                while cursor is not None:
+                    items, _total, cursor = store.list(
+                        sort=sort, limit=2, cursor=cursor
+                    )
+                    observed.extend(item["id"] for item in items)
+                self.assertEqual(observed, [1, 2, 3, 4])
+
+    def test_cursor_mismatch_and_limit_changes(self):
+        store = ProductStore()
+        for index in range(5):
+            store.create(**product_fields(sku=f"MATCH-{index}", category="same"))
+        _items, _total, cursor = store.list(
+            limit=2, pagination="cursor", category="same"
+        )
+        items, _total, next_cursor = store.list(limit=1, category="same", cursor=cursor)
+        self.assertEqual([item["id"] for item in items], [3])
+        self.assertIsNotNone(next_cursor)
+        with self.assertRaises(ApiError) as error:
+            store.list(category="other", cursor=cursor)
+        self.assertEqual(error.exception.code, "cursor_mismatch")
+
+    def test_maximum_unicode_name_cursor_continues_in_store(self):
+        store = ProductStore()
+        name = "💩" * 120
+        store.create(**product_fields(sku="UNICODE-1", name=name))
+        store.create(**product_fields(sku="UNICODE-2", name=name))
+
+        first_page, _total, cursor = store.list(
+            sort="name", limit=1, pagination="cursor"
+        )
+        self.assertEqual(first_page[0]["id"], 1)
+        self.assertLessEqual(len(cursor), MAX_CURSOR_LENGTH)
+        second_page, _total, next_cursor = store.list(
+            sort="name", limit=1, cursor=cursor
+        )
+        self.assertEqual([item["id"] for item in second_page], [2])
+        self.assertIsNone(next_cursor)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,13 @@ import threading
 from typing import Any
 
 from agent_qa.errors import ApiError
+from agent_qa.pagination import (
+    MAX_CURSOR_LENGTH,
+    decode_cursor,
+    encode_cursor,
+    filter_fingerprint,
+    keyset_page,
+)
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
@@ -90,9 +97,12 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
         "sort",
         "limit",
         "offset",
+        "pagination",
+        "cursor",
     }
     values: dict[str, str] = {}
     errors: list[dict[str, str]] = []
+    invalid_cursor_input = False
     pairs = iter(query) if isinstance(query, (list, tuple)) else iter(())
     for index, pair in enumerate(pairs):
         if index >= _MAX_QUERY_PAIRS:
@@ -104,6 +114,12 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
         name, value = pair
         if not isinstance(name, str) or not isinstance(value, str):
             errors.append({"field": str(name), "message": "Invalid query parameter"})
+        elif name == "cursor" and len(value) > MAX_CURSOR_LENGTH:
+            invalid_cursor_input = True
+            if name in values:
+                errors.append({"field": name, "message": "Parameter may appear once"})
+            else:
+                values[name] = ""
         elif len(name) > _MAX_QUERY_TEXT_LENGTH or len(value) > _MAX_QUERY_TEXT_LENGTH:
             errors.append(
                 {
@@ -134,6 +150,8 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
         )
     if "sort" in values and values["sort"] not in PRODUCT_SORTS:
         errors.append({"field": "sort", "message": "Unsupported sort order"})
+    if "pagination" in values and values["pagination"] not in {"offset", "cursor"}:
+        errors.append({"field": "pagination", "message": "Must be offset or cursor"})
 
     parsed_numbers: dict[str, int] = {}
     bounds = {
@@ -168,21 +186,41 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
         errors.append(
             {"field": "min_price_cents", "message": "Must not exceed max_price_cents"}
         )
+    cursor_mode = values.get("pagination") == "cursor" or "cursor" in values
+    if cursor_mode and "offset" in values:
+        errors.append(
+            {"field": "cursor", "message": "Offset cannot be used in cursor mode"}
+        )
+    elif "cursor" in values and values.get("pagination") == "offset":
+        errors.append(
+            {"field": "cursor", "message": "Cursor cannot be combined with offset"}
+        )
     if errors:
         raise _invalid_query(errors)
-
+    if invalid_cursor_input:
+        raise ApiError(400, "invalid_cursor", "Invalid cursor")
     result: dict[str, Any] = {
         "limit": parsed_numbers.get("limit", DEFAULT_LIMIT),
-        "offset": parsed_numbers.get("offset", DEFAULT_OFFSET),
         "sort": values.get("sort", "id"),
+        "pagination": "cursor" if cursor_mode else "offset",
     }
+    if not cursor_mode:
+        result["offset"] = parsed_numbers.get("offset", DEFAULT_OFFSET)
+    if "cursor" in values:
+        result["cursor"] = values["cursor"]
     for name in ("category", "tag", "q"):
         if name in values:
             result[name] = values[name]
     for name in ("active", "in_stock"):
         if name in values:
             result[name] = values[name] == "true"
-    result.update(parsed_numbers)
+    result.update(
+        {
+            name: value
+            for name, value in parsed_numbers.items()
+            if name != "offset" or not cursor_mode
+        }
+    )
     return result
 
 
@@ -218,6 +256,8 @@ def _validate_store_query(query: dict[str, Any]) -> None:
         "sort",
         "limit",
         "offset",
+        "pagination",
+        "cursor",
     }
     for field in query.keys() - allowed:
         raise _invalid_store_query(str(field))
@@ -256,6 +296,17 @@ def _validate_store_query(query: dict[str, Any]) -> None:
         raise _invalid_store_query("q")
     if "sort" in query and query["sort"] not in PRODUCT_SORTS:
         raise _invalid_store_query("sort")
+    if "pagination" in query and query["pagination"] not in {"offset", "cursor"}:
+        raise _invalid_store_query("pagination")
+    cursor_mode = query.get("pagination") == "cursor" or "cursor" in query
+    if cursor_mode and "offset" in query:
+        raise _invalid_store_query("cursor")
+    if "cursor" in query and query.get("pagination") == "offset":
+        raise _invalid_store_query("cursor")
+    if "cursor" in query and (
+        not isinstance(query["cursor"], str) or len(query["cursor"]) > MAX_CURSOR_LENGTH
+    ):
+        raise ApiError(400, "invalid_cursor", "Invalid cursor")
     if "limit" in query:
         value = query["limit"]
         if (
@@ -445,11 +496,35 @@ class ProductStore:
         for product_id, product in snapshot.items():
             self._products[product_id] = product
 
-    def list(self, **query: Any) -> tuple[list[dict[str, Any]], int]:
+    def list(
+        self, **query: Any
+    ) -> (
+        tuple[list[dict[str, Any]], int] | tuple[list[dict[str, Any]], int, str | None]
+    ):
         _validate_store_query(query)
         limit = query.get("limit", DEFAULT_LIMIT)
         offset = query.get("offset", DEFAULT_OFFSET)
         sort = query.get("sort", "id")
+        cursor_mode = query.get("pagination") == "cursor" or "cursor" in query
+        filters = {
+            field: query[field]
+            for field in (
+                "category",
+                "tag",
+                "active",
+                "in_stock",
+                "min_price_cents",
+                "max_price_cents",
+                "q",
+            )
+            if field in query
+        }
+        fingerprint = filter_fingerprint(filters)
+        cursor_key = (
+            decode_cursor(query["cursor"], sort, fingerprint)
+            if "cursor" in query
+            else None
+        )
         with self._lock:
             matched = []
             for product_id in sorted(self._products):
@@ -484,6 +559,15 @@ class ProductStore:
                         continue
                 matched.append(product)
             total = len(matched)
+            if cursor_mode:
+                page, next_key = keyset_page(matched, sort, cursor_key, limit)
+                items = [_copy_product(product) for product in page]
+                next_cursor = (
+                    encode_cursor(sort, fingerprint, next_key)
+                    if next_key is not None
+                    else None
+                )
+                return items, total, next_cursor
             if sort in {"id", "-id"}:
                 matched.sort(key=lambda product: product["id"], reverse=sort == "-id")
             elif sort in {"price_cents", "-price_cents"}:

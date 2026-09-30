@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from agent_qa import orders, products, schemas
 from agent_qa.openapi import build_openapi
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.routes import ROUTES
 from agent_qa.schemas import SCHEMAS
 
@@ -53,6 +54,35 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "line_total_cents",
             },
         )
+
+    def test_cursor_pagination_parameters_schemas_and_link_headers(self):
+        spec = build_openapi(ROUTES, "cursor-schema-test")
+        for path, sort_values in (
+            ("/orders", ["id", "-id"]),
+            ("/products", None),
+        ):
+            operation = spec["paths"][path]["get"]
+            parameters = {
+                parameter["name"]: parameter for parameter in operation["parameters"]
+            }
+            self.assertEqual(
+                parameters["pagination"]["schema"]["enum"], ["offset", "cursor"]
+            )
+            self.assertEqual(parameters["pagination"]["schema"]["default"], "offset")
+            self.assertEqual(
+                parameters["cursor"]["schema"]["maxLength"], MAX_CURSOR_LENGTH
+            )
+            self.assertIn("invalid_query", parameters["pagination"]["description"])
+            self.assertIn("invalid_cursor", parameters["cursor"]["description"])
+            self.assertIn("cursor_mismatch", parameters["cursor"]["description"])
+            if sort_values is not None:
+                self.assertEqual(parameters["sort"]["schema"]["enum"], sort_values)
+            response = operation["responses"]["200"]
+            self.assertIn("Link", response["headers"])
+            schema_name = "OrderList" if path == "/orders" else "ProductList"
+            list_schema = spec["components"]["schemas"][schema_name]
+            self.assertNotIn("offset", list_schema["required"])
+            self.assertTrue(list_schema["properties"]["next_cursor"]["nullable"])
 
     def test_idempotent_post_documents_key_errors_and_replay_headers(self):
         spec = build_openapi(ROUTES, "idempotency-test")

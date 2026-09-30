@@ -28,7 +28,7 @@ restarts.
 For example, `GET /products?category=tools&in_stock=true&sort=-price_cents&limit=20`
 lists available tools by descending price. Filters include `category`, `tag`,
 `active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`; pagination
-uses `limit` and `offset`.
+uses `limit` and `offset` by default.
 
 ## Orders
 
@@ -37,6 +37,25 @@ shape or `{"customer_id":"...","items":[{"product_id":1,"quantity":2}]}`.
 Item orders reserve stock atomically and include product name and price snapshots;
 their `total_cents` is computed from the line totals. Cancelling an item order
 releases its reservation once.
+
+### Cursor pagination
+
+`GET /orders` and `GET /products` use `limit` and `offset` by default. For a
+cursor traversal, request `pagination=cursor` on the first page or supply a
+`cursor` directly; follow `next_cursor` or the relative `Link` header. Cursor
+responses contain `items`, `total`, `limit`, and `next_cursor` (null on the last
+page, with no `offset`). `total` counts all matching records. Orders sort by
+`id` or `-id`; products support their documented sort values and always break
+ties by ascending `id`, including descending sorts.
+
+Keep filters and sort unchanged while paging; the limit may change. Cursor mode
+cannot include `offset`; those combinations return `invalid_query`. Changing a
+filter or sort returns `cursor_mismatch`. With existing sort and filter values
+unchanged, inserting or deleting records between pages does not repeat passed
+records or skip other existing records after the cursor. New records positioned
+before the cursor may not appear in that traversal. Updating a sort or filter
+value can move a record across the cursor boundary. Cursors are signed with a
+key held in process memory and become invalid after restart (`invalid_cursor`).
 
 `POST /orders` and `POST /products` accept an optional `Idempotency-Key` header
 (1–64 ASCII letters, digits, `.`, `_`, `:`, or `-`). The key is scoped to the API
