@@ -7,8 +7,11 @@ import time
 import unittest
 import socket
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+
+from app import Handler
 
 
 class ServiceTests(unittest.TestCase):
@@ -147,6 +150,64 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as error:
             urlopen(self.base + "/missing", timeout=2)
         self.assertEqual(error.exception.code, 404)
+        self.assertEqual(
+            json.load(error.exception),
+            {"error": {"code": "not_found", "message": "Route not found"}},
+        )
+
+    def test_unsupported_methods_on_known_routes_are_not_allowed(self):
+        unsupported_requests = (
+            ("POST", "/ready"),
+            ("PUT", "/fixture"),
+            ("PATCH", "/version"),
+            ("DELETE", "/ready"),
+        )
+        for method, path in unsupported_requests:
+            with self.subTest(method=method, path=path):
+                request = Request(self.base + path, method=method)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(request, timeout=2)
+                self.assertEqual(error.exception.code, 405)
+                self.assertEqual(error.exception.headers["Allow"], "GET")
+                self.assertEqual(
+                    json.load(error.exception),
+                    {
+                        "error": {
+                            "code": "method_not_allowed",
+                            "message": "Method not allowed",
+                        }
+                    },
+                )
+
+    def test_unsupported_method_on_unknown_route_is_not_found(self):
+        request = Request(self.base + "/missing", method="POST")
+        with self.assertRaises(HTTPError) as error:
+            urlopen(request, timeout=2)
+        self.assertEqual(error.exception.code, 404)
+        self.assertEqual(
+            json.load(error.exception),
+            {"error": {"code": "not_found", "message": "Route not found"}},
+        )
+
+    def test_unexpected_handler_exception_returns_safe_internal_error(self):
+        handler = object.__new__(Handler)
+        expected_error = {
+            "error": {
+                "code": "internal_error",
+                "message": "Internal server error",
+            }
+        }
+        with (
+            patch.object(
+                handler, "_handle_get", side_effect=RuntimeError("secret traceback")
+            ),
+            patch.object(handler, "_json") as send_json,
+        ):
+            handler.do_GET()
+
+        send_json.assert_called_once_with(500, expected_error)
+        self.assertNotIn("secret traceback", json.dumps(expected_error))
+        self.assertNotIn("Traceback", json.dumps(expected_error))
 
 
 if __name__ == "__main__":
