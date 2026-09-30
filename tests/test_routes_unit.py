@@ -147,7 +147,7 @@ class RouteUnitTests(unittest.TestCase):
                 methods = dict.fromkeys(
                     route["method"] for route in ROUTES if route["path"] == path
                 )
-                self.assertEqual(allowed_methods(path), ", ".join(methods))
+                self.assertEqual(allowed_methods(path), ", ".join(sorted(methods)))
 
     def test_order_request_schema_identity(self):
         create = next(

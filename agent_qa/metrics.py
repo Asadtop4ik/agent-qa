@@ -8,6 +8,7 @@ import threading
 _REQUESTS_NAME = "agent_qa_http_requests_total"
 _DURATION_NAME = "agent_qa_http_request_duration_seconds"
 _ORDERS_NAME = "agent_qa_orders"
+_PRODUCTS_NAME = "agent_qa_products"
 _BUILD_NAME = "agent_qa_build_info"
 _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
@@ -57,7 +58,7 @@ class MetricsRegistry:
                 duration_count + 1,
             )
 
-    def render(self, orders: int, git_sha: str) -> str:
+    def render(self, orders: int, git_sha: str, products: int | None = None) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
             requests = self._requests.copy()
@@ -111,6 +112,15 @@ class MetricsRegistry:
                 [(_ORDERS_NAME, (), str(orders))],
             ),
         ]
+        if products is not None:
+            families.append(
+                (
+                    _PRODUCTS_NAME,
+                    "Current number of products.",
+                    "gauge",
+                    [(_PRODUCTS_NAME, (), str(products))],
+                )
+            )
 
         lines: list[str] = []
         for name, help_text, metric_type, samples in sorted(families):

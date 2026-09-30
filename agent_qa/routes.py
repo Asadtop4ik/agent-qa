@@ -13,6 +13,8 @@ from agent_qa.schemas import (
     MAX_LIMIT,
     MIN_LIMIT,
     MIN_OFFSET,
+    MAX_PRODUCT_QUERY_LENGTH,
+    PRODUCT_SORTS,
     SCHEMAS,
 )
 from agent_qa.validation import validate
@@ -22,9 +24,17 @@ from agent_qa.orders import (
     validate_patch,
     validate_query,
 )
+from agent_qa.products import (
+    ProductStore,
+    validate_adjust_stock,
+    validate_create as validate_product_create,
+    validate_patch as validate_product_patch,
+    validate_query as validate_product_query,
+)
 
 
 ORDER_STORE = OrderStore()
+PRODUCT_STORE = ProductStore()
 
 
 def ready(
@@ -98,9 +108,10 @@ def metrics(
 ) -> tuple[int, object, dict[str, str]]:
     """Return a Prometheus snapshot of service metrics."""
     order_count = ORDER_STORE.list(limit=1)[1]
+    product_count = PRODUCT_STORE.list(limit=1)[1]
     return (
         200,
-        REGISTRY.render(order_count, GIT_SHA),
+        REGISTRY.render(order_count, GIT_SHA, products=product_count),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
 
@@ -291,6 +302,114 @@ def delete_order(
     return 204, None, {"Content-Length": "0"}
 
 
+def create_product(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Validate and create a product."""
+    product = PRODUCT_STORE.create(**validate_product_create(payload))
+    return 201, product, {"Location": f"/products/{product['id']}"}
+
+
+def list_products(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return filtered and paginated products."""
+    filters = validate_product_query(query)
+    items, total = PRODUCT_STORE.list(**filters)
+    return (
+        200,
+        {
+            "items": items,
+            "total": total,
+            "limit": filters["limit"],
+            "offset": filters["offset"],
+        },
+        {},
+    )
+
+
+def _product_id(path_params: dict[str, str] | None) -> int | None:
+    raw_id = (path_params or {}).get("id", "")
+    if len(raw_id) > 20 or not raw_id.isascii() or not raw_id.isdigit():
+        return None
+    try:
+        product_id = int(raw_id)
+    except ValueError:
+        return None
+    return product_id if product_id > 0 else None
+
+
+def get_product(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return one product or the standard missing-product error."""
+    product_id = _product_id(path_params)
+    product = PRODUCT_STORE.get(product_id) if product_id is not None else None
+    if product is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    return 200, product, {}
+
+
+def patch_product(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Validate and update a product."""
+    product_id = _product_id(path_params)
+    if product_id is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    changes = validate_product_patch(payload)
+    product = PRODUCT_STORE.update(product_id, changes)
+    if product is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    return 200, product, {}
+
+
+def delete_product(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Delete a product and return an empty response body."""
+    product_id = _product_id(path_params)
+    if product_id is None or not PRODUCT_STORE.delete(product_id):
+        raise ApiError(404, "product_not_found", "Product not found")
+    return 204, None, {"Content-Length": "0"}
+
+
+def adjust_product_stock(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Atomically adjust one product's stock."""
+    product_id = _product_id(path_params)
+    if product_id is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    values = validate_adjust_stock(payload)
+    product = PRODUCT_STORE.adjust_stock(product_id, values["delta"])
+    if product is None:
+        raise ApiError(404, "product_not_found", "Product not found")
+    return 200, product, {}
+
+
+def categories(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return current aggregates for categories represented by products."""
+    items = PRODUCT_STORE.categories()
+    return 200, {"items": items, "total": len(items)}, {}
+
+
 _ORDER_ID = {
     "name": "id",
     "in": "path",
@@ -304,6 +423,100 @@ _CREATE_ORDER_SCHEMA = SCHEMAS["CreateOrder"]
 _UPDATE_ORDER_SCHEMA = SCHEMAS["UpdateOrder"]
 _ORDER_RESPONSE_SCHEMA = SCHEMAS["Order"]
 _ORDER_LIST_RESPONSE_SCHEMA = SCHEMAS["OrderList"]
+_PRODUCT_ID = {
+    "name": "id",
+    "in": "path",
+    "required": True,
+    "description": "Positive product identifier.",
+    "schema": {"type": "integer", "minimum": 1},
+}
+_CREATE_PRODUCT_SCHEMA = SCHEMAS["CreateProduct"]
+_UPDATE_PRODUCT_SCHEMA = SCHEMAS["UpdateProduct"]
+_PRODUCT_RESPONSE_SCHEMA = SCHEMAS["Product"]
+_PRODUCT_LIST_RESPONSE_SCHEMA = SCHEMAS["ProductList"]
+_ADJUST_STOCK_SCHEMA = SCHEMAS["AdjustStock"]
+_CATEGORY_LIST_RESPONSE_SCHEMA = SCHEMAS["CategoryList"]
+_PRODUCT_QUERY_PARAMETERS = [
+    {
+        "name": "category",
+        "in": "query",
+        "required": False,
+        "schema": _CREATE_PRODUCT_SCHEMA["properties"]["category"],
+    },
+    {
+        "name": "tag",
+        "in": "query",
+        "required": False,
+        "schema": _CREATE_PRODUCT_SCHEMA["properties"]["tags"]["items"],
+    },
+    {
+        "name": "active",
+        "in": "query",
+        "required": False,
+        "schema": {"type": "boolean"},
+    },
+    {
+        "name": "in_stock",
+        "in": "query",
+        "required": False,
+        "schema": {"type": "boolean"},
+    },
+    {
+        "name": "min_price_cents",
+        "in": "query",
+        "required": False,
+        "schema": _CREATE_PRODUCT_SCHEMA["properties"]["price_cents"],
+    },
+    {
+        "name": "max_price_cents",
+        "in": "query",
+        "required": False,
+        "schema": _CREATE_PRODUCT_SCHEMA["properties"]["price_cents"],
+    },
+    {
+        "name": "q",
+        "in": "query",
+        "required": False,
+        "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_PRODUCT_QUERY_LENGTH,
+        },
+    },
+    {
+        "name": "sort",
+        "in": "query",
+        "required": False,
+        "schema": {
+            "type": "string",
+            "enum": list(PRODUCT_SORTS),
+            "default": "id",
+        },
+    },
+    {
+        "name": "limit",
+        "in": "query",
+        "required": False,
+        "description": "Maximum number of products to return.",
+        "schema": {
+            "type": "integer",
+            "minimum": MIN_LIMIT,
+            "maximum": MAX_LIMIT,
+            "default": DEFAULT_LIMIT,
+        },
+    },
+    {
+        "name": "offset",
+        "in": "query",
+        "required": False,
+        "description": "Number of matching products to skip.",
+        "schema": {
+            "type": "integer",
+            "minimum": MIN_OFFSET,
+            "default": DEFAULT_OFFSET,
+        },
+    },
+]
 _OPENAPI_RESPONSE_SCHEMA = {
     "type": "object",
     "required": ["openapi", "info", "paths", "components"],
@@ -665,5 +878,85 @@ ROUTES = (
         "request_schema": _UPDATE_ORDER_SCHEMA,
         "responses": ["200", "400", "401", "404", "409", "413", "415"],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "POST",
+        "path": "/products",
+        "handler": create_product,
+        "body": True,
+        "auth_required": True,
+        "operation_id": "createProduct",
+        "summary": "Create a product",
+        "request_schema": _CREATE_PRODUCT_SCHEMA,
+        "responses": ["201", "400", "401", "409", "411", "413", "415"],
+        "response_schemas": {"201": _PRODUCT_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/products",
+        "handler": list_products,
+        "auth_required": False,
+        "operation_id": "listProducts",
+        "summary": "Search and list products",
+        "parameters": _PRODUCT_QUERY_PARAMETERS,
+        "responses": ["200", "400"],
+        "response_schemas": {"200": _PRODUCT_LIST_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "DELETE",
+        "path": "/products/{id}",
+        "handler": delete_product,
+        "auth_required": True,
+        "operation_id": "deleteProduct",
+        "summary": "Delete a product",
+        "parameters": [_PRODUCT_ID],
+        "responses": ["204", "401", "404"],
+    },
+    {
+        "method": "GET",
+        "path": "/products/{id}",
+        "handler": get_product,
+        "auth_required": False,
+        "operation_id": "getProduct",
+        "summary": "Read a product",
+        "parameters": [_PRODUCT_ID],
+        "responses": ["200", "404"],
+        "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "PATCH",
+        "path": "/products/{id}",
+        "handler": patch_product,
+        "body": True,
+        "auth_required": True,
+        "operation_id": "updateProduct",
+        "summary": "Update a product",
+        "parameters": [_PRODUCT_ID],
+        "request_schema": _UPDATE_PRODUCT_SCHEMA,
+        "responses": ["200", "400", "401", "404", "409", "411", "413", "415"],
+        "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "POST",
+        "path": "/products/{id}/adjust-stock",
+        "handler": adjust_product_stock,
+        "body": True,
+        "auth_required": True,
+        "operation_id": "adjustProductStock",
+        "summary": "Adjust product stock atomically",
+        "parameters": [_PRODUCT_ID],
+        "request_schema": _ADJUST_STOCK_SCHEMA,
+        "responses": ["200", "400", "401", "404", "409", "411", "413", "415"],
+        "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/categories",
+        "handler": categories,
+        "auth_required": False,
+        "operation_id": "listCategories",
+        "summary": "Read product category aggregates",
+        "responses": ["200"],
+        "response_schemas": {"200": _CATEGORY_LIST_RESPONSE_SCHEMA},
     },
 )

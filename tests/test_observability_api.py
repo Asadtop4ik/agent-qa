@@ -77,6 +77,7 @@ class ObservabilityApiTests(unittest.TestCase):
                 ("agent_qa_http_requests_total", "counter"),
                 ("agent_qa_http_request_duration_seconds", "summary"),
                 ("agent_qa_orders", "gauge"),
+                ("agent_qa_products", "gauge"),
                 ("agent_qa_build_info", "gauge"),
             ):
                 self.assertIn(f"# HELP {name} ", first_text)
