@@ -11,11 +11,158 @@ from unittest.mock import Mock, patch
 
 from agent_qa.config import GIT_SHA
 from agent_qa.errors import ApiError, envelope
-from agent_qa.routes import ROUTES, fixture, health, ping, ready, status, version
+from agent_qa.orders import OrderStore
+from agent_qa.routes import (
+    ROUTES,
+    fixture,
+    health,
+    list_orders,
+    list_products,
+    ping,
+    ready,
+    status,
+    version,
+)
 from agent_qa.schemas import SCHEMAS
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_cursor_list_handlers_emit_relative_encoded_next_links(self):
+        order_filters = {
+            "status": "new",
+            "customer_id": "id with space",
+            "limit": 2,
+            "sort": "-id",
+            "pagination": "cursor",
+        }
+        product_filters = {
+            "q": "red mug",
+            "limit": 3,
+            "sort": "-price_cents",
+            "pagination": "cursor",
+        }
+        with (
+            patch("agent_qa.routes.validate_query", return_value=order_filters),
+            patch(
+                "agent_qa.routes.ORDER_STORE.list",
+                return_value=([{"id": 1}], 4, "opaque.order"),
+            ),
+        ):
+            status_code, body, headers = list_orders([])
+        self.assertEqual(status_code, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(body["next_cursor"], "opaque.order")
+        self.assertEqual(
+            headers["Link"],
+            (
+                "</orders?status=new&customer_id=id%20with%20space&limit=2&"
+                'sort=-id&pagination=cursor&cursor=opaque.order>; rel="next"'
+            ),
+        )
+
+        with (
+            patch(
+                "agent_qa.routes.validate_product_query", return_value=product_filters
+            ),
+            patch(
+                "agent_qa.routes.PRODUCT_STORE.list",
+                return_value=([{"id": 2}], 5, "opaque.product"),
+            ),
+        ):
+            status_code, body, headers = list_products([])
+        self.assertEqual(status_code, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "next_cursor"})
+        self.assertIn("q=red%20mug", headers["Link"])
+        self.assertIn("sort=-price_cents", headers["Link"])
+        self.assertIn("cursor=opaque.product", headers["Link"])
+
+    def test_order_cursor_handler_integrates_validation_store_and_link_traversal(self):
+        from urllib.parse import quote
+
+        from agent_qa.server import Handler
+
+        store = OrderStore()
+        customer_id = "route+customer&one"
+        created = [
+            store.create(customer_id, total_cents=100 + index) for index in range(3)
+        ]
+
+        def dispatch(path):
+            responses = []
+            handler = object.__new__(Handler)
+            handler.path = path
+            handler.command = "GET"
+            handler.headers = Message()
+            handler.rfile = BytesIO()
+            handler.request_id = "orders-route-test"
+            handler._json = lambda *args: responses.append(args)
+            Handler._handle(handler)
+            response = responses[0]
+            return (*response, {}) if len(response) == 2 else response
+
+        with patch("agent_qa.routes.ORDER_STORE", store):
+            empty_status, empty_body, _ = dispatch(
+                "/orders?customer_id=missing&pagination=cursor"
+            )
+            self.assertEqual(empty_status, 200)
+            self.assertEqual(empty_body["items"], [])
+            self.assertEqual(empty_body["total"], 0)
+            self.assertIsNone(empty_body["next_cursor"])
+            self.assertNotIn("offset", empty_body)
+
+            offset_status, offset_body, _ = dispatch(
+                "/orders?customer_id="
+                + quote(customer_id, safe="")
+                + "&limit=2&offset=0&sort=-id"
+            )
+            self.assertEqual(offset_status, 200)
+            self.assertEqual(set(offset_body), {"items", "total", "limit", "offset"})
+            self.assertEqual([item["id"] for item in offset_body["items"]], [3, 2])
+
+            first_status, first_body, first_headers = dispatch(
+                "/orders?customer_id="
+                + quote(customer_id, safe="")
+                + "&limit=1&sort=-id&pagination=cursor"
+            )
+            self.assertEqual(first_status, 200)
+            self.assertEqual(
+                set(first_body), {"items", "total", "limit", "next_cursor"}
+            )
+            self.assertEqual(first_body["items"][0]["id"], created[2]["id"])
+            link = first_headers["Link"]
+            self.assertIn("customer_id=route%2Bcustomer%26one", link)
+            next_path = link.split("<", 1)[1].split(">", 1)[0]
+
+            second_status, second_body, _ = dispatch(
+                next_path.replace("limit=1", "limit=2")
+            )
+            self.assertEqual(second_status, 200)
+            self.assertEqual([item["id"] for item in second_body["items"]], [2, 1])
+            self.assertIsNone(second_body["next_cursor"])
+
+            for changed_query in (
+                next_path.replace("route%2Bcustomer%26one", "different"),
+                next_path.replace("sort=-id", "sort=id"),
+            ):
+                status, body, _ = dispatch(changed_query)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "cursor_mismatch")
+
+            for cursor in ("forged", "x" * 4097):
+                status, body, _ = dispatch("/orders?cursor=" + cursor)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "invalid_cursor")
+                for conflict in ("offset=0", "pagination=offset"):
+                    status, body, _ = dispatch(f"/orders?cursor={cursor}&{conflict}")
+                    self.assertEqual(status, 400)
+                    self.assertEqual(body["error"]["code"], "invalid_query")
+                    self.assertTrue(
+                        any(
+                            item["field"] == "cursor"
+                            for item in body["error"]["details"]
+                        )
+                    )
+
     def test_only_requested_post_routes_are_idempotent(self):
         flagged = {
             (route["method"], route["path"])

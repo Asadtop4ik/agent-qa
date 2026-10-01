@@ -158,6 +158,28 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["items"], [second])
         self.assertNotEqual(other["customer_id"], customer)
 
+        status, headers, body = self.request(
+            "GET",
+            f"/orders?customer_id={customer}&status=new&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["items"], [first])
+        self.assertTrue(headers["Link"].startswith("</orders?"))
+        self.assertIn('rel="next"', headers["Link"])
+        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
+        self.assertIn("customer_id=", next_path)
+        self.assertIn("status=new", next_path)
+        self.assertIn("limit=1", next_path)
+        self.assertIn("cursor=", next_path)
+        status, next_headers, next_body = self.request("GET", next_path)
+        self.assertEqual(status, 200)
+        self.assertEqual(set(next_body), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(next_body["items"], [second])
+        self.assertIsNone(next_body["next_cursor"])
+        self.assertNotIn("Link", next_headers)
+
     def test_query_validation(self):
         for query in (
             "limit=0",
@@ -167,11 +189,43 @@ class OrdersApiTests(unittest.TestCase):
             "status=foo",
             "x=1",
             "limit=1&limit=2",
+            "cursor=abc&offset=1",
+            "pagination=offset&cursor=abc",
         ):
             with self.subTest(query=query):
                 self.assert_error(
                     self.request("GET", "/orders?" + query), 400, "invalid_query"
                 )
+
+    def test_cursor_rejects_tampered_and_mismatched_queries(self):
+        customer = self.customer_id()
+        self.create_order(customer)
+        self.create_order(customer)
+        status, headers, body = self.request(
+            "GET",
+            f"/orders?customer_id={customer}&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(body["next_cursor"])
+        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
+
+        cursor = body["next_cursor"]
+        tampered = cursor[:-1] + ("0" if cursor[-1] != "0" else "1")
+        self.assert_error(
+            self.request("GET", "/orders?cursor=" + tampered),
+            400,
+            "invalid_cursor",
+        )
+        self.assert_error(
+            self.request("GET", next_path.replace(customer, customer + "x")),
+            400,
+            "cursor_mismatch",
+        )
+        status, _, changed_limit = self.request(
+            "GET", next_path.replace("limit=1", "limit=2")
+        )
+        self.assertEqual(status, 200)
+        self.assertLessEqual(len(changed_limit["items"]), 2)
 
     def test_post_validation_and_body_errors(self):
         customer = self.customer_id()

@@ -201,12 +201,17 @@ SCHEMAS = {
     "Product": _PRODUCT,
     "ProductList": {
         "type": "object",
-        "required": ["items", "total", "limit", "offset"],
+        "required": ["items", "total", "limit"],
         "properties": {
             "items": {"type": "array", "items": _PRODUCT},
             "total": {"type": "integer", "minimum": 0, "maximum": MAX_PRODUCTS},
             "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
-            "offset": {"type": "integer", "minimum": MIN_OFFSET},
+            "offset": {
+                "type": "integer",
+                "minimum": MIN_OFFSET,
+                "maximum": (1 << 63) - 1,
+            },
+            "next_cursor": {"type": "string", "nullable": True},
         },
         "additionalProperties": False,
     },
@@ -277,12 +282,17 @@ SCHEMAS = {
     },
     "OrderList": {
         "type": "object",
-        "required": ["items", "total", "limit", "offset"],
+        "required": ["items", "total", "limit"],
         "properties": {
             "items": {"type": "array", "items": {"$ref": "#/components/schemas/Order"}},
             "total": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
-            "offset": {"type": "integer", "minimum": MIN_OFFSET},
+            "offset": {
+                "type": "integer",
+                "minimum": MIN_OFFSET,
+                "maximum": (1 << 63) - 1,
+            },
+            "next_cursor": {"type": "string", "nullable": True},
         },
         "additionalProperties": False,
     },

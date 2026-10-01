@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from agent_qa import orders, products, schemas
 from agent_qa.openapi import build_openapi
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.routes import ROUTES
 from agent_qa.schemas import SCHEMAS
 
@@ -22,6 +23,49 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_cursor_pagination_parameters_responses_and_errors_are_documented(self):
+        spec = build_openapi(ROUTES, "cursor-pagination-test")
+        for path in ("/orders", "/products"):
+            with self.subTest(path=path):
+                operation = spec["paths"][path]["get"]
+                parameters = {item["name"]: item for item in operation["parameters"]}
+                self.assertEqual(
+                    parameters["pagination"]["schema"]["enum"],
+                    ["offset", "cursor"],
+                )
+                self.assertEqual(
+                    parameters["pagination"]["schema"]["default"], "offset"
+                )
+                self.assertEqual(parameters["cursor"]["in"], "query")
+                self.assertEqual(
+                    parameters["cursor"]["schema"]["maxLength"],
+                    MAX_CURSOR_LENGTH,
+                )
+                self.assertGreaterEqual(
+                    parameters["pagination"]["description"].find("offset"), 0
+                )
+                self.assertIn("Link", operation["responses"]["200"]["headers"])
+                self.assertIn(
+                    "invalid_cursor",
+                    operation["responses"]["400"]["description"],
+                )
+                self.assertIn(
+                    "cursor_mismatch",
+                    operation["responses"]["400"]["description"],
+                )
+                response_schema = operation["responses"]["200"]["content"][
+                    "application/json"
+                ]["schema"]
+                self.assertNotIn("offset", response_schema["required"])
+                self.assertTrue(
+                    response_schema["properties"]["next_cursor"]["nullable"]
+                )
+        order_parameters = {
+            item["name"]: item["schema"]
+            for item in spec["paths"]["/orders"]["get"]["parameters"]
+        }
+        self.assertEqual(order_parameters["sort"]["enum"], ["id", "-id"])
+
     def test_conditional_request_headers_and_responses_are_documented(self):
         spec = build_openapi(ROUTES, "conditional-test")
         cases = (
@@ -297,6 +341,9 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(parameters["limit"]["default"], orders.DEFAULT_LIMIT)
         self.assertEqual(parameters["offset"]["minimum"], orders.MIN_OFFSET)
         self.assertEqual(parameters["offset"]["default"], orders.DEFAULT_OFFSET)
+        self.assertEqual(parameters["offset"]["maximum"], (1 << 63) - 1)
+        self.assertEqual(parameters["sort"]["enum"], ["id", "-id"])
+        self.assertEqual(parameters["pagination"]["default"], "offset")
 
         create_schema = spec["paths"]["/orders"]["post"]["requestBody"]
         create_schema = create_schema["content"]["application/json"]["schema"]
@@ -449,6 +496,8 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(parameters["limit"]["default"], orders.DEFAULT_LIMIT)
         self.assertEqual(parameters["offset"]["minimum"], orders.MIN_OFFSET)
         self.assertEqual(parameters["offset"]["default"], orders.DEFAULT_OFFSET)
+        self.assertEqual(parameters["offset"]["maximum"], (1 << 63) - 1)
+        self.assertEqual(parameters["pagination"]["default"], "offset")
         delta_schema = SCHEMAS["AdjustStock"]["properties"]["delta"]
         self.assertEqual(delta_schema["minimum"], -schemas.MAX_STOCK)
         self.assertEqual(delta_schema["maximum"], schemas.MAX_STOCK)

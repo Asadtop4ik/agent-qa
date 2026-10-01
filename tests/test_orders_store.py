@@ -43,9 +43,16 @@ class OrderValidationTests(unittest.TestCase):
     def test_query_validates_values_and_repeated_parameters(self):
         self.assertEqual(
             validate_query([("limit", "2"), ("offset", "1")]),
-            {"limit": 2, "offset": 1},
+            {"limit": 2, "sort": "id", "pagination": "offset", "offset": 1},
+        )
+        self.assertEqual(
+            validate_query([("cursor", "opaque")]),
+            {"limit": 20, "sort": "id", "pagination": "cursor", "cursor": "opaque"},
         )
         invalid_queries = (
+            [("limit", None)],
+            [(None, "1")],
+            ["malformed"],
             [("limit", "0")],
             [("limit", "101")],
             [("limit", "abc")],
@@ -53,6 +60,8 @@ class OrderValidationTests(unittest.TestCase):
             [("status", "foo")],
             [("x", "1")],
             [("limit", "1"), ("limit", "2")],
+            [("cursor", "abc"), ("offset", "0")],
+            [("pagination", "offset"), ("cursor", "abc")],
         )
         for query in invalid_queries:
             with self.subTest(query=query), self.assertRaises(OrderError) as error:
@@ -121,6 +130,52 @@ class OrderStoreTests(unittest.TestCase):
         items, total = store.list(status="paid")
         self.assertEqual(total, 1)
         self.assertEqual(items[0]["id"], one["id"])
+        descending, total = store.list(sort="-id", limit=1, offset=1)
+        self.assertEqual(total, 3)
+        self.assertEqual([item["id"] for item in descending], [2])
+
+        cursor_items, _, cursor = store.list(sort="-id", limit=1, pagination="cursor")
+        seen = [item["id"] for item in cursor_items]
+        while cursor is not None:
+            cursor_items, _, cursor = store.list(sort="-id", limit=1, cursor=cursor)
+            seen.extend(item["id"] for item in cursor_items)
+        self.assertEqual(seen, [3, 2, 1])
+
+    def test_cursor_pages_survive_creates_and_deletes_without_repeating(self):
+        store = OrderStore()
+        for index in range(50):
+            store.create(f"customer-{index}", index)
+
+        items, total, cursor = store.list(limit=7, pagination="cursor")
+        seen = [item["id"] for item in items]
+        self.assertEqual(total, 50)
+        self.assertIsNotNone(cursor)
+        store.create("new-after-page-one", 100)
+        self.assertTrue(store.delete(3))
+        self.assertTrue(store.delete(10))
+
+        while cursor is not None:
+            items, total, cursor = store.list(
+                limit=5 if len(seen) % 2 else 7,
+                pagination="cursor",
+                cursor=cursor,
+            )
+            seen.extend(item["id"] for item in items)
+        expected = [*range(1, 10), *range(11, 52)]
+        self.assertEqual(seen, expected)
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(total, 49)
+
+    def test_list_bounds_direct_pagination_values(self):
+        store = OrderStore()
+        for query in (
+            {"limit": 10**100, "pagination": "cursor"},
+            {"limit": True, "pagination": "cursor"},
+            {"offset": 10**100},
+        ):
+            with self.subTest(query=query), self.assertRaises(OrderError) as error:
+                store.list(**query)
+            self.assertEqual(error.exception.code, "invalid_query")
 
     def test_transition_rules_and_total_lock(self):
         store = OrderStore()

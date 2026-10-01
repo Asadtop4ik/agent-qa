@@ -27,8 +27,23 @@ restarts.
 
 For example, `GET /products?category=tools&in_stock=true&sort=-price_cents&limit=20`
 lists available tools by descending price. Filters include `category`, `tag`,
-`active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`; pagination
-uses `limit` and `offset`.
+`active`, `in_stock`, `min_price_cents`, `max_price_cents`, and `q`. Offset
+pagination remains the default and uses `limit` and `offset`; its response has
+`items`, `total`, `limit`, and `offset`. Both `/orders` and `/products` also
+support keyset pagination with `pagination=cursor` (or a `cursor` parameter); its
+response has `items`, `total`, `limit`, and nullable `next_cursor`, without
+`offset`. A relative `Link` header points to the next page when one is available.
+Pass the returned cursor on the next request and repeat the same filters and
+sort. Cursor cannot be combined with `offset` or `pagination=offset`; this
+returns `400 invalid_query`. Changing a filter or sort returns
+`400 cursor_mismatch`; a malformed or invalidated cursor returns
+`400 invalid_cursor`. Limits may change between cursor pages. Products use ID
+ascending order to break sort-value ties, including descending sorts. Cursor
+signatures use a process-local key, so all cursors become invalid after a
+service restart.
+
+For example, `GET /orders?status=new&sort=-id&limit=20&pagination=cursor` starts
+a cursor-paginated order listing.
 
 ## Conditional requests
 

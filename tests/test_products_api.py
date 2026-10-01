@@ -343,6 +343,25 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual((page["limit"], page["offset"]), (20, 0))
 
+        status, page, headers = self.dispatch(
+            "GET",
+            "/products?category=tools&sort=-price_cents&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(page), {"items", "total", "limit", "next_cursor"})
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(page["items"][0]["sku"], "ALPHA-1")
+        self.assertTrue(headers["Link"].startswith("</products?"))
+        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
+        self.assertIn("category=tools", next_path)
+        self.assertIn("sort=-price_cents", next_path)
+        self.assertIn("limit=1", next_path)
+        status, second_page, second_headers = self.dispatch("GET", next_path)
+        self.assertEqual(status, 200)
+        self.assertEqual(second_page["items"][0]["sku"], "BETA-1")
+        self.assertIsNone(second_page["next_cursor"])
+        self.assertNotIn("Link", second_headers)
+
     def test_invalid_and_duplicate_query_parameters_are_400(self):
         invalid_queries = (
             ("unknown=x", "unknown"),
@@ -355,6 +374,8 @@ class ProductApiTests(unittest.TestCase):
             ("limit=0", "limit"),
             ("limit=101", "limit"),
             ("offset=-1", "offset"),
+            ("cursor=abc&offset=1", "cursor"),
+            ("pagination=offset&cursor=abc", "cursor"),
             ("offset=" + "9" * 5000, "offset"),
             ("min_price_cents=100000001", "min_price_cents"),
             ("max_price_cents=bad", "max_price_cents"),
@@ -374,6 +395,55 @@ class ProductApiTests(unittest.TestCase):
                 self.assertTrue(
                     any(item["field"] == field for item in body["error"]["details"])
                 )
+
+    def test_cursor_rejects_tampering_and_filter_changes(self):
+        for conflict in ("", "&offset=0", "&pagination=offset"):
+            status, body, _ = self.dispatch(
+                "GET", "/products?cursor=" + "x" * 4097 + conflict
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                body["error"]["code"],
+                "invalid_query" if conflict else "invalid_cursor",
+            )
+        self.create("CURSOR-1", category="tools")
+        self.create("CURSOR-2", category="tools")
+        status, page, headers = self.dispatch(
+            "GET", "/products?category=tools&limit=1&pagination=cursor"
+        )
+        self.assertEqual(status, 200)
+        cursor = page["next_cursor"]
+        self.assertIsNotNone(cursor)
+        tampered = cursor[:-1] + ("0" if cursor[-1] != "0" else "1")
+        status, body, _ = self.dispatch("GET", "/products?cursor=" + tampered)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_cursor")
+
+        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
+        status, body, _ = self.dispatch("GET", next_path.replace("tools", "books"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "cursor_mismatch")
+
+    def test_cursor_link_preserves_boolean_filters_as_lowercase(self):
+        self.create("ACTIVE-1", active=True, stock=4)
+        self.create("ACTIVE-2", active=True, stock=2)
+        status, page, headers = self.dispatch(
+            "GET",
+            "/products?active=true&in_stock=true&limit=1&pagination=cursor",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["total"], 2)
+        self.assertIn("active=true", headers["Link"])
+        self.assertIn("in_stock=true", headers["Link"])
+        self.assertNotIn("active=True", headers["Link"])
+        self.assertNotIn("in_stock=True", headers["Link"])
+
+        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
+        status, next_page, _ = self.dispatch("GET", next_path)
+        self.assertEqual(status, 200)
+        self.assertEqual(next_page["total"], 2)
+        self.assertEqual(len(next_page["items"]), 1)
+        self.assertIsNone(next_page["next_cursor"])
 
     def test_dispatch_reports_405_413_and_415_for_product_routes(self):
         status, _, headers = self.dispatch("PUT", "/products")

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import platform
+from urllib.parse import quote, urlencode
 
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
@@ -11,6 +12,7 @@ from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
 from agent_qa.openapi import build_openapi
+from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
     DEFAULT_OFFSET,
@@ -53,6 +55,17 @@ def _list_etag(body: object) -> str:
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f'W/"{digest}"'
+
+
+def _cursor_link(path: str, filters: dict[str, object], cursor: str) -> str:
+    parameters = [
+        (key, str(value).lower() if isinstance(value, bool) else value)
+        for key, value in filters.items()
+        if key not in {"offset", "pagination", "cursor"} and value is not None
+    ]
+    parameters.append(("pagination", "cursor"))
+    parameters.append(("cursor", cursor))
+    return f'<{path}?{urlencode(parameters, quote_via=quote)}>; rel="next"'
 
 
 def _if_none_match(headers: dict[str, str] | None, current: str) -> bool:
@@ -283,15 +296,27 @@ def list_orders(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated orders."""
     filters = validate_query(query)
-    items, total = ORDER_STORE.list(**filters)
-    body = {
-        "items": items,
-        "total": total,
-        "limit": filters["limit"],
-        "offset": filters["offset"],
-    }
+    result = ORDER_STORE.list(**filters)
+    if filters["pagination"] == "cursor":
+        items, total, next_cursor = result
+        body = {
+            "items": items,
+            "total": total,
+            "limit": filters["limit"],
+            "next_cursor": next_cursor,
+        }
+    else:
+        items, total = result
+        body = {
+            "items": items,
+            "total": total,
+            "limit": filters["limit"],
+            "offset": filters["offset"],
+        }
     etag = _list_etag(body)
     headers = {"ETag": etag}
+    if filters["pagination"] == "cursor" and next_cursor is not None:
+        headers["Link"] = _cursor_link("/orders", filters, next_cursor)
     if _if_none_match(request_headers, etag):
         return 304, None, headers
     return 200, body, headers
@@ -399,15 +424,27 @@ def list_products(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated products."""
     filters = validate_product_query(query)
-    items, total = PRODUCT_STORE.list(**filters)
-    body = {
-        "items": items,
-        "total": total,
-        "limit": filters["limit"],
-        "offset": filters["offset"],
-    }
+    result = PRODUCT_STORE.list(**filters)
+    if filters["pagination"] == "cursor":
+        items, total, next_cursor = result
+        body = {
+            "items": items,
+            "total": total,
+            "limit": filters["limit"],
+            "next_cursor": next_cursor,
+        }
+    else:
+        items, total = result
+        body = {
+            "items": items,
+            "total": total,
+            "limit": filters["limit"],
+            "offset": filters["offset"],
+        }
     etag = _list_etag(body)
     headers = {"ETag": etag}
+    if filters["pagination"] == "cursor" and next_cursor is not None:
+        headers["Link"] = _cursor_link("/products", filters, next_cursor)
     if _if_none_match(request_headers, etag):
         return 304, None, headers
     return 200, body, headers
@@ -641,7 +678,30 @@ _PRODUCT_QUERY_PARAMETERS = [
         "schema": {
             "type": "integer",
             "minimum": MIN_OFFSET,
+            "maximum": (1 << 63) - 1,
             "default": DEFAULT_OFFSET,
+        },
+    },
+    {
+        "name": "pagination",
+        "in": "query",
+        "required": False,
+        "description": "Cursor cannot be combined with offset pagination.",
+        "schema": {
+            "type": "string",
+            "enum": ["offset", "cursor"],
+            "default": "offset",
+        },
+    },
+    {
+        "name": "cursor",
+        "in": "query",
+        "required": False,
+        "description": "Opaque cursor returned by the previous cursor page.",
+        "schema": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "maxLength": MAX_CURSOR_LENGTH,
         },
     },
 ]
@@ -936,6 +996,13 @@ ROUTES = (
                 "schema": {"type": "string"},
             },
             {
+                "name": "sort",
+                "in": "query",
+                "required": False,
+                "description": "Order ordering; id or -id.",
+                "schema": {"type": "string", "enum": ["id", "-id"], "default": "id"},
+            },
+            {
                 "name": "limit",
                 "in": "query",
                 "required": False,
@@ -955,13 +1022,52 @@ ROUTES = (
                 "schema": {
                     "type": "integer",
                     "minimum": MIN_OFFSET,
+                    "maximum": (1 << 63) - 1,
                     "default": DEFAULT_OFFSET,
+                },
+            },
+            {
+                "name": "pagination",
+                "in": "query",
+                "required": False,
+                "description": "Cursor cannot be combined with offset pagination.",
+                "schema": {
+                    "type": "string",
+                    "enum": ["offset", "cursor"],
+                    "default": "offset",
+                },
+            },
+            {
+                "name": "cursor",
+                "in": "query",
+                "required": False,
+                "description": "Opaque cursor returned by the previous cursor page.",
+                "schema": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_.-]+$",
+                    "maxLength": MAX_CURSOR_LENGTH,
                 },
             },
         ],
         "responses": ["200", "304", "400"],
         "response_schemas": {"200": _ORDER_LIST_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
+        "error_responses": {
+            "400": (
+                "Invalid query (including conflicting cursor and offset), "
+                "invalid_cursor, or cursor_mismatch."
+            )
+        },
+        "response_headers": {
+            "200": {
+                "Link": {
+                    "description": (
+                        "Relative link to the next cursor page, when present."
+                    ),
+                    "schema": {"type": "string"},
+                }
+            }
+        },
     },
     {
         "method": "POST",
@@ -1039,6 +1145,22 @@ ROUTES = (
         "responses": ["200", "304", "400"],
         "response_schemas": {"200": _PRODUCT_LIST_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
+        "error_responses": {
+            "400": (
+                "Invalid query (including conflicting cursor and offset), "
+                "invalid_cursor, or cursor_mismatch."
+            )
+        },
+        "response_headers": {
+            "200": {
+                "Link": {
+                    "description": (
+                        "Relative link to the next cursor page, when present."
+                    ),
+                    "schema": {"type": "string"},
+                }
+            }
+        },
     },
     {
         "method": "DELETE",
