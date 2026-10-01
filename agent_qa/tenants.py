@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from agent_qa import config
 from agent_qa.errors import ApiError
@@ -72,7 +74,10 @@ class TenantRegistry:
 
     def __init__(self, *, default_outbox: OutboxStore | None = None) -> None:
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._tenants: dict[str, TenantStores] = {}
+        self._active_pins: dict[str, int] = {}
+        self._deleting: set[str] = set()
         self._tenants["default"] = self._new_bundle(
             "default",
             outbox=default_outbox,
@@ -88,6 +93,7 @@ class TenantRegistry:
         *,
         outbox: OutboxStore | None = None,
         created_at: str | None = None,
+        start_dispatcher: bool = True,
     ) -> TenantStores:
         orders = OrderStore(tenant=tenant)
         products = ProductStore(tenant=tenant)
@@ -101,26 +107,28 @@ class TenantRegistry:
                 retention=config.job_retention(),
                 tenant=tenant,
             ),
-            outbox=outbox or OutboxStore(),
+            outbox=outbox or OutboxStore(start_dispatcher=start_dispatcher),
             idempotency=IdempotencyStore(config.idempotency_ttl_seconds()),
             fulfillment_lock=threading.RLock(),
             created_at=created_at or TenantRegistry._timestamp(),
         )
 
     def get(self, name: str) -> TenantStores:
-        """Get stored resources or a throwaway empty bundle for read requests."""
+        """Get stored resources or an inert empty bundle for read requests."""
         name = validate_name(name)
         with self._lock:
             bundle = self._tenants.get(name)
             if bundle is not None:
                 return bundle
-        return self._new_bundle(name)
+        return self._new_bundle(name, start_dispatcher=False)
 
     def ensure(self, name: str) -> TenantStores:
         """Create a bundle after the caller has completed authorization."""
         name = validate_name(name)
         with self._lock:
             bundle = self._tenants.get(name)
+            if name in self._deleting:
+                raise ApiError(404, "tenant_not_found", "Tenant not found")
             if bundle is not None:
                 return bundle
             if len(self._tenants) >= MAX_TENANTS:
@@ -128,6 +136,31 @@ class TenantRegistry:
             bundle = self._new_bundle(name)
             self._tenants[name] = bundle
             return bundle
+
+    @contextmanager
+    def pin(self, bundle: TenantStores) -> Iterator[TenantStores]:
+        """Keep a registered bundle stable for a request's write operation."""
+        with self._condition:
+            if (
+                self._tenants.get(bundle.tenant) is not bundle
+                or bundle.tenant in self._deleting
+            ):
+                raise ApiError(404, "tenant_not_found", "Tenant not found")
+            self._active_pins[bundle.tenant] = (
+                self._active_pins.get(bundle.tenant, 0) + 1
+            )
+        token = _PINNED_BUNDLE.set((self, bundle))
+        try:
+            yield bundle
+        finally:
+            _PINNED_BUNDLE.reset(token)
+            with self._condition:
+                active = self._active_pins[bundle.tenant] - 1
+                if active:
+                    self._active_pins[bundle.tenant] = active
+                else:
+                    del self._active_pins[bundle.tenant]
+                self._condition.notify_all()
 
     def list_tenants(self) -> list[dict[str, object]]:
         with self._lock:
@@ -145,12 +178,25 @@ class TenantRegistry:
             raise ApiError(
                 409, "default_tenant_protected", "Default tenant is protected"
             )
-        with self._lock:
-            bundle = self._tenants.pop(name, None)
-        if bundle is None:
-            raise ApiError(404, "tenant_not_found", "Tenant not found")
-        with bundle.fulfillment_lock:
-            bundle.stop()
+        with self._condition:
+            bundle = self._tenants.get(name)
+            if bundle is None or name in self._deleting:
+                raise ApiError(404, "tenant_not_found", "Tenant not found")
+            self._deleting.add(name)
+        try:
+            with self._condition:
+                while self._active_pins.get(name, 0):
+                    self._condition.wait()
+            with bundle.fulfillment_lock:
+                with self._condition:
+                    if self._tenants.get(name) is not bundle:
+                        raise ApiError(404, "tenant_not_found", "Tenant not found")
+                    del self._tenants[name]
+                bundle.stop()
+        finally:
+            with self._condition:
+                self._deleting.discard(name)
+                self._condition.notify_all()
 
     def shutdown(self, timeout: float = 1.0) -> None:
         """Stop tenant workers within one shared deadline, retaining their data."""
@@ -183,10 +229,16 @@ class TenantRegistry:
 
 
 TENANTS = TenantRegistry(default_outbox=OUTBOX)
+_PINNED_BUNDLE: ContextVar[tuple[TenantRegistry, TenantStores] | None] = ContextVar(
+    "agent_qa_pinned_tenant_bundle", default=None
+)
 
 
 def current() -> TenantStores:
     """Return storage for the request's selected tenant, defaulting to default."""
+    pinned = _PINNED_BUNDLE.get()
+    if pinned is not None and pinned[0] is TENANTS:
+        return pinned[1]
     from agent_qa.context import get_context
 
     context = get_context()

@@ -2,12 +2,13 @@
 
 import io
 import json
+import threading
 import unittest
 from time import perf_counter
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent_qa import tenants
+from agent_qa import server, tenants
 from agent_qa.audit import AuditLog
 from agent_qa.context import RequestContext, clear_context, set_context
 from agent_qa.errors import ApiError, envelope
@@ -216,6 +217,151 @@ class TenantApiTests(unittest.TestCase):
         self.assertEqual(body["id"], 1)
         self.assertEqual(wire_headers["X-Tenant"], "permitted")
         self.assertIn("permitted", self.registry.tenant_names())
+
+    def test_write_fails_if_tenant_is_deleted_after_ensure_before_handler(self):
+        ensure = tenants.ensure
+
+        def ensure_then_delete(name):
+            bundle = ensure(name)
+            self.registry.delete(name)
+            return bundle
+
+        with patch("agent_qa.server.tenants.ensure", side_effect=ensure_then_delete):
+            status, body, _, _ = self.request(
+                "POST",
+                "/orders",
+                {"customer_id": "raced-order", "total_cents": 500},
+                tenant="raced",
+            )
+
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "tenant_not_found")
+        self.assertNotIn("raced", self.registry.tenant_names())
+
+    def test_write_pin_is_released_after_replay_and_validation_error(self):
+        payload = {"customer_id": "pin-cleanup", "total_cents": 500}
+        self.request(
+            "POST", "/orders", payload, tenant="replay-cleanup", idempotency_key="k"
+        )
+        replay = self.request(
+            "POST", "/orders", payload, tenant="replay-cleanup", idempotency_key="k"
+        )
+        self.assertEqual(replay[3]["Idempotent-Replay"], "true")
+
+        status, body, _, _ = self.request(
+            "POST",
+            "/orders",
+            {"customer_id": "invalid-pin", "total_cents": "invalid"},
+            tenant="error-cleanup",
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "validation_error")
+
+        for name in ("replay-cleanup", "error-cleanup"):
+            deleted = threading.Event()
+
+            def delete_tenant(name=name):
+                self.registry.delete(name)
+                deleted.set()
+
+            deleter = threading.Thread(target=delete_tenant, daemon=True)
+            deleter.start()
+            self.assertTrue(deleted.wait(1), f"delete for {name} remained blocked")
+            deleter.join()
+
+    def test_concurrent_idempotent_write_reports_in_progress(self):
+        route = next(
+            route
+            for route in server.ROUTES
+            if route["method"] == "POST" and route["path"] == "/orders"
+        )
+        original_handler = route["handler"]
+        first_handler_entered = threading.Event()
+        release_first_handler = threading.Event()
+        results = {}
+        failures = []
+        first_started = False
+        second_started = False
+        identity = {
+            "key_id": "test",
+            "role": "admin",
+            "label": "test",
+            "tenants": None,
+        }
+
+        def paused_handler(*args, **kwargs):
+            first_handler_entered.set()
+            if not release_first_handler.wait(2):
+                raise AssertionError("first request was not released")
+            return original_handler(*args, **kwargs)
+
+        def dispatch(name):
+            request = Harness(
+                "POST",
+                "/orders",
+                {"customer_id": "concurrent-order", "total_cents": 500},
+                {
+                    "X-Tenant": "concurrent",
+                    "X-API-Key": "test-key",
+                    "Idempotency-Key": "same",
+                },
+            )
+            set_context(RequestContext(request_id=request.request_id))
+            try:
+                try:
+                    Handler._dispatch(request)
+                except ApiError as error:
+                    request._json(
+                        error.status,
+                        envelope(error.code, error.message, error.details),
+                    )
+                results[name] = request.responses[0]
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                clear_context()
+
+        route["handler"] = paused_handler
+        first = threading.Thread(
+            target=dispatch,
+            args=("first",),
+            name="first-idempotent-request",
+            daemon=True,
+        )
+        second = threading.Thread(
+            target=dispatch,
+            args=("second",),
+            name="second-idempotent-request",
+            daemon=True,
+        )
+        try:
+            with patch("agent_qa.server.authenticate_api_key", return_value=identity):
+                first.start()
+                first_started = True
+                self.assertTrue(first_handler_entered.wait(1))
+                second.start()
+                second_started = True
+                second.join(1)
+                self.assertFalse(
+                    second.is_alive(),
+                    "second request did not finish while first handler was paused",
+                )
+        finally:
+            release_first_handler.set()
+            if first_started:
+                first.join(2)
+            if second_started:
+                second.join(2)
+            route["handler"] = original_handler
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(results["first"][0], 201)
+        self.assertEqual(results["second"][0], 409)
+        self.assertEqual(
+            results["second"][1]["error"]["code"], "idempotency_in_progress"
+        )
 
     def test_orders_products_cursors_and_idempotency_are_tenant_local(self):
         payload = {"customer_id": "cursor-owner", "total_cents": 500}

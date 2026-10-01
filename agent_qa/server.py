@@ -484,6 +484,16 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _dispatch(self) -> None:
+        self._tenant_write_pin = None
+        try:
+            Handler._dispatch_request(self)
+        finally:
+            pin = self._tenant_write_pin
+            if pin is not None:
+                self._tenant_write_pin = None
+                pin.__exit__(*sys.exc_info())
+
+    def _dispatch_request(self) -> None:
         Handler._prepare_tenant(self, False)
         try:
             parsed = urlsplit(self.path)
@@ -705,7 +715,12 @@ class Handler(BaseHTTPRequestHandler):
             "DELETE",
         }:
             context = get_context()
-            tenants.ensure(context.tenant if context is not None else "default")
+            bundle = tenants.ensure(
+                context.tenant if context is not None else "default"
+            )
+            pin = tenants.TENANTS.pin(bundle)
+            pin.__enter__()
+            self._tenant_write_pin = pin
         if idempotency_key is not None:
             canonical_json = json.dumps(
                 payload, sort_keys=True, separators=(",", ":"), allow_nan=False

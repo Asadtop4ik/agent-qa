@@ -95,6 +95,95 @@ class TenantRegistryTests(unittest.TestCase):
         with patch("agent_qa.tenants.TENANTS", self.registry):
             self.assertIs(current(), alpha)
 
+    def test_unknown_tenant_reads_do_not_start_background_threads(self):
+        for index in range(50):
+            bundle = self.registry.get(f"unknown-{index}")
+            bundle.jobs.list_jobs()
+            bundle.outbox.get_dispatcher()
+            self.assertEqual(bundle.jobs._threads, [])
+            self.assertIsNone(bundle.outbox._dispatcher_thread)
+        self.assertEqual(self.registry.tenant_names(), ("default",))
+
+    def test_pinned_write_finishes_before_delete_and_current_stays_stable(self):
+        bundle = self.registry.ensure("pinned")
+        set_context(RequestContext("request", tenant="pinned"))
+        entered = threading.Event()
+        release = threading.Event()
+        delete_started = threading.Event()
+        delete_finished = threading.Event()
+        failures = []
+
+        def write():
+            try:
+                with patch("agent_qa.tenants.TENANTS", self.registry):
+                    with self.registry.pin(bundle):
+                        entered.set()
+                        if not release.wait(timeout=2):
+                            raise AssertionError("write lease was not released")
+                        self.assertIs(current(), bundle)
+                        current().orders.create("customer", 10)
+            except Exception as error:  # surfaced in the test thread
+                failures.append(error)
+
+        def delete():
+            delete_started.set()
+            self.registry.delete("pinned")
+            delete_finished.set()
+
+        writer = threading.Thread(target=write)
+        writer.start()
+        self.assertTrue(entered.wait(timeout=2))
+        deleter = threading.Thread(target=delete)
+        deleter.start()
+        self.assertTrue(delete_started.wait(timeout=2))
+        self.assertFalse(delete_finished.wait(timeout=0.05))
+        release.set()
+        writer.join(timeout=2)
+        deleter.join(timeout=2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(deleter.is_alive())
+        self.assertEqual(failures, [])
+        self.assertTrue(delete_finished.is_set())
+        with self.assertRaises(ApiError) as error:
+            with self.registry.pin(bundle):
+                pass
+        self.assertEqual(error.exception.code, "tenant_not_found")
+
+    def test_multiple_writes_can_pin_the_same_tenant_concurrently(self):
+        bundle = self.registry.ensure("overlapping")
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release = threading.Event()
+        failures = []
+
+        def write(entered):
+            try:
+                with self.registry.pin(bundle) as pinned:
+                    self.assertIs(pinned, bundle)
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise AssertionError("write lease was not released")
+            except Exception as error:  # surfaced in the test thread
+                failures.append(error)
+
+        first = threading.Thread(target=write, args=(first_entered,))
+        second = threading.Thread(target=write, args=(second_entered,))
+        first.start()
+        try:
+            self.assertTrue(first_entered.wait(timeout=2))
+            second.start()
+            self.assertTrue(second_entered.wait(timeout=1))
+        finally:
+            release.set()
+            first.join(timeout=2)
+            if second.ident is not None:
+                second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+
     def test_limit_and_delete_purge_preserve_audit(self):
         for index in range(1, MAX_TENANTS):
             self.registry.ensure(f"tenant-{index}")
