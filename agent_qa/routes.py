@@ -3,12 +3,11 @@
 from copy import deepcopy
 import hashlib
 import json
-import os
 import platform
 import re
 from urllib.parse import quote, urlencode
 
-from agent_qa import auth
+from agent_qa import auth, settings
 from agent_qa.audit import AUDIT_LOG
 from agent_qa.config import FIXTURE_PATH, GIT_SHA, job_retention, job_workers
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
@@ -103,7 +102,7 @@ def _if_none_match(headers: dict[str, str] | None, current: str) -> bool:
 def _expected_version(headers: dict[str, str] | None) -> tuple[str, ...] | str | None:
     raw = _header(headers, "If-Match")
     if raw is None:
-        if os.environ.get("AGENT_QA_REQUIRE_IF_MATCH", "").lower() == "true":
+        if settings.current().values["AGENT_QA_REQUIRE_IF_MATCH"]:
             raise ApiError(428, "precondition_required", "If-Match is required")
         return None
     return parse_etag_list(raw)
@@ -1019,6 +1018,162 @@ def delete_rate_limit(
     if not RATE_LIMITER.delete_override(identity):
         raise ApiError(404, "override_not_found", "Rate limit override not found")
     return 204, None, {}
+
+
+def list_config(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the registered settings with secret values redacted."""
+    loaded = settings.current()
+    return (
+        200,
+        {
+            "settings": {
+                name: settings.describe(loaded, name)
+                for name in sorted(settings.SETTINGS)
+            },
+            "unknown_env": list(loaded.unknown_env),
+            "valid": loaded.valid,
+        },
+        {},
+    )
+
+
+def get_config_setting(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return metadata for one registered setting."""
+    name = (path_params or {}).get("name", "")
+    if len(name) > 128 or name not in settings.SETTINGS:
+        raise ApiError(404, "setting_not_found", "Setting not found")
+    loaded = settings.current()
+    return 200, {"name": name, **settings.describe(loaded, name)}, {}
+
+
+_SETTING_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_MAX_CONFIG_VALUE_LENGTH = 4096
+_CONFIG_SCALAR_SCHEMA = {
+    "oneOf": [
+        {"type": "string"},
+        {"type": "number"},
+        {"type": "boolean"},
+    ]
+}
+_CONFIG_SETTING_SCHEMA = {
+    "type": "object",
+    "required": [
+        "value",
+        "default",
+        "source",
+        "type",
+        "secret",
+        "description",
+        "is_default",
+    ],
+    "properties": {
+        "value": _CONFIG_SCALAR_SCHEMA,
+        "default": _CONFIG_SCALAR_SCHEMA,
+        "source": {"type": "string", "enum": ["env", "default"]},
+        "type": {"type": "string", "enum": ["int", "float", "bool", "str"]},
+        "secret": {"type": "boolean"},
+        "description": {"type": "string"},
+        "is_default": {"type": "boolean"},
+    },
+    "additionalProperties": False,
+}
+_CONFIG_SETTING_DETAIL_SCHEMA = {
+    **_CONFIG_SETTING_SCHEMA,
+    "required": ["name", *_CONFIG_SETTING_SCHEMA["required"]],
+    "properties": {
+        "name": {"type": "string"},
+        **_CONFIG_SETTING_SCHEMA["properties"],
+    },
+}
+_CONFIG_ERROR_SCHEMA = {
+    "type": "object",
+    "required": ["field", "message"],
+    "properties": {"field": {"type": "string"}, "message": {"type": "string"}},
+    "additionalProperties": False,
+}
+
+
+def validate_config(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Dry-run validation of a bounded set of environment setting values."""
+    if not isinstance(payload, dict) or set(payload) != {"env"}:
+        raise ApiError(400, "validation_error", "Invalid request body")
+    env = payload["env"]
+    if not isinstance(env, dict):
+        raise ApiError(
+            400,
+            "validation_error",
+            "Request validation failed",
+            [{"field": "env", "message": "Must be an object"}],
+        )
+    if len(env) > 50:
+        raise ApiError(
+            400,
+            "validation_error",
+            "Request validation failed",
+            [{"field": "env", "message": "Must contain at most 50 settings"}],
+        )
+    for name, value in env.items():
+        if not isinstance(name, str) or not _SETTING_NAME_PATTERN.fullmatch(name):
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                [
+                    {
+                        "field": "env",
+                        "message": "Setting names must be valid identifiers",
+                    }
+                ],
+            )
+        if not isinstance(value, str):
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                [{"field": name, "message": "Must be a string"}],
+            )
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                [{"field": name, "message": "Must be valid UTF-8 text"}],
+            ) from error
+        if len(value) > _MAX_CONFIG_VALUE_LENGTH:
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                [{"field": name, "message": "Must contain at most 4096 characters"}],
+            )
+
+    loaded = settings.load(env)
+    return (
+        200,
+        {
+            "valid": loaded.valid,
+            "errors": [
+                {"field": error.field, "message": error.message}
+                for error in sorted(loaded.errors, key=lambda error: error.field)
+            ],
+            "unknown": sorted(set(env) - set(settings.SETTINGS)),
+        },
+        {},
+    )
 
 
 def create_webhook(
@@ -2340,6 +2495,113 @@ ROUTES = (
                 },
                 "additionalProperties": False,
             }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/config",
+        "handler": list_config,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "listConfig",
+        "summary": "Read registered configuration metadata",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["settings", "unknown_env", "valid"],
+                "properties": {
+                    "settings": {
+                        "type": "object",
+                        "additionalProperties": _CONFIG_SETTING_SCHEMA,
+                    },
+                    "unknown_env": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "valid": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/config/{name}",
+        "handler": get_config_setting,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "getConfigSetting",
+        "summary": "Read metadata for one registered setting",
+        "parameters": [
+            {
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$",
+                },
+            }
+        ],
+        "responses": ["200", "401", "403", "404"],
+        "response_schemas": {"200": _CONFIG_SETTING_DETAIL_SCHEMA},
+        "error_responses": {
+            "404": "The setting name is not registered (setting_not_found)."
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/admin/config/validate",
+        "handler": validate_config,
+        "body": True,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "validateConfig",
+        "summary": "Dry-run validation for setting values",
+        "request_schema": {
+            "type": "object",
+            "required": ["env"],
+            "properties": {
+                "env": {
+                    "type": "object",
+                    "description": (
+                        "Mapping of setting names (up to 128 characters) to string "
+                        "values. Names must be environment variable identifiers."
+                    ),
+                    "maxProperties": 50,
+                    "additionalProperties": {
+                        "type": "string",
+                        "maxLength": _MAX_CONFIG_VALUE_LENGTH,
+                    },
+                }
+            },
+            "additionalProperties": False,
+        },
+        "max_body_bytes": 262144,
+        "responses": ["200", "400", "401", "403", "411", "413", "415"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["valid", "errors", "unknown"],
+                "properties": {
+                    "valid": {"type": "boolean"},
+                    "errors": {
+                        "type": "array",
+                        "items": _CONFIG_ERROR_SCHEMA,
+                    },
+                    "unknown": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": False,
+            }
+        },
+        "error_responses": {
+            "400": "Malformed settings validation input (validation_error)."
         },
     },
     {

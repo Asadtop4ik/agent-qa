@@ -30,6 +30,24 @@ AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_require_if_match_uses_registered_boolean_variants(self):
+        from agent_qa.routes import _expected_version
+
+        for raw in ("true", "1", "yes", "TRUE", "Yes"):
+            with self.subTest(value=raw), patch.dict(
+                os.environ, {"AGENT_QA_REQUIRE_IF_MATCH": raw}
+            ):
+                with self.assertRaises(ApiError) as error:
+                    _expected_version(None)
+                self.assertEqual(error.exception.status, 428)
+                self.assertEqual(error.exception.code, "precondition_required")
+
+        for raw in ("false", "0", "no", "FALSE", "No", ""):
+            with self.subTest(value=raw), patch.dict(
+                os.environ, {"AGENT_QA_REQUIRE_IF_MATCH": raw}
+            ):
+                self.assertIsNone(_expected_version(None))
+
     def test_cursor_list_handlers_emit_relative_encoded_next_links(self):
         order_filters = {
             "status": "new",

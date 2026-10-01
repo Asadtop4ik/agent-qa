@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
-import os
 import threading
 
+from agent_qa import settings
 from agent_qa.context import RequestContext
 
 _MIN_CAPACITY = 10
@@ -29,17 +29,7 @@ _CHANGE_TYPES = {
 
 
 def _configured_capacity() -> int:
-    raw = os.environ.get("AGENT_QA_AUDIT_CAPACITY", "500")
-    try:
-        # Reject pathological values before int conversion (also handles Python's
-        # configurable integer string limit without surfacing an import error).
-        digits = raw[1:] if raw.startswith(("+", "-")) else raw
-        if len(raw) > 12 or not raw.isascii() or not digits or not digits.isdecimal():
-            return 500
-        value = int(raw)
-    except (TypeError, ValueError):
-        return 500
-    return min(_MAX_CAPACITY, max(_MIN_CAPACITY, value))
+    return settings.current().values["AGENT_QA_AUDIT_CAPACITY"]
 
 
 def _bounded_text(value: object, maximum: int = _MAX_TEXT) -> str:

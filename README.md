@@ -27,6 +27,32 @@ securely. The service retains hashes in memory, and keeps at most 20 active
 non-bootstrap keys. Rotation can temporarily accept the previous secret during
 its grace period.
 
+## Configuration
+
+Admins can inspect settings through `GET /admin/config` and
+`GET /admin/config/{name}`. Secret values and defaults are returned as `***`.
+`POST /admin/config/validate` accepts `{"env":{"NAME":"value"}}` and checks
+up to 50 values without applying them. Unknown setting names appear separately
+from validation errors.
+
+Settings are validated at startup; invalid values are reported to stderr and
+stop the server with exit code 2. An empty value is treated as unset and uses
+the default. Boolean values accept `true`, `false`, `1`, `0`, `yes`, and `no`,
+ignoring case.
+
+| Name | Type | Default | Accepted range | Description |
+| --- | --- | --- | --- | --- |
+| `APP_PORT` | int | `8080` | 1–65535 | HTTP server port. |
+| `AGENT_QA_GIT_SHA` | str | `unknown` | 1–128 characters | Build revision reported by the service. |
+| `AGENT_QA_API_KEY` | str (secret) | `***` | 1–4096 characters | API key required for authenticated requests. |
+| `AGENT_QA_IDEMPOTENCY_TTL_SECONDS` | int | `600` | 1–86400 | Lifetime of stored idempotent responses in seconds. |
+| `AGENT_QA_REQUIRE_IF_MATCH` | bool | `false` | See boolean values above | Require If-Match for conditional updates. |
+| `AGENT_QA_AUDIT_CAPACITY` | int | `500` | 10–5000 | Maximum number of audit entries retained in memory. |
+| `AGENT_QA_RATE_BURST` | int | `120` | 1–100000 | Token bucket request burst size. |
+| `AGENT_QA_RATE_REFILL_PER_SECOND` | float | `60.0` | 0.001–10000.0 | Token bucket refill rate per second. |
+| `AGENT_QA_JOB_WORKERS` | int | `2` | 1–3 | Number of lazily started background job workers. |
+| `AGENT_QA_JOB_RETENTION` | int | `100` | 10–1000 | Maximum number of terminal jobs retained in memory. |
+
 ## Rate limits
 
 Requests use an in-memory token bucket keyed by a valid API key, then a valid

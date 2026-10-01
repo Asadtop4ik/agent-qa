@@ -98,23 +98,27 @@ class TokenBucketLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.consume("key:b", "key").allowed)
 
     def test_environment_defaults_reject_invalid_and_huge_values(self):
-        import os
+        from agent_qa.settings import load
 
-        from agent_qa.ratelimit import _bounded_env_float, _bounded_env_int
-
-        with patch.dict(os.environ, {"TEST_BURST": "9"}):
-            self.assertEqual(_bounded_env_int("TEST_BURST", 120, 1, 100000), 9)
-        for value in ("0", "100001", "9" * 10000, "nope"):
-            with self.subTest(value=value[:12]):
-                with patch.dict(os.environ, {"TEST_BURST": value}):
-                    self.assertEqual(
-                        _bounded_env_int("TEST_BURST", 120, 1, 100000), 120
-                    )
-        for value in ("nan", "inf", "0", "10001", "bad"):
-            with patch.dict(os.environ, {"TEST_REFILL": value}):
-                self.assertEqual(
-                    _bounded_env_float("TEST_REFILL", 60.0, 0.001, 10000.0), 60.0
-                )
+        loaded = load(
+            {
+                "AGENT_QA_RATE_BURST": "9",
+                "AGENT_QA_RATE_REFILL_PER_SECOND": "4.5",
+            }
+        )
+        self.assertEqual(loaded.values["AGENT_QA_RATE_BURST"], 9)
+        self.assertEqual(loaded.values["AGENT_QA_RATE_REFILL_PER_SECOND"], 4.5)
+        for name, values in (
+            ("AGENT_QA_RATE_BURST", ("0", "100001", "9" * 10000, "nope")),
+            (
+                "AGENT_QA_RATE_REFILL_PER_SECOND",
+                ("nan", "inf", "0", "10001", "bad"),
+            ),
+        ):
+            for value in values:
+                with self.subTest(name=name, value=value[:12]):
+                    result = load({name: value})
+                    self.assertFalse(result.valid)
 
     def test_denials_are_audited_and_metrics_hide_identity(self):
         audit = AuditLog(2)
