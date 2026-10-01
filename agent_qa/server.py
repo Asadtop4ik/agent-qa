@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
 from agent_qa import config
-from agent_qa.auth import api_key_from_headers, is_valid_api_key
+from agent_qa.auth import api_key_from_headers, authenticate_api_key
 from agent_qa.errors import ApiError, envelope
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
 from agent_qa.metrics import REGISTRY
@@ -237,7 +237,13 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
-        if route["auth_required"] and not is_valid_api_key(self.headers):
+        required_role = route.get(
+            "role", "write" if route.get("auth_required") else None
+        )
+        identity = None
+        if required_role is not None:
+            identity = authenticate_api_key(self.headers)
+        if required_role is not None and identity is None:
             self._json(
                 401,
                 envelope(
@@ -246,6 +252,22 @@ class Handler(BaseHTTPRequestHandler):
                     request_id=self.request_id,
                 ),
                 {"WWW-Authenticate": "X-API-Key"},
+            )
+            return
+        role_rank = {"read": 1, "write": 2, "admin": 3}
+        if (
+            required_role is not None
+            and identity is not None
+            and role_rank.get(identity["role"], 0) < role_rank.get(required_role, 4)
+        ):
+            self._json(
+                403,
+                envelope(
+                    "forbidden",
+                    "Insufficient API key role",
+                    [{"field": "role", "message": f"Requires role {required_role}"}],
+                    request_id=self.request_id,
+                ),
             )
             return
         idempotency_key: str | None = None
@@ -316,6 +338,8 @@ class Handler(BaseHTTPRequestHandler):
             if schema is not None:
                 errors = validate(schema, payload)
                 if errors:
+                    if route.get("sanitize_validation_errors"):
+                        errors = [{"field": "body", "message": "Invalid request body"}]
                     raise ApiError(
                         400,
                         "validation_error",
@@ -331,6 +355,10 @@ class Handler(BaseHTTPRequestHandler):
                         request_headers[name] = ", ".join(values)
                 status, body, headers = route["handler"](
                     query, path_params, payload, request_headers=request_headers
+                )
+            elif route.get("pass_identity"):
+                status, body, headers = route["handler"](
+                    query, path_params, payload, identity=identity
                 )
             else:
                 status, body, headers = route["handler"](query, path_params, payload)

@@ -13,13 +13,18 @@ from agent_qa.routes import ROUTES
 from agent_qa.server import Handler, allowed_methods
 
 
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+
+
 class BulkApiDispatchTests(unittest.TestCase):
     def setUp(self):
         self.orders = patch("agent_qa.routes.ORDER_STORE", OrderStore())
         self.products = patch("agent_qa.routes.PRODUCT_STORE", ProductStore())
         self.orders.start()
         self.products.start()
-        self.auth = patch("agent_qa.server.is_valid_api_key", return_value=True)
+        self.auth = patch(
+            "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
+        )
         self.auth.start()
 
     def tearDown(self):

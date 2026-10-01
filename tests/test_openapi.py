@@ -33,15 +33,57 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         }
         self.assertEqual(spec_pairs, route_pairs)
         for route in ROUTES:
+            operation = spec["paths"][route["path"]][route["method"].lower()]
+            self.assertEqual(operation["x-required-role"], route["role"])
+            self.assertEqual(route["auth_required"], route["role"] is not None)
+            self.assertIn("403", operation["responses"])
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
-            operation = spec["paths"][route["path"]]["post"]
             self.assertEqual(set(operation["responses"]), set(route["responses"]))
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
                 operation["requestBody"]["content"]["application/json"]["schema"],
                 route["request_schema"],
             )
+
+    def test_key_management_routes_are_documented_with_roles_and_forbidden(self):
+        spec = build_openapi(ROUTES, "keys-test")
+        expected = {
+            ("/whoami", "get"): "read",
+            ("/admin/keys", "get"): "admin",
+            ("/admin/keys", "post"): "admin",
+            ("/admin/keys/{key_id}/rotate", "post"): "admin",
+            ("/admin/keys/{key_id}", "delete"): "admin",
+        }
+        for (path, method), role in expected.items():
+            operation = spec["paths"][path][method]
+            self.assertEqual(operation["x-required-role"], role)
+            self.assertIn("403", operation["responses"])
+            self.assertIn(
+                "#/components/schemas/Error",
+                json.dumps(operation["responses"]["403"]),
+            )
+            self.assertTrue(operation.get("security"))
+        self.assertIn("409", spec["paths"]["/admin/keys"]["post"]["responses"])
+        self.assertIn(
+            "key_not_found",
+            json.dumps(spec["paths"]["/admin/keys/{key_id}"]["delete"]),
+        )
+        list_schema = spec["paths"]["/admin/keys"]["get"]["responses"]["200"][
+            "content"
+        ]["application/json"]["schema"]
+        self.assertEqual(
+            list_schema["properties"]["items"]["items"]["required"],
+            [
+                "key_id",
+                "role",
+                "label",
+                "created_at",
+                "last_used_at",
+                "fingerprint",
+                "status",
+            ],
+        )
 
     def test_bulk_routes_document_body_limits_and_result_statuses(self):
         spec = build_openapi(ROUTES, "bulk-test")
@@ -307,7 +349,11 @@ class OpenApiDriftTests(unittest.TestCase):
 
     @staticmethod
     def concrete_path(template):
-        return template.replace("{id}", "1").replace("{name}", "CreateOrder")
+        return (
+            template.replace("{id}", "1")
+            .replace("{name}", "CreateOrder")
+            .replace("{key_id}", "key_1")
+        )
 
     def test_route_table_and_spec_have_the_same_method_path_pairs(self):
         spec = self.live_spec()

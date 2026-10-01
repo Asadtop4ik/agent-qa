@@ -20,12 +20,17 @@ from agent_qa.server import Handler, allowed_methods
 MAX_STOCK = schemas.MAX_STOCK
 
 
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+
+
 class ProductApiTests(unittest.TestCase):
     def setUp(self):
         self.store = ProductStore()
         self.store_patch = patch("agent_qa.routes.PRODUCT_STORE", self.store)
         self.store_patch.start()
-        self.auth_patch = patch("agent_qa.server.is_valid_api_key", return_value=True)
+        self.auth_patch = patch(
+            "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
+        )
         self.auth_patch.start()
 
     def tearDown(self):
@@ -592,7 +597,19 @@ class ProductApiTests(unittest.TestCase):
         )
         self.assertEqual(
             paths["/products/{id}/adjust-stock"]["post"]["responses"].keys(),
-            {"200", "400", "401", "404", "409", "411", "412", "413", "415", "428"},
+            {
+                "200",
+                "400",
+                "401",
+                "403",
+                "404",
+                "409",
+                "411",
+                "412",
+                "413",
+                "415",
+                "428",
+            },
         )
 
     def test_product_etags_and_if_match_dispatch(self):

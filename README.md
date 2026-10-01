@@ -14,6 +14,19 @@ curl http://127.0.0.1:8080/ready
 
 Order write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before starting the service to configure the key. If the variable is unset or empty, the service uses the documented synthetic fallback `qa-synthetic-key`; this fallback is for synthetic QA environments only. Read endpoints and `POST /schemas/{name}/validate` remain public.
 
+## API key roles
+
+The configured bootstrap key is an immutable `admin` key. Key roles form the
+`read` < `write` < `admin` hierarchy: write routes accept `write` or `admin`,
+and `GET /whoami` accepts any valid key. Public routes do not need a key.
+Admins can create keys with `POST /admin/keys` using `{"role":"write","label":"automation"}`, list metadata at `GET /admin/keys`, rotate a key
+with `POST /admin/keys/{key_id}/rotate` and an optional `grace_seconds` from 0
+to 300, or revoke it with `DELETE /admin/keys/{key_id}`. A newly created or
+rotated secret is returned only in that operation's response; store it
+securely. The service retains hashes in memory, and keeps at most 20 active
+non-bootstrap keys. Rotation can temporarily accept the previous secret during
+its grace period.
+
 ## Products
 
 `GET /products` searches and filters the in-memory product catalog;

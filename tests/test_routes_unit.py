@@ -26,6 +26,9 @@ from agent_qa.routes import (
 from agent_qa.schemas import SCHEMAS
 
 
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+
+
 class RouteUnitTests(unittest.TestCase):
     def test_cursor_list_handlers_emit_relative_encoded_next_links(self):
         order_filters = {
@@ -188,7 +191,7 @@ class RouteUnitTests(unittest.TestCase):
         route = next(route for route in ROUTES if route["path"] == "/health")
         self.assertEqual(route["method"], "GET")
         self.assertIs(route["handler"], health)
-        self.assertEqual(route["responses"], ["200"])
+        self.assertEqual(route["responses"], ["200", "403"])
 
     def test_ping_handler(self):
         status, body, headers = ping([])
@@ -384,14 +387,14 @@ class RouteUnitTests(unittest.TestCase):
 
         body = b'{"items":[]}' + b" " * 5000
         handler, _ = self.make_dispatcher("/orders/bulk", body)
-        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
             with self.assertRaises(ApiError) as error:
                 Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 400)
         self.assertEqual(error.exception.code, "validation_error")
 
         handler, _ = self.make_dispatcher("/orders/bulk", b" " * 65537)
-        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
             with self.assertRaises(ApiError) as error:
                 Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 413)
@@ -471,20 +474,20 @@ class RouteUnitTests(unittest.TestCase):
         from agent_qa.server import Handler
 
         handler, responses = self.make_dispatcher("/orders", b"not-json")
-        with patch("agent_qa.server.is_valid_api_key", return_value=False):
+        with patch("agent_qa.server.authenticate_api_key", return_value=None):
             Handler._dispatch(handler)
         self.assertEqual(responses[0][0], 401)
 
         handler, _ = self.make_dispatcher("/orders", b"{}")
         del handler.headers["Content-Length"]
-        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
             with self.assertRaises(ApiError) as error:
                 Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 411)
         self.assertEqual(error.exception.code, "length_required")
 
         handler, _ = self.make_dispatcher("/orders", b" " * 4097)
-        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
             with self.assertRaises(ApiError) as error:
                 Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 413)
@@ -493,7 +496,7 @@ class RouteUnitTests(unittest.TestCase):
         handler, _ = self.make_dispatcher(
             "/orders", b"not-json", content_type="text/plain"
         )
-        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
             with self.assertRaises(ApiError) as error:
                 Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 415)
@@ -501,7 +504,9 @@ class RouteUnitTests(unittest.TestCase):
 
         for raw in (b"NaN", b"1e999"):
             handler, _ = self.make_dispatcher("/orders", raw)
-            with patch("agent_qa.server.is_valid_api_key", return_value=True):
+            with patch(
+                "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
+            ):
                 with self.assertRaises(ApiError) as error:
                     Handler._dispatch(handler)
             self.assertEqual(error.exception.status, 400)
@@ -731,7 +736,10 @@ class RouteUnitTests(unittest.TestCase):
             with self.subTest(method=method, payload=payload):
                 raw_body = json.dumps(payload).encode("utf-8")
                 handler, _ = self.make_dispatcher(path, raw_body, method=method)
-                with patch("agent_qa.server.is_valid_api_key", return_value=True):
+                with patch(
+                    "agent_qa.server.authenticate_api_key",
+                    return_value=AUTH_IDENTITY,
+                ):
                     with self.assertRaises(ApiError) as error:
                         Handler._dispatch(handler)
                 self.assertEqual(error.exception.status, 400)
