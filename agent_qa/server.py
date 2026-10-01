@@ -11,11 +11,18 @@ from time import perf_counter
 from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
+from agent_qa.audit import AUDIT_LOG
 from agent_qa import config
 from agent_qa.auth import api_key_from_headers, authenticate_api_key
 from agent_qa.errors import ApiError, envelope
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
 from agent_qa.metrics import REGISTRY
+from agent_qa.context import (
+    RequestContext,
+    clear_context,
+    get_context,
+    set_context,
+)
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
@@ -90,9 +97,13 @@ def _parse_finite_float(value: str) -> float:
 class Handler(BaseHTTPRequestHandler):
     def handle_one_request(self) -> None:
         self.request_id = request_id(None)
+        set_context(RequestContext(request_id=self.request_id))
         self._request_started = perf_counter()
         self._response_recorded = False
-        super().handle_one_request()
+        try:
+            super().handle_one_request()
+        finally:
+            clear_context()
 
     def parse_request(self) -> bool:
         parsed = super().parse_request()
@@ -103,6 +114,9 @@ class Handler(BaseHTTPRequestHandler):
         headers = getattr(self, "headers", None)
         if headers is not None:
             self.request_id = request_id(headers.get("X-Request-Id"))
+            context = get_context()
+            if context is not None:
+                context.request_id = self.request_id
 
     def _json(
         self, status: int, body: object, headers: dict[str, str] | None = None
@@ -116,6 +130,7 @@ class Handler(BaseHTTPRequestHandler):
             encoded = body.encode("utf-8")
         else:
             encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        self._audit_response_body = body
         self._record_response(status)
         self.send_response(status)
         if not is_empty:
@@ -149,6 +164,45 @@ class Handler(BaseHTTPRequestHandler):
         matches = _path_routes(path)
         route = str(matches[0][0]["path"]) if matches else "unmatched"
         method = getattr(self, "command", "") or ""
+        audit_route = next(
+            (
+                candidate
+                for candidate, _ in matches
+                if candidate.get("method") == method
+            ),
+            None,
+        )
+        if (
+            status != 405
+            and method in {"POST", "PUT", "PATCH", "DELETE"}
+            and audit_route is not None
+        ):
+            context = get_context()
+            if context is None:
+                context = RequestContext(
+                    request_id=getattr(self, "request_id", "") or ""
+                )
+            response_body = getattr(self, "_audit_response_body", None)
+            if context.resource_id is None and isinstance(response_body, dict):
+                created_id = response_body.get("id")
+                if context.resource == "keys":
+                    created_id = response_body.get("key_id")
+                if isinstance(created_id, (int, str)) and not isinstance(
+                    created_id, bool
+                ):
+                    context.resource_id = created_id
+            AUDIT_LOG.append(
+                context,
+                method,
+                str(audit_route["path"]),
+                path,
+                status,
+                replay=getattr(self, "_audit_replay", False),
+            )
+        if hasattr(self, "_audit_response_body"):
+            del self._audit_response_body
+        if hasattr(self, "_audit_replay"):
+            del self._audit_replay
         duration = perf_counter() - self._request_started
         REGISTRY.record(method, route, status, duration)
         write_access_log(
@@ -237,12 +291,50 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        context = get_context()
+        if context is not None:
+            segments = str(route["path"]).strip("/").split("/")
+            context.resource = next(
+                (
+                    segment
+                    for segment in segments
+                    if segment in {"orders", "products", "keys"}
+                ),
+                None,
+            )
+            path_id = next(
+                (
+                    value
+                    for name, value in path_params.items()
+                    if name.endswith("_id") or name == "id"
+                ),
+                None,
+            )
+            if path_id is not None:
+                if context.resource == "keys":
+                    context.resource_id = path_id[:256]
+                else:
+                    try:
+                        if len(path_id) <= 19:
+                            context.resource_id = int(path_id)
+                        else:
+                            context.resource_id = path_id[:256]
+                    except ValueError:
+                        context.resource_id = path_id[:256]
         required_role = route.get(
             "role", "write" if route.get("auth_required") else None
         )
         identity = None
-        if required_role is not None:
+        if required_role is not None or self.command in {
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
             identity = authenticate_api_key(self.headers)
+        if context is not None and identity is not None:
+            context.actor = identity.get("key_id", "anonymous")
+            context.role = identity.get("role")
         if required_role is not None and identity is None:
             self._json(
                 401,
@@ -313,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                 replay_headers = dict(decision.response.headers)
                 replay_headers["Idempotent-Replay"] = "true"
                 replay_headers["Idempotency-Key"] = idempotency_key
+                self._audit_replay = True
+                self._audit_response_body = decision.response.body
                 self._json(
                     decision.response.status,
                     decision.response.body,

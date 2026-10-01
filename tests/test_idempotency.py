@@ -8,6 +8,8 @@ from io import BytesIO
 from unittest.mock import patch
 
 from agent_qa import config
+from agent_qa.audit import AuditLog
+from agent_qa.context import RequestContext, clear_context, set_context
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
 from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderStore
@@ -152,8 +154,19 @@ class IdempotencyApiTests(unittest.TestCase):
             "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
         )
         self.auth_patch.start()
+        self.audit = AuditLog(20)
+        self.audit_patch = patch("agent_qa.server.AUDIT_LOG", self.audit)
+        self.audit_patch.start()
+        self.metrics_record_patch = patch("agent_qa.server.REGISTRY.record")
+        self.metrics_record_patch.start()
+        self.access_patch = patch("agent_qa.server.write_access_log")
+        self.access_patch.start()
 
     def tearDown(self):
+        clear_context()
+        self.access_patch.stop()
+        self.metrics_record_patch.stop()
+        self.audit_patch.stop()
         self.auth_patch.stop()
         self.products_patch.stop()
         self.orders_patch.stop()
@@ -188,19 +201,27 @@ class IdempotencyApiTests(unittest.TestCase):
         handler.headers = headers
         handler.rfile = BytesIO(raw)
         handler.request_id = request_id
+        handler._request_started = 1.0
+        handler._response_recorded = False
+        set_context(RequestContext(request_id=request_id))
 
         def capture(status, body, response_headers=None):
             nonlocal fail_output
+            result_headers = dict(response_headers or {})
+            handler._audit_response_body = body
+            if result_headers.get("Idempotent-Replay") == "true":
+                handler._audit_replay = True
+            Handler._record_response(handler, status)
             if fail_output:
                 fail_output = False
                 raise OSError("simulated client disconnect")
-            result_headers = dict(response_headers or {})
             result_headers["X-Request-Id"] = handler.request_id
             responses.append((status, body, result_headers))
 
         handler._json = capture
         with patch("agent_qa.server.LOGGER.exception"):
             Handler._handle(handler)
+        clear_context()
         return responses[0]
 
     @staticmethod
@@ -223,6 +244,12 @@ class IdempotencyApiTests(unittest.TestCase):
         self.assertEqual(first[2]["X-Request-Id"], "api-request")
         self.assertEqual(second[2]["X-Request-Id"], "replay-request")
         self.assertEqual(self.orders.list()[1], 1)
+        entries = self.audit.query(method="POST", resource="orders", order="asc")[
+            "items"
+        ]
+        self.assertEqual(len(entries), 2)
+        self.assertNotIn("replay", entries[0])
+        self.assertIs(entries[1]["replay"], True)
 
     def test_canonical_object_key_order_replays_same_order(self):
         first_payload = {"customer_id": "canonical", "total_cents": 1200}

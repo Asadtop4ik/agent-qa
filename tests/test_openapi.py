@@ -23,6 +23,47 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_audit_routes_document_admin_role_filters_and_schemas(self):
+        spec = build_openapi(ROUTES, "audit-drift")
+        listing = spec["paths"]["/audit"]["get"]
+        self.assertEqual(listing["x-required-role"], "admin")
+        self.assertEqual(listing["security"], [{"ApiKeyAuth": []}])
+        self.assertEqual(
+            {parameter["name"] for parameter in listing["parameters"]},
+            {
+                "method",
+                "resource",
+                "resource_id",
+                "outcome",
+                "actor",
+                "status",
+                "since_seq",
+                "limit",
+                "order",
+            },
+        )
+        self.assertEqual(
+            listing["parameters"][-1]["schema"],
+            {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
+        )
+        listing_schema = listing["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        self.assertEqual(
+            listing_schema["required"],
+            ["items", "total_matching", "limit", "capacity", "dropped", "last_seq"],
+        )
+        single = spec["paths"]["/audit/{seq}"]["get"]
+        self.assertEqual(single["x-required-role"], "admin")
+        self.assertIn("audit_entry_not_found", json.dumps(single["responses"]["404"]))
+        entry_schema = single["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        self.assertEqual(
+            entry_schema["properties"]["resource_id"]["oneOf"],
+            [{"type": "integer"}, {"type": "string", "nullable": True}],
+        )
+
     def test_bulk_route_metadata_matches_openapi(self):
         spec = build_openapi(ROUTES, "bulk-drift")
         route_pairs = {(route["method"].lower(), route["path"]) for route in ROUTES}
@@ -353,6 +394,7 @@ class OpenApiDriftTests(unittest.TestCase):
             template.replace("{id}", "1")
             .replace("{name}", "CreateOrder")
             .replace("{key_id}", "key_1")
+            .replace("{seq}", "1")
         )
 
     def test_route_table_and_spec_have_the_same_method_path_pairs(self):

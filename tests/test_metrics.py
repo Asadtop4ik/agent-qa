@@ -121,6 +121,22 @@ class MetricsRegistryTests(unittest.TestCase):
         self.assertIn("# TYPE agent_qa_products gauge\n", rendered)
         self.assertIn("agent_qa_products 0\n", rendered)
 
+    def test_audit_metrics_are_lazy_and_render_zero_when_available(self):
+        registry = MetricsRegistry()
+        rendered = registry.render(0, "test")
+        self.assertNotIn("agent_qa_audit_entries", rendered)
+        self.assertNotIn("agent_qa_audit_dropped_total", rendered)
+
+        rendered = registry.render(0, "test", audit_entries=0, audit_dropped=0)
+        self.assertIn(
+            "# TYPE agent_qa_audit_entries gauge\nagent_qa_audit_entries 0", rendered
+        )
+        self.assertIn(
+            "# TYPE agent_qa_audit_dropped_total counter\n"
+            "agent_qa_audit_dropped_total 0",
+            rendered,
+        )
+
     def test_concurrent_recording_is_thread_safe(self):
         registry = MetricsRegistry()
         thread_count = 8

@@ -11,6 +11,8 @@ _ORDERS_NAME = "agent_qa_orders"
 _PRODUCTS_NAME = "agent_qa_products"
 _BUILD_NAME = "agent_qa_build_info"
 _IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
+_AUDIT_ENTRIES_NAME = "agent_qa_audit_entries"
+_AUDIT_DROPPED_NAME = "agent_qa_audit_dropped_total"
 _IDEMPOTENCY_RESULTS = frozenset({"stored", "replayed", "mismatch", "in_progress"})
 _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
@@ -68,7 +70,15 @@ class MetricsRegistry:
         with self._lock:
             self._idempotency[result] = self._idempotency.get(result, 0) + 1
 
-    def render(self, orders: int, git_sha: str, products: int | None = None) -> str:
+    def render(
+        self,
+        orders: int,
+        git_sha: str,
+        products: int | None = None,
+        *,
+        audit_entries: int | None = None,
+        audit_dropped: int | None = None,
+    ) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
             requests = self._requests.copy()
@@ -142,6 +152,24 @@ class MetricsRegistry:
                         (_IDEMPOTENCY_NAME, (("result", result),), str(value))
                         for result, value in idempotency.items()
                     ],
+                )
+            )
+        if audit_entries is not None:
+            families.append(
+                (
+                    _AUDIT_ENTRIES_NAME,
+                    "Current number of retained audit entries.",
+                    "gauge",
+                    [(_AUDIT_ENTRIES_NAME, (), str(max(0, int(audit_entries))))],
+                )
+            )
+        if audit_dropped is not None:
+            families.append(
+                (
+                    _AUDIT_DROPPED_NAME,
+                    "Total audit entries dropped from the ring buffer.",
+                    "counter",
+                    [(_AUDIT_DROPPED_NAME, (), str(max(0, int(audit_dropped))))],
                 )
             )
 
