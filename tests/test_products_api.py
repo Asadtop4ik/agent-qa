@@ -587,6 +587,7 @@ class ProductApiTests(unittest.TestCase):
             ("/products/{id}", "delete"),
             ("/products/{id}/adjust-stock", "post"),
             ("/categories", "get"),
+            ("/exports/products.csv", "get"),
         ):
             self.assertIn(method, paths[path])
         self.assertEqual(
@@ -610,6 +611,34 @@ class ProductApiTests(unittest.TestCase):
                 "415",
                 "428",
             },
+        )
+
+    def test_product_csv_export_filters_and_download_headers(self):
+        self.create("SKU-CSV", name="=SUM(1,2) Widget", stock=3)
+        self.create("SKU-OTHER", category="books", name="Other")
+        status, body, headers = self.dispatch(
+            "GET",
+            "/exports/products.csv?category=tools&active=true&in_stock=true&q=Widget",
+            extra_headers={"Accept": "text/csv"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/csv; charset=utf-8")
+        self.assertEqual(
+            headers["Content-Disposition"], 'attachment; filename="products.csv"'
+        )
+        self.assertIn('"\'=SUM(1,2) Widget"', body)
+        self.assertNotIn("SKU-OTHER", body)
+
+        status, body, _ = self.dispatch(
+            "GET",
+            "/exports/products.csv?category=missing",
+            extra_headers={"Accept": "text/csv"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            "id,sku,name,category,price_cents,stock,tags,active,created_at,"
+            "updated_at\r\n",
         )
 
     def test_product_etags_and_if_match_dispatch(self):

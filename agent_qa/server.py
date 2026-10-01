@@ -227,20 +227,38 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _read_json_body(
-        self, require_object: bool = True, max_body_bytes: int = 4096
+    def _read_body(
+        self,
+        consumes: list[str] | tuple[str, ...] = ("application/json",),
+        require_object: bool = True,
+        max_body_bytes: int = 4096,
     ) -> object:
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             raise ApiError(411, "length_required", "Content-Length is required")
+        raw_content_type = self.headers.get("Content-Type", "")
+        is_csv = raw_content_type.split(";", 1)[0].strip().lower() == "text/csv"
+        length_error_code = "invalid_csv" if is_csv else "invalid_json"
+        length_error_message = (
+            "CSV body length is invalid"
+            if is_csv
+            else "Request body must be valid JSON"
+        )
+        length_error_details = (
+            [{"field": "body", "message": "CSV body length is invalid"}]
+            if is_csv
+            else None
+        )
         try:
             length = int(length_header)
         except ValueError as error:
             raise ApiError(
-                400, "invalid_json", "Request body must be valid JSON"
+                400, length_error_code, length_error_message, length_error_details
             ) from error
         if length < 0:
-            raise ApiError(400, "invalid_json", "Request body must be valid JSON")
+            raise ApiError(
+                400, length_error_code, length_error_message, length_error_details
+            )
         if (
             isinstance(max_body_bytes, bool)
             or not isinstance(max_body_bytes, int)
@@ -249,11 +267,43 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("Invalid route max_body_bytes configuration")
         if length > max_body_bytes:
             raise ApiError(413, "payload_too_large", "Request body is too large")
-        content_type = self.headers.get("Content-Type", "")
-        if content_type.split(";", 1)[0].strip().lower() != "application/json":
-            raise ApiError(
-                415, "unsupported_media_type", "Content-Type must be application/json"
+        content_type = raw_content_type
+        parts = [part.strip() for part in content_type.split(";")]
+        media_type = parts[0].lower()
+        if media_type not in consumes:
+            media_type_message = (
+                "Content-Type must be application/json"
+                if tuple(consumes) == ("application/json",)
+                else "Content-Type must be one of the supported media types"
             )
+            raise ApiError(
+                415,
+                "unsupported_media_type",
+                media_type_message,
+            )
+        if media_type == "text/csv":
+            parameters = {}
+            for item in parts[1:]:
+                if "=" not in item:
+                    raise ApiError(
+                        415, "unsupported_media_type", "Unsupported CSV charset"
+                    )
+                name, value = (piece.strip().lower() for piece in item.split("=", 1))
+                if name == "charset":
+                    if name in parameters or value.strip('"') != "utf-8":
+                        raise ApiError(
+                            415, "unsupported_media_type", "CSV charset must be UTF-8"
+                        )
+                    parameters[name] = value
+            try:
+                return self.rfile.read(length).decode("utf-8-sig")
+            except UnicodeDecodeError as error:
+                raise ApiError(
+                    400,
+                    "invalid_csv",
+                    "CSV body must be valid UTF-8",
+                    [{"field": "body", "message": "CSV body must be valid UTF-8"}],
+                ) from error
         try:
             body = self.rfile.read(length).decode("utf-8")
             payload = json.loads(
@@ -278,6 +328,39 @@ class Handler(BaseHTTPRequestHandler):
                 pending.extend((child, depth + 1) for child in value)
         return payload
 
+    def _accepts(self, media_type: str) -> bool:
+        raw = self.headers.get("Accept")
+        if not raw:
+            return True
+        best_specificity = -1
+        best_quality = 0.0
+        for item in raw.split(","):
+            pieces = [piece.strip() for piece in item.split(";")]
+            accepted = pieces[0].lower()
+            quality = 1.0
+            for parameter in pieces[1:]:
+                if parameter.lower().startswith("q="):
+                    try:
+                        quality = float(parameter[2:])
+                    except ValueError:
+                        quality = 0.0
+            if not math.isfinite(quality) or not 0 <= quality <= 1:
+                quality = 0.0
+            if accepted == media_type:
+                specificity = 2
+            elif accepted == media_type.split("/", 1)[0] + "/*":
+                specificity = 1
+            elif accepted == "*/*":
+                specificity = 0
+            else:
+                continue
+            if specificity > best_specificity:
+                best_specificity = specificity
+                best_quality = quality
+            elif specificity == best_specificity:
+                best_quality = max(best_quality, quality)
+        return best_quality > 0
+
     def _dispatch(self) -> None:
         parsed = urlsplit(self.path)
         matches = _path_routes(parsed.path)
@@ -291,6 +374,17 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        produces = route.get("produces", ["application/json"])
+        if not any(self._accepts(media_type) for media_type in produces):
+            self._json(
+                406,
+                envelope(
+                    "not_acceptable",
+                    "No acceptable representation is available",
+                    request_id=self.request_id,
+                ),
+            )
+            return
         context = get_context()
         if context is not None:
             segments = str(route["path"]).strip("/").split("/")
@@ -378,7 +472,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = (
-            self._read_json_body(
+            self._read_body(
+                consumes=route.get("consumes", ["application/json"]),
                 require_object=route.get("json_object_only", True),
                 max_body_bytes=route.get("max_body_bytes", 4096),
             )

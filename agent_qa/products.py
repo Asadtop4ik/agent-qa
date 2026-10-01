@@ -8,9 +8,9 @@ import re
 import threading
 from typing import Any
 
+from agent_qa.bulk import run_bulk, run_transaction, validate_bulk_input
 from agent_qa.conditional import check_expected_version
 from agent_qa.context import get_context
-from agent_qa.bulk import run_bulk, validate_bulk_input
 from agent_qa.errors import ApiError
 from agent_qa.pagination import (
     decode_cursor,
@@ -375,15 +375,80 @@ class ProductStore:
             return self.create(**validate_create(item))
 
         with self._lock:
-            products_snapshot = deepcopy(self._products)
-            next_id_snapshot = self._next_id
+            snapshot = self._snapshot_locked()
 
-            def rollback() -> None:
-                self._products.clear()
-                self._products.update(deepcopy(products_snapshot))
-                self._next_id = next_id_snapshot
+            return run_bulk(
+                items, apply_one, lambda: self._restore_locked(snapshot), atomic
+            )
 
-            return run_bulk(items, apply_one, rollback, atomic)
+    def _snapshot_locked(self) -> tuple[dict[int, dict[str, Any]], int]:
+        return deepcopy(self._products), self._next_id
+
+    def _restore_locked(self, snapshot: tuple[dict[int, dict[str, Any]], int]) -> None:
+        products, next_id = snapshot
+        self._products.clear()
+        self._products.update(deepcopy(products))
+        self._next_id = next_id
+
+    def apply_csv_import(
+        self,
+        records: list[tuple[int, dict[str, Any]]],
+        errors: list[dict[str, Any]],
+        mode: str,
+        on_error: str,
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        """Apply already validated CSV rows under one store transaction."""
+        with self._lock:
+            row_errors = [dict(error) for error in errors]
+            existing_skus = {item["sku"] for item in self._products.values()}
+            filtered = []
+            for line, fields in records:
+                if fields["sku"] in existing_skus:
+                    row_errors.append(
+                        {
+                            "line": line,
+                            "field": "sku",
+                            "message": "SKU already exists",
+                        }
+                    )
+                else:
+                    filtered.append((line, fields))
+                    existing_skus.add(fields["sku"])
+            records = filtered
+            row_errors.sort(key=lambda item: item["line"])
+            if mode == "validate":
+                return 200, 0, row_errors
+            if row_errors and on_error == "abort":
+                return 422, 0, row_errors
+
+            available = self._capacity - len(self._products)
+            if len(records) > available:
+                for line, _fields in records[available:]:
+                    row_errors.append(
+                        {
+                            "line": line,
+                            "field": "body",
+                            "message": "Product store is full",
+                        }
+                    )
+                records = records[:available]
+                row_errors.sort(key=lambda item: item["line"])
+            if row_errors and on_error == "abort":
+                return 422, 0, row_errors
+
+            snapshot = self._snapshot_locked()
+
+            def apply_rows() -> int:
+                for _line, fields in records:
+                    self.create(**fields)
+                return len(records)
+
+            created = run_transaction(
+                apply_rows,
+                lambda: self._restore_locked(snapshot),
+                "product CSV import",
+            )
+            return (201 if created else 422), created, row_errors
 
     def get(
         self, product_id: int, *, include_version: bool = False
@@ -694,6 +759,50 @@ class ProductStore:
                 matched.sort(key=lambda product: product["created_at"])
             page = matched[offset : offset + limit] if offset < total else []
             return [_copy_product(product) for product in page], total
+
+    def export_csv(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Return up to 1000 products matching CSV export filters, under one lock."""
+        filters = {} if filters is None else dict(filters)
+        allowed = {"category", "active", "in_stock", "q"}
+        unsupported = filters.keys() - allowed
+        if unsupported:
+            raise _invalid_store_query(sorted(unsupported)[0])
+        _validate_store_query(filters)
+        with self._lock:
+            matched = []
+            for product_id in sorted(self._products):
+                product = self._products[product_id]
+                if (
+                    filters.get("category") is not None
+                    and product["category"] != filters["category"]
+                ):
+                    continue
+                if "active" in filters and product["active"] != filters["active"]:
+                    continue
+                if (
+                    "in_stock" in filters
+                    and (product["stock"] > 0) != filters["in_stock"]
+                ):
+                    continue
+                search = filters.get("q")
+                if search is not None:
+                    needle = search.casefold()
+                    if not any(
+                        needle in value.casefold()
+                        for value in (
+                            product["name"],
+                            product["sku"],
+                            *product["tags"],
+                        )
+                    ):
+                        continue
+                exported = _copy_product(product)
+                exported["tags"] = "|".join(exported["tags"])
+                exported["active"] = "true" if exported["active"] else "false"
+                matched.append(exported)
+                if len(matched) == 1000:
+                    break
+            return matched
 
     def categories(self) -> list[dict[str, Any]]:
         with self._lock:

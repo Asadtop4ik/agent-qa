@@ -51,8 +51,16 @@ class Harness:
     def end_headers(self):
         pass
 
-    def _read_json_body(self, require_object=True, max_body_bytes=4096):
-        return Handler._read_json_body(self, require_object, max_body_bytes)
+    def _read_body(
+        self,
+        consumes=("application/json",),
+        require_object=True,
+        max_body_bytes=4096,
+    ):
+        return Handler._read_body(self, consumes, require_object, max_body_bytes)
+
+    def _accepts(self, media_type):
+        return Handler._accepts(self, media_type)
 
     def _record_response(self, status):
         Handler._record_response(self, status)
@@ -116,7 +124,7 @@ class RoleApiTests(unittest.TestCase):
                     required_role = "read"
                 elif route["method"] in {"POST", "PATCH", "DELETE"} and route[
                     "path"
-                ].startswith(("/orders", "/products")):
+                ].startswith(("/orders", "/products", "/imports")):
                     required_role = "write"
                 else:
                     required_role = None
@@ -136,6 +144,8 @@ class RoleApiTests(unittest.TestCase):
                             expected = (
                                 403
                                 if rank[identity["role"]] < rank[required_role]
+                                else 415
+                                if route["path"].startswith("/imports/")
                                 else 400
                             )
                         self.assertEqual(status, expected)

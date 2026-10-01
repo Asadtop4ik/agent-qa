@@ -58,6 +58,24 @@ service restart.
 For example, `GET /orders?status=new&sort=-id&limit=20&pagination=cursor` starts
 a cursor-paginated order listing.
 
+## CSV import and export
+
+`GET /exports/products.csv` exports products with optional `category`, `active`,
+`in_stock`, and `q` filters. `GET /exports/orders.csv` accepts `status` and
+`customer_id` filters. Both downloads include a header even when no rows match
+and are limited to 1,000 rows. CSV text cells are protected against spreadsheet
+formula injection. The endpoints return `406` when the request only accepts
+JSON.
+
+Write-role keys can import products with `POST /imports/products` and legacy
+orders with `POST /imports/orders` using `Content-Type: text/csv; charset=utf-8`.
+Import files are limited to 65,536 bytes and 200 data rows. Product CSV columns
+are `sku,name,category,price_cents` with optional `stock,tags,active`; order
+columns are `customer_id,total_cents`. Use `mode=validate` to receive a report
+without writing, or `mode=apply&on_error=skip` to apply valid rows and report
+row errors. The default is an all-or-nothing apply that returns `422` if any
+row is invalid.
+
 ## Conditional requests
 
 Order and product item responses include opaque ETags tied to the service

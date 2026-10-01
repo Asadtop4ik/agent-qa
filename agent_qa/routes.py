@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import platform
+from collections.abc import Callable
 from urllib.parse import quote, urlencode
 
 from agent_qa import auth
+from agent_qa import csvio
 from agent_qa.audit import AUDIT_LOG
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
@@ -565,6 +567,236 @@ def list_products(
     if _if_none_match(request_headers, etag):
         return 304, None, headers
     return 200, body, headers
+
+
+_EXPORT_PRODUCT_COLUMNS = (
+    "id",
+    "sku",
+    "name",
+    "category",
+    "price_cents",
+    "stock",
+    "tags",
+    "active",
+    "created_at",
+    "updated_at",
+)
+_EXPORT_ORDER_COLUMNS = (
+    "id",
+    "customer_id",
+    "total_cents",
+    "status",
+    "items_count",
+    "created_at",
+)
+_EXPORT_PRODUCT_QUERY = [
+    {
+        "name": "category",
+        "in": "query",
+        "schema": SCHEMAS["CreateProduct"]["properties"]["category"],
+    },
+    {"name": "active", "in": "query", "schema": {"type": "boolean"}},
+    {"name": "in_stock", "in": "query", "schema": {"type": "boolean"}},
+    {
+        "name": "q",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_PRODUCT_QUERY_LENGTH,
+        },
+    },
+]
+_EXPORT_ORDER_QUERY = [
+    {
+        "name": "status",
+        "in": "query",
+        "schema": SCHEMAS["UpdateOrder"]["properties"]["status"],
+    },
+    {
+        "name": "customer_id",
+        "in": "query",
+        "schema": SCHEMAS["CreateOrder"]["properties"]["customer_id"],
+    },
+]
+_CSV_IMPORT_QUERY = [
+    {
+        "name": "mode",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": ["apply", "validate"],
+            "default": "apply",
+        },
+    },
+    {
+        "name": "on_error",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": ["abort", "skip"],
+            "default": "abort",
+        },
+    },
+]
+
+_CSV_IMPORT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["mode", "rows", "created", "failed", "applied", "errors"],
+    "properties": {
+        "mode": {"type": "string", "enum": ["apply", "validate"]},
+        "rows": {"type": "integer", "minimum": 0},
+        "created": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "applied": {"type": "boolean"},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["line", "field", "message"],
+                "properties": {
+                    "line": {"type": "integer", "minimum": 2},
+                    "field": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def _csv_download(
+    filename: str,
+    columns: tuple[str, ...],
+    rows: list[dict],
+    text_columns: set[str],
+) -> tuple[int, str, dict[str, str]]:
+    text = csvio.render_csv(columns, rows, text_columns=text_columns)
+    return (
+        200,
+        text,
+        {
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+def export_products_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, str, dict[str, str]]:
+    parsed = validate_product_query(query)
+    unsupported = sorted(
+        {name for name, _ in query} - {"category", "active", "in_stock", "q"}
+    )
+    if unsupported:
+        raise ApiError(
+            400,
+            "invalid_query",
+            "Invalid query parameters",
+            [
+                {"field": name, "message": "Unsupported query parameter"}
+                for name in unsupported
+            ],
+        )
+    filters = {
+        name: parsed[name]
+        for name in ("category", "active", "in_stock", "q")
+        if name in parsed
+    }
+    rows = PRODUCT_STORE.export_csv(filters)
+    return _csv_download(
+        "products.csv",
+        _EXPORT_PRODUCT_COLUMNS,
+        rows,
+        {"sku", "name", "category", "tags", "created_at", "updated_at"},
+    )
+
+
+def export_orders_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, str, dict[str, str]]:
+    parsed = validate_query(query)
+    unsupported = sorted({name for name, _ in query} - {"status", "customer_id"})
+    if unsupported:
+        raise ApiError(
+            400,
+            "invalid_query",
+            "Invalid query parameters",
+            [
+                {"field": name, "message": "Unsupported query parameter"}
+                for name in unsupported
+            ],
+        )
+    filters = {
+        name: parsed[name] for name in ("status", "customer_id") if name in parsed
+    }
+    rows = ORDER_STORE.export_csv(filters)
+    return _csv_download(
+        "orders.csv",
+        _EXPORT_ORDER_COLUMNS,
+        rows,
+        {"customer_id", "status", "created_at"},
+    )
+
+
+def _import_csv(
+    importer: Callable,
+    store: object,
+    payload: object,
+    query: list[tuple[str, str]],
+) -> tuple[int, object, dict[str, str]]:
+    if not isinstance(payload, str):
+        raise ApiError(
+            400,
+            "invalid_csv",
+            "CSV body is required",
+            [{"field": "body", "message": "CSV body is required"}],
+        )
+    options = validate_query_params(_CSV_IMPORT_QUERY, query)
+    mode = options.get("mode", "apply")
+    on_error = options.get("on_error", "abort")
+    try:
+        status_code, report = importer(store, payload, mode=mode, on_error=on_error)
+    except csvio.CsvStructureError as error:
+        raise ApiError(
+            400,
+            "invalid_csv",
+            "Invalid CSV structure",
+            [{"field": error.field, "message": error.message}],
+        ) from error
+    context = get_context()
+    if context is not None and isinstance(report, dict):
+        context.changes = {
+            "summary": {
+                "created": report.get("created", 0),
+                "failed": report.get("failed", 0),
+                "rows": report.get("rows", 0),
+            }
+        }
+    return status_code, report, {}
+
+
+def import_products_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return _import_csv(csvio.import_products_csv, PRODUCT_STORE, payload, query)
+
+
+def import_orders_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return _import_csv(csvio.import_orders_csv, ORDER_STORE, payload, query)
 
 
 def _product_id(path_params: dict[str, str] | None) -> int | None:
@@ -1312,6 +1544,88 @@ ROUTES = (
                 },
             }
         },
+    },
+    {
+        "method": "GET",
+        "path": "/exports/products.csv",
+        "handler": export_products_csv,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "exportProductsCsv",
+        "summary": "Export filtered products as CSV",
+        "produces": ["text/csv"],
+        "parameters": _EXPORT_PRODUCT_QUERY,
+        "responses": ["200", "400", "406", "403"],
+        "response_schemas": {"200": {"type": "string", "format": "binary"}},
+        "response_headers": {
+            "200": {
+                "Content-Disposition": {
+                    "description": "Download filename.",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/exports/orders.csv",
+        "handler": export_orders_csv,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "exportOrdersCsv",
+        "summary": "Export filtered orders as CSV",
+        "produces": ["text/csv"],
+        "parameters": _EXPORT_ORDER_QUERY,
+        "responses": ["200", "400", "406", "403"],
+        "response_schemas": {"200": {"type": "string", "format": "binary"}},
+        "response_headers": {
+            "200": {
+                "Content-Disposition": {
+                    "description": "Download filename.",
+                    "schema": {"type": "string"},
+                }
+            }
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/imports/products",
+        "handler": import_products_csv,
+        "body": True,
+        "max_body_bytes": 65536,
+        "consumes": ["text/csv"],
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "importProductsCsv",
+        "summary": "Import products from CSV",
+        "parameters": _CSV_IMPORT_QUERY,
+        "responses": ["200", "201", "400", "401", "411", "413", "415", "422", "403"],
+        "response_schemas": {
+            "200": _CSV_IMPORT_RESPONSE_SCHEMA,
+            "201": _CSV_IMPORT_RESPONSE_SCHEMA,
+            "422": _CSV_IMPORT_RESPONSE_SCHEMA,
+        },
+        "error_responses": {"400": "Invalid CSV structure or import options."},
+    },
+    {
+        "method": "POST",
+        "path": "/imports/orders",
+        "handler": import_orders_csv,
+        "body": True,
+        "max_body_bytes": 65536,
+        "consumes": ["text/csv"],
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "importOrdersCsv",
+        "summary": "Import legacy orders from CSV",
+        "parameters": _CSV_IMPORT_QUERY,
+        "responses": ["200", "201", "400", "401", "411", "413", "415", "422", "403"],
+        "response_schemas": {
+            "200": _CSV_IMPORT_RESPONSE_SCHEMA,
+            "201": _CSV_IMPORT_RESPONSE_SCHEMA,
+            "422": _CSV_IMPORT_RESPONSE_SCHEMA,
+        },
+        "error_responses": {"400": "Invalid CSV structure or import options."},
     },
     {
         "method": "GET",

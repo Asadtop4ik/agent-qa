@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 import threading
 from typing import Any
 
+from agent_qa.bulk import run_transaction
 from agent_qa.conditional import check_expected_version
 from agent_qa.context import get_context
 from agent_qa.pagination import (
@@ -233,6 +235,60 @@ class OrderStore:
         self._orders[order_id] = order
         return self._copy_order(order, include_version)
 
+    def _snapshot_locked(self) -> tuple[dict[int, dict[str, Any]], int]:
+        return deepcopy(self._orders), self._next_id
+
+    def _restore_locked(self, snapshot: tuple[dict[int, dict[str, Any]], int]) -> None:
+        orders, next_id = snapshot
+        self._orders.clear()
+        self._orders.update(deepcopy(orders))
+        self._next_id = next_id
+
+    def apply_csv_import(
+        self,
+        records: list[tuple[int, dict[str, Any]]],
+        errors: list[dict[str, Any]],
+        mode: str,
+        on_error: str,
+    ) -> tuple[int, int, list[dict[str, Any]]]:
+        """Apply already validated legacy CSV rows under one store transaction."""
+        with self._lock:
+            row_errors = [dict(error) for error in errors]
+            row_errors.sort(key=lambda item: item["line"])
+            if mode == "validate":
+                return 200, 0, row_errors
+            if row_errors and on_error == "abort":
+                return 422, 0, row_errors
+
+            available = self._capacity - len(self._orders)
+            if len(records) > available:
+                for line, _fields in records[available:]:
+                    row_errors.append(
+                        {
+                            "line": line,
+                            "field": "body",
+                            "message": "Order store is full",
+                        }
+                    )
+                records = records[:available]
+                row_errors.sort(key=lambda item: item["line"])
+            if row_errors and on_error == "abort":
+                return 422, 0, row_errors
+
+            snapshot = self._snapshot_locked()
+
+            def apply_rows() -> int:
+                for _line, fields in records:
+                    self._create_locked({**fields, "items": []})
+                return len(records)
+
+            created = run_transaction(
+                apply_rows,
+                lambda: self._restore_locked(snapshot),
+                "order CSV import",
+            )
+            return (201 if created else 422), created, row_errors
+
     def list(
         self,
         status: str | None = None,
@@ -318,6 +374,45 @@ class OrderStore:
                 [self._copy_order(order) for order in matched[offset : offset + limit]],
                 total,
             )
+
+    def export_csv(self, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Return up to 1000 orders matching the supported export filters."""
+        filters = {} if filters is None else dict(filters)
+        unsupported = filters.keys() - {"status", "customer_id"}
+        if unsupported:
+            field = sorted(unsupported)[0]
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": field, "message": "Unsupported query parameter"}],
+            )
+        with self._lock:
+            rows = []
+            for order_id in sorted(self._orders):
+                order = self._orders[order_id]
+                if (
+                    filters.get("status") is not None
+                    and order["status"] != filters["status"]
+                ):
+                    continue
+                if (
+                    filters.get("customer_id") is not None
+                    and order["customer_id"] != filters["customer_id"]
+                ):
+                    continue
+                rows.append(
+                    {
+                        "id": order["id"],
+                        "customer_id": order["customer_id"],
+                        "total_cents": order["total_cents"],
+                        "status": order["status"],
+                        "items_count": len(order.get("items", [])),
+                        "created_at": order["created_at"],
+                    }
+                )
+                if len(rows) == 1000:
+                    break
+            return rows
 
     def get(
         self, order_id: int, *, include_version: bool = False

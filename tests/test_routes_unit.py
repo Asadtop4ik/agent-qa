@@ -512,6 +512,310 @@ class RouteUnitTests(unittest.TestCase):
             self.assertEqual(error.exception.status, 400)
             self.assertEqual(error.exception.code, "invalid_json")
 
+    def test_csv_body_reader_checks_charset_size_utf8_and_bom(self):
+        from agent_qa.server import Handler
+
+        def read(raw, content_type="text/csv"):
+            handler = object.__new__(Handler)
+            handler.headers = Message()
+            handler.headers["Content-Length"] = str(len(raw))
+            handler.headers["Content-Type"] = content_type
+            handler.rfile = BytesIO(raw)
+            return Handler._read_body(
+                handler, consumes=["text/csv"], max_body_bytes=65536
+            )
+
+        self.assertEqual(
+            read(b"\xef\xbb\xbfsku,name\r\nA,Widget\r\n"),
+            "sku,name\r\nA,Widget\r\n",
+        )
+        self.assertEqual(
+            read(b"sku,name\r\n", "text/csv; charset=utf-8"), "sku,name\r\n"
+        )
+        for content_type in ("text/csv; charset=latin-1", "text/csv; charset=utf8"):
+            handler = object.__new__(Handler)
+            handler.headers = Message()
+            handler.headers["Content-Length"] = "1"
+            handler.headers["Content-Type"] = content_type
+            handler.rfile = BytesIO(b"x")
+            with self.subTest(content_type=content_type):
+                with self.assertRaises(ApiError) as error:
+                    Handler._read_body(handler, consumes=["text/csv"])
+                self.assertEqual(error.exception.status, 415)
+
+        for raw, expected_code in (
+            (b"\xff", "invalid_csv"),
+            (b"x" * 65537, "payload_too_large"),
+        ):
+            with self.subTest(expected_code=expected_code):
+                with self.assertRaises(ApiError) as error:
+                    read(raw)
+                self.assertEqual(error.exception.code, expected_code)
+                self.assertEqual(
+                    error.exception.status,
+                    400 if expected_code == "invalid_csv" else 413,
+                )
+
+        handler = object.__new__(Handler)
+        handler.headers = Message()
+        handler.headers["Content-Length"] = "9" * 5000
+        handler.headers["Content-Type"] = "text/csv"
+        handler.rfile = BytesIO()
+        with self.assertRaises(ApiError) as error:
+            Handler._read_body(handler, consumes=["text/csv"])
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.code, "invalid_csv")
+        self.assertEqual(error.exception.details[0]["field"], "body")
+
+    def test_csv_export_negotiates_accept_and_rejects_unknown_filters(self):
+        from agent_qa.server import Handler
+
+        for accept in (
+            "application/json",
+            "text/csv;q=0, */*;q=1",
+        ):
+            handler, responses = self.make_dispatcher(
+                "/exports/products.csv", b"", method="GET"
+            )
+            handler.headers["Accept"] = accept
+            Handler._dispatch(handler)
+            self.assertEqual(responses[0][0], 406)
+        handler, responses = self.make_dispatcher(
+            "/exports/products.csv", b"", method="GET"
+        )
+        handler.headers["Accept"] = "*/*"
+        with patch("agent_qa.routes.PRODUCT_STORE.export_csv", return_value=[]):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(
+            responses[0][1],
+            "id,sku,name,category,price_cents,stock,tags,active,created_at,"
+            "updated_at\r\n",
+        )
+        self.assertEqual(responses[0][2]["Content-Type"], "text/csv; charset=utf-8")
+        self.assertEqual(
+            responses[0][2]["Content-Disposition"],
+            'attachment; filename="products.csv"',
+        )
+        handler, _ = self.make_dispatcher(
+            "/exports/products.csv?unexpected=x", b"", method="GET"
+        )
+        with self.assertRaises(ApiError) as error:
+            Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.code, "invalid_query")
+
+    def test_csv_import_routes_apply_validate_abort_and_skip(self):
+        from agent_qa.orders import OrderStore
+        from agent_qa.products import ProductStore
+        from agent_qa.server import Handler
+
+        products = ProductStore()
+        orders = OrderStore()
+
+        def dispatch(path, body):
+            handler, responses = self.make_dispatcher(
+                path, body, content_type="text/csv; charset=utf-8"
+            )
+            with (
+                patch(
+                    "agent_qa.server.authenticate_api_key",
+                    return_value=AUTH_IDENTITY,
+                ),
+                patch("agent_qa.routes.PRODUCT_STORE", products),
+                patch("agent_qa.routes.ORDER_STORE", orders),
+            ):
+                Handler._handle(handler)
+            return responses[0]
+
+        status, body, _ = dispatch("/imports/products", b"")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_csv")
+        self.assertEqual(body["error"]["details"][0]["field"], "header")
+
+        good_row = b"SKU-CSV,Widget,tools,1200\r\n"
+        status, report, _ = dispatch(
+            "/imports/products?mode=validate",
+            b"sku,name,category,price_cents\r\n" + good_row,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(report["created"], 0)
+        self.assertFalse(report["applied"])
+        self.assertEqual(products.export_csv({}), [])
+
+        status, report, _ = dispatch(
+            "/imports/products",
+            b"sku,name,category,price_cents\r\n"
+            + good_row
+            + b"SKU-BAD,Widget,tools,nope\r\n",
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(report["created"], 0)
+        self.assertEqual(report["errors"][0]["line"], 3)
+        self.assertEqual(products.export_csv({}), [])
+
+        status, report, _ = dispatch(
+            "/imports/products?on_error=skip",
+            b"sku,name,category,price_cents\r\n"
+            + good_row
+            + b"SKU-BAD,Widget,tools,nope\r\n",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(report["created"], 1)
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(products.export_csv({})), 1)
+
+        status, report, _ = dispatch(
+            "/imports/orders",
+            b"customer_id,total_cents\r\ncsv-customer-1,1500\r\n",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(report["created"], 1)
+        self.assertEqual(len(orders.export_csv({})), 1)
+
+        handler, responses = self.make_dispatcher(
+            "/exports/orders.csv?status=new&customer_id=csv-customer-1",
+            b"",
+            method="GET",
+        )
+        handler.headers["Accept"] = "text/csv"
+        with patch("agent_qa.routes.ORDER_STORE", orders):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 200)
+        self.assertTrue(
+            responses[0][1].startswith(
+                "id,customer_id,total_cents,status,items_count,created_at\r\n"
+            )
+        )
+
+    def test_order_csv_import_policies_and_structural_rejections(self):
+        from agent_qa.orders import OrderStore
+        from agent_qa.server import Handler
+
+        def dispatch(path, raw, content_type="text/csv; charset=utf-8"):
+            handler, responses = self.make_dispatcher(
+                path, raw, content_type=content_type
+            )
+            store = OrderStore()
+            with (
+                patch(
+                    "agent_qa.server.authenticate_api_key",
+                    return_value=AUTH_IDENTITY,
+                ),
+                patch("agent_qa.routes.ORDER_STORE", store),
+            ):
+                Handler._handle(handler)
+            return responses[0], store
+
+        valid = b"customer-1,1500\r\n"
+        invalid = b"customer-2,not-an-integer\r\n"
+        mixed = b"customer_id,total_cents\r\n" + valid + invalid
+
+        for policy in ("abort", "skip"):
+            (status, report, _), store = dispatch(
+                f"/imports/orders?mode=validate&on_error={policy}", mixed
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(report["created"], 0)
+            self.assertEqual(report["failed"], 1)
+            self.assertFalse(report["applied"])
+            self.assertEqual(store.export_csv({}), [])
+
+        (status, report, _), store = dispatch("/imports/orders", mixed)
+        self.assertEqual(status, 422)
+        self.assertEqual(report["created"], 0)
+        self.assertFalse(report["applied"])
+        self.assertEqual(store.export_csv({}), [])
+
+        (status, report, _), store = dispatch("/imports/orders?on_error=skip", mixed)
+        self.assertEqual(status, 201)
+        self.assertEqual(report["created"], 1)
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(store.export_csv({})), 1)
+
+        (status, report, _), store = dispatch(
+            "/imports/orders?on_error=skip",
+            b"customer_id,total_cents\r\ncustomer-2,not-an-integer\r\n",
+        )
+        self.assertEqual(status, 422)
+        self.assertEqual(report["created"], 0)
+        self.assertFalse(report["applied"])
+        self.assertEqual(store.export_csv({}), [])
+
+        (status, report, _), store = dispatch(
+            "/imports/orders",
+            b"customer_id,total_cents\r\ncustomer-1,1500\r\n",
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(report["created"], 1)
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(store.export_csv({})), 1)
+
+        for path in (
+            "/imports/orders?mode=preview",
+            "/imports/orders?on_error=continue",
+            "/imports/orders?extra=x",
+        ):
+            (status, body, _), _ = dispatch(
+                path, b"customer_id,total_cents\r\ncustomer-1,1500\r\n"
+            )
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["code"], "invalid_query")
+
+        structural_cases = (
+            (b"", "header"),
+            (b"customer_id,total_cents,extra\r\nc,1,x\r\n", "header"),
+            (b"customer_id,customer_id,total_cents\r\nc,c,1\r\n", "header"),
+            (b"total_cents\r\n1\r\n", "header"),
+            (b"customer_id,total_cents\r\n", "either"),
+            (b"customer_id,total_cents\r\nc\r\n", "body"),
+            (b'customer_id,total_cents\r\n"customer-1,1500\r\n', "body"),
+            (
+                b"customer_id,total_cents\r\n" + b"customer-1,1500\r\n" * 201,
+                "body",
+            ),
+        )
+        for raw, field in structural_cases:
+            with self.subTest(field=field, size=len(raw)):
+                (status, body, _), _ = dispatch("/imports/orders", raw)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], "invalid_csv")
+                actual_field = body["error"]["details"][0]["field"]
+                if field == "either":
+                    self.assertIn(actual_field, {"header", "body"})
+                else:
+                    self.assertEqual(actual_field, field)
+
+        (status, body, _), _ = dispatch(
+            "/imports/orders",
+            b"customer_id,total_cents\r\nc,1500\r\n",
+            "text/csv; charset=iso-8859-1",
+        )
+        self.assertEqual(status, 415)
+        self.assertEqual(body["error"]["code"], "unsupported_media_type")
+
+        (status, body, _), _ = dispatch(
+            "/imports/orders", b"customer_id,total_cents\r\n\xff\r\n"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_csv")
+        self.assertEqual(body["error"]["details"][0]["field"], "body")
+
+        (status, report, _), store = dispatch(
+            "/imports/orders",
+            b"\xef\xbb\xbfcustomer_id,total_cents\r\ncsv-customer,1500\r\n",
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(store.export_csv({})), 1)
+
+        (status, body, _), _ = dispatch(
+            "/imports/orders",
+            b"customer_id,total_cents\r\n" + b"x" * 70000,
+        )
+        self.assertEqual(status, 413)
+        self.assertEqual(body["error"]["code"], "payload_too_large")
+
     def test_dispatch_validates_before_calling_handler(self):
         from agent_qa.server import Handler
 

@@ -78,6 +78,18 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             self.assertEqual(operation["x-required-role"], route["role"])
             self.assertEqual(route["auth_required"], route["role"] is not None)
             self.assertIn("403", operation["responses"])
+            success_media = route.get("produces", ["application/json"])
+            for status in route.get("response_schemas", {}):
+                if 200 <= int(status) < 300:
+                    self.assertEqual(
+                        set(operation["responses"][status]["content"]),
+                        set(success_media),
+                    )
+            if route.get("body"):
+                request_media = route.get("consumes", ["application/json"])
+                self.assertEqual(
+                    set(operation["requestBody"]["content"]), set(request_media)
+                )
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
             self.assertEqual(set(operation["responses"]), set(route["responses"]))
@@ -85,6 +97,47 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             self.assertEqual(
                 operation["requestBody"]["content"]["application/json"]["schema"],
                 route["request_schema"],
+            )
+
+    def test_csv_routes_document_media_types_queries_and_import_limits(self):
+        spec = build_openapi(ROUTES, "csv-drift")
+        products = spec["paths"]["/exports/products.csv"]["get"]
+        orders = spec["paths"]["/exports/orders.csv"]["get"]
+        self.assertEqual(
+            products["responses"]["200"]["content"]["text/csv"]["schema"]["type"],
+            "string",
+        )
+        self.assertEqual(
+            orders["responses"]["200"]["content"]["text/csv"]["schema"]["type"],
+            "string",
+        )
+        self.assertIn("406", products["responses"])
+        self.assertIn("406", orders["responses"])
+        self.assertEqual(
+            {parameter["name"] for parameter in products["parameters"]},
+            {"category", "active", "in_stock", "q"},
+        )
+        self.assertEqual(
+            {parameter["name"] for parameter in orders["parameters"]},
+            {"status", "customer_id"},
+        )
+        for path in ("/imports/products", "/imports/orders"):
+            operation = spec["paths"][path]["post"]
+            self.assertEqual(operation["x-required-role"], "write")
+            self.assertEqual(operation["x-max-body-bytes"], 65536)
+            self.assertEqual(
+                operation["requestBody"]["content"]["text/csv"]["schema"],
+                {"type": "string"},
+            )
+            self.assertEqual(
+                {parameter["name"] for parameter in operation["parameters"]},
+                {"mode", "on_error"},
+            )
+            self.assertEqual(
+                operation["responses"]["201"]["content"]["application/json"]["schema"][
+                    "required"
+                ],
+                ["mode", "rows", "created", "failed", "applied", "errors"],
             )
 
     def test_key_management_routes_are_documented_with_roles_and_forbidden(self):

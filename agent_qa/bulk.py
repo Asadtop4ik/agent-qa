@@ -32,6 +32,27 @@ def _item_error(error: ApiError) -> dict[str, Any]:
     }
 
 
+def rollback_after_error(rollback: Callable[[], None], context: str) -> None:
+    """Run a store rollback and log failures with the transaction context."""
+    try:
+        rollback()
+    except Exception:
+        logger.exception("Unexpected error rolling back %s", context)
+        raise
+
+
+def run_transaction(
+    apply: Callable[[], Any], rollback: Callable[[], None], context: str
+) -> Any:
+    """Apply one locked store transaction and roll it back on unexpected errors."""
+    try:
+        return apply()
+    except Exception:
+        logger.exception("Unexpected error applying %s", context)
+        rollback_after_error(rollback, context)
+        raise
+
+
 def run_bulk(
     items: list[Any],
     apply_one: Callable[[Any], dict[str, Any]],
@@ -55,22 +76,14 @@ def run_bulk(
         except Exception:
             logger.exception("Unexpected error applying bulk item at index %d", index)
             if atomic:
-                try:
-                    rollback()
-                except Exception:
-                    logger.exception("Unexpected error rolling back bulk request")
-                    raise
+                rollback_after_error(rollback, "bulk request")
             raise
         else:
             succeeded += 1
             results.append({"index": index, "status": 201, "data": data})
 
     if atomic and failed:
-        try:
-            rollback()
-        except Exception:
-            logger.exception("Unexpected error rolling back failed bulk request")
-            raise
+        rollback_after_error(rollback, "failed bulk request")
         results = [
             (
                 result

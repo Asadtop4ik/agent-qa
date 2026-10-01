@@ -13,6 +13,7 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         method = route["method"].lower()
         path = route["path"]
         response_schemas = route.get("response_schemas", {})
+        produces = route.get("produces", ["application/json"])
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
@@ -25,9 +26,14 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     **(
                         {
                             "content": {
-                                "application/json": {
+                                media_type: {
                                     "schema": deepcopy(response_schemas[status])
                                 }
+                                for media_type in (
+                                    produces
+                                    if 200 <= int(status) < 300
+                                    else ["application/json"]
+                                )
                             }
                         }
                         if status in response_schemas
@@ -43,6 +49,15 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
             },
         }
+        if "406" in operation["responses"]:
+            operation["responses"]["406"] = {
+                "description": "No acceptable response representation was requested.",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/Error"}
+                    }
+                },
+            }
         if route.get("conditional_headers"):
             conditional_errors = {
                 "400": (
@@ -182,11 +197,16 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     response.setdefault("headers", {}).update(deepcopy(replay_headers))
         elif route.get("parameters"):
             operation["parameters"] = deepcopy(route["parameters"])
-        if route.get("request_schema") is not None:
+        if route.get("request_schema") is not None or route.get("body"):
+            consumes = route.get("consumes", ["application/json"])
+            request_schema = route.get("request_schema")
+            if request_schema is None:
+                request_schema = {"type": "string"}
             operation["requestBody"] = {
                 "required": True,
                 "content": {
-                    "application/json": {"schema": deepcopy(route["request_schema"])}
+                    media_type: {"schema": deepcopy(request_schema)}
+                    for media_type in consumes
                 },
             }
         if route.get("body"):
