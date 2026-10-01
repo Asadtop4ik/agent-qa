@@ -43,6 +43,35 @@ def response_header(handler, name):
 
 
 class ContentNegotiationHandlerTests(unittest.TestCase):
+    def test_csv_body_reader_strips_bom_and_enforces_charset_and_utf8(self):
+        handler = make_handler(headers={"Content-Type": "text/csv; charset=utf-8"})
+        csv_body = b"\xef\xbb\xbfsku,name\r\na,Alpha\r\n"
+        handler.rfile = io.BytesIO(csv_body)
+        handler.headers["Content-Length"] = str(len(csv_body))
+        self.assertEqual(
+            Handler._read_request_body(
+                handler,
+                ("text/csv",),
+                max_body_bytes=128,
+            ),
+            "sku,name\r\na,Alpha\r\n",
+        )
+
+        handler = make_handler(headers={"Content-Type": "text/csv; charset=latin-1"})
+        handler.headers["Content-Length"] = "0"
+        with self.assertRaises(ApiError) as caught:
+            Handler._read_request_body(handler, ("text/csv",), max_body_bytes=128)
+        self.assertEqual(caught.exception.status, 415)
+
+        handler = make_handler(headers={"Content-Type": "text/csv"})
+        handler.rfile = io.BytesIO(b"\xff")
+        handler.headers["Content-Length"] = "1"
+        with self.assertRaises(ApiError) as caught:
+            Handler._read_request_body(handler, ("text/csv",), max_body_bytes=128)
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.code, "invalid_csv")
+        self.assertEqual(caught.exception.details[0]["field"], "body")
+
     def test_problem_error_is_selected_and_has_accept_vary(self):
         handler = make_handler(
             "/missing?private=1",

@@ -32,6 +32,20 @@ service does not decompress request bodies; a request
 with `Content-Encoding` other than `identity` receives
 `415 unsupported_content_encoding` after authentication.
 
+## CSV transfer
+
+`GET /exports/products.csv` and `GET /exports/orders.csv` return filtered CSV
+attachments. Product exports accept `category`, `active`, `in_stock`, and `q`;
+order exports accept `status` and `customer_id`. Import with
+`POST /imports/products` or `POST /imports/orders` using `Content-Type: text/csv`
+and a write API key. Imports accept `mode=validate` to check rows without
+writing, and `on_error=skip` to apply valid rows when other rows fail; defaults
+are `mode=apply` and `on_error=abort`. Reports include per-row errors. Exports
+include at most 1000 records; imports require 1–200 records and at most 65536
+bytes of UTF-8 CSV (an optional BOM is accepted). Exported IDs, timestamps, and
+order status/item counts are ignored on import; orders use the legacy form
+without items. Spreadsheet formula prefixes in text cells are escaped.
+
 ## API key roles
 
 The configured bootstrap key is an immutable `admin` key. Key roles form the

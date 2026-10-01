@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 import threading
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from agent_qa.conditional import check_expected_version
 from agent_qa.context import get_context
 from agent_qa.bulk import run_bulk, validate_bulk_input
+from agent_qa.csvio import coerce_row
 from agent_qa.errors import ApiError
 from agent_qa.pagination import (
     decode_cursor,
@@ -32,6 +34,8 @@ from agent_qa.schemas import (
     SCHEMAS,
 )
 from agent_qa.validation import validate
+
+logger = logging.getLogger(__name__)
 
 _MAX_QUERY_PAIRS = 1000
 _MAX_QUERY_TEXT_LENGTH = 4096
@@ -384,6 +388,156 @@ class ProductStore:
                 self._next_id = next_id_snapshot
 
             return run_bulk(items, apply_one, rollback, atomic)
+
+    def export_rows(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return at most 1000 matching products for CSV export."""
+        allowed = {"category", "active", "in_stock", "q"}
+        unsupported = set(filters) - allowed
+        if unsupported:
+            raise _invalid_query(
+                [
+                    {"field": key, "message": "Unsupported query parameter"}
+                    for key in unsupported
+                ]
+            )
+        _validate_store_query({**filters, "limit": 1})
+        with self._lock:
+            matched = []
+            for product_id in sorted(self._products):
+                product = self._products[product_id]
+                if (
+                    filters.get("category") is not None
+                    and product["category"] != filters["category"]
+                ):
+                    continue
+                if (
+                    filters.get("active") is not None
+                    and product["active"] != filters["active"]
+                ):
+                    continue
+                if filters.get("in_stock") is True and product["stock"] <= 0:
+                    continue
+                if filters.get("in_stock") is False and product["stock"] > 0:
+                    continue
+                search = filters.get("q")
+                if search is not None:
+                    needle = search.casefold()
+                    searchable = [product["name"], product["sku"], *product["tags"]]
+                    if not any(needle in value.casefold() for value in searchable):
+                        continue
+                matched.append(_copy_product(product))
+                if len(matched) == 1000:
+                    break
+            return matched
+
+    def import_rows(
+        self,
+        rows: list[tuple[int, dict[str, str]]],
+        mode: str = "apply",
+        on_error: str = "abort",
+    ) -> tuple[int, dict[str, Any]]:
+        """Validate CSV rows and optionally create all valid products atomically."""
+        if mode not in {"apply", "validate"} or on_error not in {"abort", "skip"}:
+            raise ValueError("invalid import policy")
+        with self._lock:
+            existing = {product["sku"] for product in self._products.values()}
+            seen: set[str] = set()
+            prepared: list[tuple[int, dict[str, Any]]] = []
+            errors: list[dict[str, Any]] = []
+            for line, raw in rows:
+                fields = coerce_row("products", raw)
+                sku = fields["sku"]
+                duplicate_in_file = bool(sku) and sku in seen
+                if sku:
+                    seen.add(sku)
+                duplicate_existing = not duplicate_in_file and sku in existing
+                if duplicate_in_file:
+                    errors.append(
+                        {
+                            "line": line,
+                            "field": "sku",
+                            "message": "Duplicate sku in file",
+                        }
+                    )
+                elif duplicate_existing:
+                    errors.append(
+                        {
+                            "line": line,
+                            "field": "sku",
+                            "message": "SKU already exists",
+                        }
+                    )
+                try:
+                    valid = validate_create(fields)
+                    if not duplicate_in_file and not duplicate_existing:
+                        prepared.append((line, valid))
+                except ApiError as error:
+                    details = error.details or [
+                        {"field": "row", "message": error.message}
+                    ]
+                    errors.extend(
+                        {
+                            "line": line,
+                            "field": detail["field"],
+                            "message": detail["message"],
+                        }
+                        for detail in details
+                    )
+
+            created = 0
+            applied = False
+            should_apply = mode == "apply" and (not errors or on_error == "skip")
+            if should_apply and prepared:
+                if len(self._products) + len(prepared) > self._capacity:
+                    errors.append(
+                        {
+                            "line": prepared[-1][0],
+                            "field": "row",
+                            "message": "Product store is full",
+                        }
+                    )
+                    prepared = []
+                    should_apply = False
+                else:
+                    products_snapshot = deepcopy(self._products)
+                    next_id_snapshot = self._next_id
+                    try:
+                        for _line, fields in prepared:
+                            product_id = self._next_id
+                            self._next_id += 1
+                            timestamp = _now()
+                            product = {
+                                "id": product_id,
+                                **fields,
+                                "created_at": timestamp,
+                                "updated_at": timestamp,
+                                "version": 1,
+                            }
+                            self._products[product_id] = product
+                            created += 1
+                    except Exception:
+                        logger.exception("Unexpected error applying product CSV import")
+                        self._products.clear()
+                        self._products.update(products_snapshot)
+                        self._next_id = next_id_snapshot
+                        raise
+                    applied = created > 0
+            if mode == "validate":
+                status = 200
+            elif errors and on_error == "abort":
+                status = 422
+            elif errors and created == 0:
+                status = 422
+            else:
+                status = 201
+            return status, {
+                "mode": mode,
+                "rows": len(rows),
+                "created": created,
+                "failed": len({error["line"] for error in errors}),
+                "applied": applied,
+                "errors": errors,
+            }
 
     def get(
         self, product_id: int, *, include_version: bool = False

@@ -11,6 +11,7 @@ from agent_qa import auth, settings
 from agent_qa.audit import AUDIT_LOG
 from agent_qa.config import FIXTURE_PATH, GIT_SHA, job_retention, job_workers
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
+from agent_qa.csvio import ORDER_COLUMNS, PRODUCT_COLUMNS, parse_csv, render_csv
 from agent_qa.context import get_context
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
@@ -605,6 +606,174 @@ def list_products(
     if _if_none_match(request_headers, etag):
         return 304, None, headers
     return 200, body, headers
+
+
+def _csv_filters(query: list[tuple[str, str]], resource: str) -> dict[str, object]:
+    """Validate only the filters supported by the CSV export endpoints."""
+    allowed = {
+        "products": {"category", "active", "in_stock", "q"},
+        "orders": {"status", "customer_id"},
+    }[resource]
+    errors = []
+    seen = set()
+    filtered = []
+    for index, pair in enumerate(query):
+        if index >= 10:
+            errors.append({"field": "query", "message": "Too many query parameters"})
+            break
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            errors.append({"field": "query", "message": "Invalid query parameter"})
+            continue
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str):
+            errors.append({"field": str(name), "message": "Invalid query parameter"})
+        elif len(name) > 128 or len(value) > 4096:
+            errors.append(
+                {"field": name[:128], "message": "Query parameter is too long"}
+            )
+        elif name not in allowed:
+            errors.append({"field": name, "message": "Unsupported query parameter"})
+        elif name in seen:
+            errors.append({"field": name, "message": "Parameter may appear once"})
+        else:
+            seen.add(name)
+            filtered.append((name, value))
+    if errors:
+        raise ApiError(400, "invalid_query", "Invalid query parameters", errors)
+    parsed = (
+        validate_product_query(filtered)
+        if resource == "products"
+        else validate_query(filtered)
+    )
+    return {name: parsed[name] for name in allowed if name in parsed}
+
+
+def _csv_response(
+    filename: str,
+    columns: tuple[str, ...],
+    rows: list[dict[str, object]],
+) -> tuple[int, str, dict[str, str]]:
+    text_columns = tuple(
+        name
+        for name in columns
+        if name
+        not in {
+            "id",
+            "price_cents",
+            "stock",
+            "total_cents",
+            "items_count",
+            "active",
+        }
+    )
+    return (
+        200,
+        render_csv(columns, rows, text_columns=text_columns),
+        {
+            "Content-Type": "text/csv; charset=utf-8",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+def export_products_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, str, dict[str, str]]:
+    """Export filtered products as a bounded CSV representation."""
+    filters = _csv_filters(query, "products")
+    return _csv_response(
+        "products.csv", PRODUCT_COLUMNS, PRODUCT_STORE.export_rows(filters)
+    )
+
+
+def export_orders_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, str, dict[str, str]]:
+    """Export filtered orders as a bounded CSV representation."""
+    filters = _csv_filters(query, "orders")
+    return _csv_response("orders.csv", ORDER_COLUMNS, ORDER_STORE.export_rows(filters))
+
+
+def _csv_import_options(query: list[tuple[str, str]]) -> tuple[str, str]:
+    values = {}
+    errors = []
+    for index, pair in enumerate(query):
+        if index >= 10:
+            errors.append({"field": "query", "message": "Too many query parameters"})
+            break
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            errors.append({"field": "query", "message": "Invalid query parameter"})
+            continue
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str):
+            errors.append({"field": str(name), "message": "Invalid query parameter"})
+        elif len(name) > 128 or len(value) > 16:
+            errors.append(
+                {"field": name[:128], "message": "Query parameter is too long"}
+            )
+        elif name not in {"mode", "on_error"}:
+            errors.append({"field": name, "message": "Unsupported query parameter"})
+        elif name in values:
+            errors.append({"field": name, "message": "Parameter may appear once"})
+        else:
+            values[name] = value
+    mode = values.get("mode", "apply")
+    on_error = values.get("on_error", "abort")
+    if mode not in {"apply", "validate"}:
+        errors.append({"field": "mode", "message": "Must be apply or validate"})
+    if on_error not in {"abort", "skip"}:
+        errors.append({"field": "on_error", "message": "Must be abort or skip"})
+    if errors:
+        raise ApiError(400, "invalid_query", "Invalid query parameters", errors)
+    return mode, on_error
+
+
+def _import_csv(
+    resource: str, query: list[tuple[str, str]], payload: object
+) -> tuple[int, dict[str, object], dict[str, str]]:
+    if not isinstance(payload, str):
+        raise ApiError(
+            400,
+            "invalid_csv",
+            "Request body must be CSV",
+            [{"field": "body", "message": "Must be CSV text"}],
+        )
+    mode, on_error = _csv_import_options(query)
+    rows = parse_csv(payload, resource)
+    store = PRODUCT_STORE if resource == "products" else ORDER_STORE
+    status, report = store.import_rows(rows, mode=mode, on_error=on_error)
+    context = get_context()
+    if context is not None:
+        context.resource = resource
+        context.changes = {
+            "summary": {
+                "created": report.get("created", 0),
+                "failed": report.get("failed", 0),
+            }
+        }
+    return status, report, {}
+
+
+def import_products_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, dict[str, object], dict[str, str]]:
+    """Validate or atomically import products from CSV."""
+    return _import_csv("products", query, payload)
+
+
+def import_orders_csv(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, dict[str, object], dict[str, str]]:
+    """Validate or atomically import orders from CSV."""
+    return _import_csv("orders", query, payload)
 
 
 _SEARCH_SORTS = {"orders": ("id", "-id"), "products": PRODUCT_SORTS}
@@ -1773,6 +1942,183 @@ _KEY_LIST_RESPONSE_SCHEMA = {
     },
     "additionalProperties": False,
 }
+
+_CSV_IMPORT_REPORT_SCHEMA = {
+    "type": "object",
+    "required": ["mode", "rows", "created", "failed", "applied", "errors"],
+    "properties": {
+        "mode": {"type": "string", "enum": ["apply", "validate"]},
+        "rows": {"type": "integer", "minimum": 0, "maximum": 200},
+        "created": {"type": "integer", "minimum": 0, "maximum": 200},
+        "failed": {"type": "integer", "minimum": 0, "maximum": 200},
+        "applied": {"type": "boolean"},
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["line", "field", "message"],
+                "properties": {
+                    "line": {"type": "integer", "minimum": 2, "maximum": 201},
+                    "field": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+_CSV_ROUTES = (
+    {
+        "method": "GET",
+        "path": "/exports/products.csv",
+        "handler": export_products_csv,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "exportProductsCsv",
+        "summary": "Export filtered products as CSV",
+        "produces": ["text/csv"],
+        "parameters": [
+            {
+                "name": "category",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "string"},
+            },
+            {
+                "name": "active",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "boolean"},
+            },
+            {
+                "name": "in_stock",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "boolean"},
+            },
+            {
+                "name": "q",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "string", "maxLength": MAX_PRODUCT_QUERY_LENGTH},
+            },
+        ],
+        "responses": ["200", "400", "403"],
+        "error_responses": {
+            "400": "Invalid or unsupported export filter (invalid_query)."
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/exports/orders.csv",
+        "handler": export_orders_csv,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "exportOrdersCsv",
+        "summary": "Export filtered orders as CSV",
+        "produces": ["text/csv"],
+        "parameters": [
+            {
+                "name": "status",
+                "in": "query",
+                "required": False,
+                "schema": _STATUS_SCHEMA,
+            },
+            {
+                "name": "customer_id",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "string"},
+            },
+        ],
+        "responses": ["200", "400", "403"],
+        "error_responses": {
+            "400": "Invalid or unsupported export filter (invalid_query)."
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/imports/products",
+        "handler": import_products_csv,
+        "body": True,
+        "consumes": ["text/csv"],
+        "max_body_bytes": 65536,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "importProductsCsv",
+        "summary": "Validate or import products from CSV",
+        "parameters": [
+            {
+                "name": "mode",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "string",
+                    "enum": ["apply", "validate"],
+                    "default": "apply",
+                },
+            },
+            {
+                "name": "on_error",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "string",
+                    "enum": ["abort", "skip"],
+                    "default": "abort",
+                },
+            },
+        ],
+        "responses": ["200", "201", "400", "401", "403", "413", "415", "422"],
+        "response_schemas": {
+            "200": _CSV_IMPORT_REPORT_SCHEMA,
+            "201": _CSV_IMPORT_REPORT_SCHEMA,
+            "422": _CSV_IMPORT_REPORT_SCHEMA,
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/imports/orders",
+        "handler": import_orders_csv,
+        "body": True,
+        "consumes": ["text/csv"],
+        "max_body_bytes": 65536,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "importOrdersCsv",
+        "summary": "Validate or import orders from CSV",
+        "parameters": [
+            {
+                "name": "mode",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "string",
+                    "enum": ["apply", "validate"],
+                    "default": "apply",
+                },
+            },
+            {
+                "name": "on_error",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "string",
+                    "enum": ["abort", "skip"],
+                    "default": "abort",
+                },
+            },
+        ],
+        "responses": ["200", "201", "400", "401", "403", "413", "415", "422"],
+        "response_schemas": {
+            "200": _CSV_IMPORT_REPORT_SCHEMA,
+            "201": _CSV_IMPORT_REPORT_SCHEMA,
+            "422": _CSV_IMPORT_REPORT_SCHEMA,
+        },
+    },
+)
 
 ROUTES = (
     {
@@ -3032,4 +3378,5 @@ ROUTES = (
             "404": "The sequence is not retained (audit_entry_not_found)."
         },
     },
+    *_CSV_ROUTES,
 )
