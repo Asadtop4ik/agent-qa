@@ -768,6 +768,7 @@ class ProductApiTests(unittest.TestCase):
                 "415",
                 "428",
                 "429",
+                "503",
             },
         )
 

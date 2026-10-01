@@ -122,6 +122,8 @@ class RoleApiTests(unittest.TestCase):
                     path = path.replace(part, "sample")
                 if route["path"].startswith(
                     (
+                        "/admin/stats",
+                        "/admin/maintenance",
                         "/admin/keys",
                         "/admin/tenants",
                         "/admin/rate-limits",
