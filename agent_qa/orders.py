@@ -319,6 +319,51 @@ class OrderStore:
                 total,
             )
 
+    def search(
+        self,
+        predicate: Any,
+        *,
+        sort: str = "id",
+        limit: int = DEFAULT_LIMIT,
+        offset: int = DEFAULT_OFFSET,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return one filtered order snapshot using offset pagination."""
+        if not callable(predicate):
+            raise OrderError("invalid_query", "Invalid query parameters")
+        if not isinstance(sort, str) or sort not in {"id", "-id"}:
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": "sort", "message": "Unsupported sort order"}],
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not MIN_LIMIT <= limit <= MAX_LIMIT
+        ):
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": "limit", "message": "Invalid limit"}],
+            )
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not MIN_OFFSET <= offset <= (1 << 63) - 1
+        ):
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": "offset", "message": "Invalid offset"}],
+            )
+        with self._lock:
+            matched = [order for order in self._orders.values() if predicate(order)]
+            matched.sort(key=lambda order: order["id"], reverse=sort == "-id")
+            return (
+                [self._copy_order(order) for order in matched[offset : offset + limit]],
+                len(matched),
+            )
+
     def summary_snapshot(self) -> dict[str, Any]:
         """Return aggregate values from one consistent order-store snapshot."""
         with self._lock:

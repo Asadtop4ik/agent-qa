@@ -369,6 +369,20 @@ class RouteUnitTests(unittest.TestCase):
             [(route["path"], params) for route, params in _path_routes("/orders/bulk")],
             [("/orders/bulk", {})],
         )
+        self.assertEqual(
+            [
+                (route["path"], params)
+                for route, params in _path_routes("/orders/search")
+            ],
+            [("/orders/search", {})],
+        )
+        self.assertEqual(
+            [
+                (route["path"], params)
+                for route, params in _path_routes("/products/search")
+            ],
+            [("/products/search", {})],
+        )
         self.assertEqual(allowed_methods("/orders/bulk"), "POST")
         for method in ("GET", "PUT", "DELETE"):
             handler, responses = self.make_dispatcher("/orders/bulk", b"", method)

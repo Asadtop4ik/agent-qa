@@ -15,6 +15,7 @@ from agent_qa import orders, products, schemas
 from agent_qa.openapi import build_openapi
 from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.routes import ROUTES
+from agent_qa.searchdsl import FIELD_METADATA, supported_operators
 from agent_qa.schemas import SCHEMAS
 
 
@@ -23,6 +24,62 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_search_routes_document_metadata_responses_and_ready_contract(self):
+        spec = build_openapi(ROUTES, "search-drift")
+        paths = spec["paths"]
+        for path, resource in (
+            ("/orders/search", "orders"),
+            ("/products/search", "products"),
+        ):
+            operation = paths[path]["get"]
+            self.assertNotIn("security", operation)
+            parameters = {item["name"]: item for item in operation["parameters"]}
+            self.assertTrue(parameters["q"]["required"])
+            self.assertEqual(parameters["q"]["schema"]["maxLength"], 500)
+            for field, metadata in FIELD_METADATA[resource].items():
+                expected = f"{field} ({metadata['type']})"
+                self.assertIn(expected, parameters["q"]["description"])
+                for operator in supported_operators(metadata):
+                    rendered = operator.upper() if operator == "in" else operator
+                    self.assertIn(rendered, parameters["q"]["description"])
+            self.assertEqual(parameters["sort"]["schema"]["default"], "id")
+            self.assertEqual(parameters["limit"]["schema"]["minimum"], 1)
+            self.assertEqual(parameters["offset"]["schema"]["maximum"], (1 << 63) - 1)
+            item_schema = operation["responses"]["200"]["content"]["application/json"][
+                "schema"
+            ]["properties"]["items"]["items"]
+            component = "Order" if resource == "orders" else "Product"
+            self.assertEqual(item_schema["$ref"], f"#/components/schemas/{component}")
+            self.assertIn(
+                "details.position", operation["responses"]["400"]["description"]
+            )
+
+        explain = paths["/search/explain"]["get"]
+        parameters = {item["name"]: item for item in explain["parameters"]}
+        self.assertEqual(parameters["resource"]["schema"]["enum"], list(FIELD_METADATA))
+        self.assertTrue(parameters["q"]["required"])
+        self.assertIn("active (bool)", parameters["q"]["description"])
+        explain_schema = explain["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        self.assertEqual(
+            explain_schema["properties"]["resource"]["enum"], list(FIELD_METADATA)
+        )
+        self.assertEqual(explain_schema["properties"]["ast"], {"type": "object"})
+        self.assertIn(
+            "position",
+            SCHEMAS["Error"]["properties"]["error"]["properties"]["details"]["items"][
+                "properties"
+            ],
+        )
+        ready_route = next(route for route in ROUTES if route["path"] == "/ready")
+        self.assertEqual(
+            paths["/ready"]["get"]["responses"]["200"]["content"]["application/json"][
+                "schema"
+            ],
+            ready_route["response_schemas"]["200"],
+        )
+
     def test_outbox_routes_roles_schemas_and_error_responses_match_openapi(self):
         spec = build_openapi(ROUTES, "outbox-drift")
         expected_roles = {
@@ -671,6 +728,8 @@ class OpenApiDriftTests(unittest.TestCase):
             {
                 ("post", "/products"),
                 ("get", "/products"),
+                ("get", "/products/search"),
+                ("get", "/search/explain"),
                 ("get", "/products/{id}"),
                 ("patch", "/products/{id}"),
                 ("delete", "/products/{id}"),

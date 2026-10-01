@@ -8,9 +8,68 @@ import subprocess
 import sys
 import time
 import unittest
+from email.message import Message
+from io import BytesIO
 import uuid
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from agent_qa.errors import ApiError
+from agent_qa.orders import OrderStore
+from agent_qa.server import Handler
+
+
+class OrdersSearchRouteTests(unittest.TestCase):
+    """Socket-free checks for public order search routing."""
+
+    def setUp(self):
+        self.store = OrderStore()
+        self.store_patch = patch("agent_qa.routes.ORDER_STORE", self.store)
+        self.store_patch.start()
+
+    def tearDown(self):
+        self.store_patch.stop()
+
+    @staticmethod
+    def dispatch(method, path):
+        headers = Message()
+        responses = []
+        handler = object.__new__(Handler)
+        handler.path = path
+        handler.command = method
+        handler.headers = headers
+        handler.rfile = BytesIO()
+        handler.request_id = "orders-search-test"
+        handler._json = lambda *args: responses.append(args)
+        try:
+            Handler._dispatch(handler)
+        except ApiError as error:
+            return error.status, {
+                "error": {"code": error.code, "details": error.details}
+            }
+        _, body, _ = responses[0]
+        return 200, body
+
+    def test_order_search_route_applies_query_and_offset_sort(self):
+        first = self.store.create("search-customer", 100)
+        second = self.store.create("search-customer", 200)
+        status, body = self.dispatch(
+            "GET",
+            "/orders/search?q=customer_id=search-customer&sort=-id&limit=1&offset=1",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["items"], [first])
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["offset"], 1)
+        self.assertEqual(body["query"]["terms"], 1)
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_order_search_route_returns_positioned_parse_error(self):
+        status, body = self.dispatch("GET", "/orders/search?q=total_cents%3D")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_search_query")
+        self.assertEqual(body["error"]["details"][0]["position"], "12")
 
 
 class OrdersApiTests(unittest.TestCase):
@@ -179,6 +238,32 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(next_body["items"], [second])
         self.assertIsNone(next_body["next_cursor"])
         self.assertNotIn("Link", next_headers)
+
+    def test_search_query_endpoint_and_offset_pagination(self):
+        customer = self.customer_id()
+        first = self.create_order(customer, 1000)
+        second = self.create_order(customer, 2000)
+        status, _, body = self.request(
+            "GET",
+            f"/orders/search?q=customer_id={customer}&sort=-id&limit=1&offset=1",
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "offset", "query"})
+        self.assertEqual(body["total"], 2)
+        self.assertEqual(body["limit"], 1)
+        self.assertEqual(body["offset"], 1)
+        self.assertEqual(body["items"], [first])
+        self.assertEqual(
+            body["query"],
+            {"normalized": f"customer_id = {customer}", "terms": 1},
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        self.assert_error(
+            self.request("GET", "/orders/search?sort=id"), 400, "invalid_query"
+        )
+        malformed = self.request("GET", "/orders/search?q=total_cents%3D")
+        error = self.assert_error(malformed, 400, "invalid_search_query")
+        self.assertEqual(error["details"][0]["position"], "12")
 
     def test_query_validation(self):
         for query in (

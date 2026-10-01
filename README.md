@@ -58,6 +58,17 @@ service restart.
 For example, `GET /orders?status=new&sort=-id&limit=20&pagination=cursor` starts
 a cursor-paginated order listing.
 
+## Search DSL
+
+`GET /orders/search?q=...` and `GET /products/search?q=...` search their
+collections with `sort`, `limit`, and offset-based `offset` pagination. Queries
+support `AND`, `OR`, `NOT`, parentheses, implicit `AND`, comparisons, `~`
+substring matching, and `IN (...)`. For example,
+`GET /products/search?q=category:tools%20AND%20active=true` finds active tools.
+`GET /search/explain?resource=products&q=active=true` returns the normalized
+query and its AST. Syntax errors use `400 invalid_search_query` and include the
+zero-based character position in `details`.
+
 ## Conditional requests
 
 Order and product item responses include opaque ETags tied to the service
