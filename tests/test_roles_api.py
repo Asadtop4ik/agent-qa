@@ -108,9 +108,9 @@ class RoleApiTests(unittest.TestCase):
                 route.pop("request_schema", None)
                 route["handler"] = lambda *_args, **_kwargs: (204, None, {})
                 path = route["path"]
-                for part in ("{id}", "{name}", "{key_id}"):
+                for part in ("{id}", "{name}", "{key_id}", "{seq}"):
                     path = path.replace(part, "sample")
-                if route["path"].startswith("/admin/keys"):
+                if route["path"].startswith(("/admin/keys", "/audit")):
                     required_role = "admin"
                 elif route["path"] == "/whoami":
                     required_role = "read"

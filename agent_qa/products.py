@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 from agent_qa.conditional import check_expected_version
+from agent_qa.context import get_context
 from agent_qa.bulk import run_bulk, validate_bulk_input
 from agent_qa.errors import ApiError
 from agent_qa.pagination import (
@@ -421,6 +422,11 @@ class ProductStore:
             check_expected_version(
                 expected_version, "product", product_id, current["version"]
             )
+            context = get_context()
+            if context is not None:
+                context.resource = "products"
+                context.resource_id = product_id
+                context.changes = None
             updated_at = _next_timestamp(current["updated_at"])
             updated = {
                 **current,
@@ -429,6 +435,14 @@ class ProductStore:
                 "version": current["version"] + 1,
             }
             self._products[product_id] = updated
+            if context is not None:
+                changed = {
+                    name: {"from": current[name], "to": value}
+                    for name, value in fields.items()
+                    if current.get(name) != value
+                }
+                if changed:
+                    context.changes = changed
             return _copy_product(updated, include_version)
 
     def delete(
@@ -450,6 +464,10 @@ class ProductStore:
             check_expected_version(
                 expected_version, "product", product_id, current["version"]
             )
+            context = get_context()
+            if context is not None:
+                context.resource = "products"
+                context.resource_id = product_id
             del self._products[product_id]
             return True
 
@@ -497,7 +515,20 @@ class ProductStore:
             check_expected_version(
                 expected_version, "product", product_id, current["version"]
             )
+            context = get_context()
+            if context is not None:
+                context.resource = "products"
+                context.resource_id = product_id
+                context.changes = None
             updated = self._change_stock_locked(product_id, valid["delta"])
+            if context is not None and updated is not None:
+                if updated["stock"] != current["stock"]:
+                    context.changes = {
+                        "stock": {
+                            "from": current["stock"],
+                            "to": updated["stock"],
+                        }
+                    }
             return (
                 _copy_product(updated, include_version) if updated is not None else None
             )

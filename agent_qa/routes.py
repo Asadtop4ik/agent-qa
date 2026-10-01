@@ -7,8 +7,10 @@ import platform
 from urllib.parse import quote, urlencode
 
 from agent_qa import auth
+from agent_qa.audit import AUDIT_LOG
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
+from agent_qa.context import get_context
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
@@ -24,7 +26,7 @@ from agent_qa.schemas import (
     PRODUCT_SORTS,
     SCHEMAS,
 )
-from agent_qa.validation import validate
+from agent_qa.validation import validate, validate_query_params
 from agent_qa.orders import (
     OrderStore,
     validate_create,
@@ -155,9 +157,16 @@ def metrics(
     """Return a Prometheus snapshot of service metrics."""
     order_count = ORDER_STORE.list(limit=1)[1]
     product_count = PRODUCT_STORE.list(limit=1)[1]
+    audit_entries, audit_dropped = AUDIT_LOG.metrics_snapshot()
     return (
         200,
-        REGISTRY.render(order_count, GIT_SHA, products=product_count),
+        REGISTRY.render(
+            order_count,
+            GIT_SHA,
+            products=product_count,
+            audit_entries=audit_entries,
+            audit_dropped=audit_dropped,
+        ),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
 
@@ -372,6 +381,10 @@ def create_orders_bulk(
     status, body = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create_bulk(
         values.get("items"), values.get("atomic", False)
     )
+    context = get_context()
+    if context is not None and isinstance(body, dict):
+        context.resource = "orders"
+        context.changes = {"summary": dict(body.get("summary", {}))}
     return status, body, {}
 
 
@@ -513,6 +526,10 @@ def create_products_bulk(
     status, body = PRODUCT_STORE.create_bulk(
         values.get("items"), values.get("atomic", False)
     )
+    context = get_context()
+    if context is not None and isinstance(body, dict):
+        context.resource = "products"
+        context.changes = {"summary": dict(body.get("summary", {}))}
     return status, body, {}
 
 
@@ -658,6 +675,36 @@ def categories(
     return 200, {"items": items, "total": len(items)}, {}
 
 
+def list_audit(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return bounded, filtered audit entries for administrators."""
+    filters = validate_query_params(_AUDIT_QUERY_PARAMETERS, query)
+    return 200, AUDIT_LOG.query(**filters), {}
+
+
+def get_audit_entry(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return one retained audit entry by its sequence number."""
+    raw_seq = (path_params or {}).get("seq", "")
+    if len(raw_seq) > 20 or not raw_seq.isascii() or not raw_seq.isdigit():
+        entry = None
+    else:
+        try:
+            seq = int(raw_seq)
+        except ValueError:
+            seq = 0
+        entry = AUDIT_LOG.get(seq) if seq > 0 else None
+    if entry is None:
+        raise ApiError(404, "audit_entry_not_found", "Audit entry not found")
+    return 200, entry, {}
+
+
 _ORDER_ID = {
     "name": "id",
     "in": "path",
@@ -701,6 +748,133 @@ _PRODUCT_RESPONSE_SCHEMA = SCHEMAS["Product"]
 _PRODUCT_LIST_RESPONSE_SCHEMA = SCHEMAS["ProductList"]
 _ADJUST_STOCK_SCHEMA = SCHEMAS["AdjustStock"]
 _CATEGORY_LIST_RESPONSE_SCHEMA = SCHEMAS["CategoryList"]
+_AUDIT_QUERY_PARAMETERS = [
+    {
+        "name": "method",
+        "in": "query",
+        "schema": {"type": "string", "enum": ["POST", "PUT", "PATCH", "DELETE"]},
+    },
+    {
+        "name": "resource",
+        "in": "query",
+        "schema": {"type": "string", "enum": ["orders", "products", "keys"]},
+    },
+    {
+        "name": "resource_id",
+        "in": "query",
+        "schema": {"type": "string", "maxLength": 64},
+    },
+    {
+        "name": "outcome",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": ["success", "denied", "rejected", "error"],
+        },
+    },
+    {
+        "name": "actor",
+        "in": "query",
+        "schema": {"type": "string", "maxLength": 128},
+    },
+    {
+        "name": "status",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 100, "maximum": 599},
+    },
+    {
+        "name": "since_seq",
+        "in": "query",
+        "schema": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": (1 << 63) - 1,
+            "default": 0,
+        },
+    },
+    {
+        "name": "limit",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+    },
+    {
+        "name": "order",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": ["asc", "desc"],
+            "default": "desc",
+        },
+    },
+]
+_AUDIT_ENTRY_SCHEMA = {
+    "type": "object",
+    "required": [
+        "seq",
+        "ts",
+        "actor",
+        "role",
+        "method",
+        "route",
+        "path",
+        "resource",
+        "resource_id",
+        "status",
+        "outcome",
+        "request_id",
+        "changes",
+    ],
+    "properties": {
+        "seq": {"type": "integer", "minimum": 1},
+        "ts": {"type": "string", "format": "date-time"},
+        "actor": {"type": "string", "minLength": 1, "maxLength": 128},
+        "role": {
+            "type": "string",
+            "enum": ["read", "write", "admin"],
+            "nullable": True,
+        },
+        "method": {"type": "string", "enum": ["POST", "PUT", "PATCH", "DELETE"]},
+        "route": {"type": "string"},
+        "path": {"type": "string"},
+        "resource": {
+            "type": "string",
+            "enum": ["orders", "products", "keys"],
+            "nullable": True,
+        },
+        "resource_id": {
+            "oneOf": [{"type": "integer"}, {"type": "string", "nullable": True}],
+        },
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "outcome": {
+            "type": "string",
+            "enum": ["success", "denied", "rejected", "error"],
+        },
+        "request_id": {"type": "string"},
+        "changes": {"type": "object", "nullable": True},
+        "replay": {"type": "boolean", "enum": [True]},
+    },
+    "additionalProperties": False,
+}
+_AUDIT_LIST_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": [
+        "items",
+        "total_matching",
+        "limit",
+        "capacity",
+        "dropped",
+        "last_seq",
+    ],
+    "properties": {
+        "items": {"type": "array", "items": _AUDIT_ENTRY_SCHEMA},
+        "total_matching": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        "capacity": {"type": "integer", "minimum": 10, "maximum": 5000},
+        "dropped": {"type": "integer", "minimum": 0},
+        "last_seq": {"type": "integer", "minimum": 0},
+    },
+    "additionalProperties": False,
+}
 _PRODUCT_QUERY_PARAMETERS = [
     {
         "name": "category",
@@ -1620,5 +1794,46 @@ ROUTES = (
         "summary": "Read product category aggregates",
         "responses": ["200", "403"],
         "response_schemas": {"200": _CATEGORY_LIST_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/audit",
+        "handler": list_audit,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "listAuditEntries",
+        "summary": "Filter retained audit entries",
+        "parameters": _AUDIT_QUERY_PARAMETERS,
+        "responses": ["200", "400", "401", "403"],
+        "response_schemas": {"200": _AUDIT_LIST_RESPONSE_SCHEMA},
+        "error_responses": {
+            "400": "Invalid, unknown, or repeated query parameter (invalid_query)."
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/audit/{seq}",
+        "handler": get_audit_entry,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "getAuditEntry",
+        "summary": "Read one retained audit entry",
+        "parameters": [
+            {
+                "name": "seq",
+                "in": "path",
+                "required": True,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": (1 << 63) - 1,
+                },
+            }
+        ],
+        "responses": ["200", "401", "403", "404"],
+        "response_schemas": {"200": _AUDIT_ENTRY_SCHEMA},
+        "error_responses": {
+            "404": "The sequence is not retained (audit_entry_not_found)."
+        },
     },
 )

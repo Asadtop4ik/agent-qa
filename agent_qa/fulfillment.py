@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_qa.bulk import run_bulk, validate_bulk_input
 from agent_qa.conditional import check_expected_version
+from agent_qa.context import get_context
 from agent_qa.errors import ApiError
 from agent_qa.orders import OrderError, OrderStore, validate_create, validate_patch
 from agent_qa.products import ProductStore
@@ -201,6 +202,9 @@ class FulfillmentService:
             except Exception as error:
                 self._products._restore_stock_locked(stock_snapshot)
                 self._orders._orders[order_id] = order_snapshot
+                context = get_context()
+                if context is not None:
+                    context.changes = None
                 if not isinstance(error, (ApiError, OrderError)):
                     logger.exception("Unexpected failure cancelling item order")
                 raise

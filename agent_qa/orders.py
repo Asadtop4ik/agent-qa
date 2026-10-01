@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from agent_qa.conditional import check_expected_version
+from agent_qa.context import get_context
 from agent_qa.pagination import (
     decode_cursor,
     encode_cursor,
@@ -345,6 +346,11 @@ class OrderStore:
             check_expected_version(
                 expected_version, "order", order_id, current["version"]
             )
+            context = get_context()
+            if context is not None:
+                context.resource = "orders"
+                context.resource_id = order_id
+                context.changes = None
             if "total_cents" in fields and current.get("items"):
                 from agent_qa.errors import ApiError
 
@@ -369,6 +375,14 @@ class OrderStore:
                     )
             updated = {**current, **fields, "version": current["version"] + 1}
             self._orders[order_id] = updated
+            if context is not None:
+                changed = {
+                    name: {"from": current[name], "to": value}
+                    for name, value in fields.items()
+                    if current.get(name) != value
+                }
+                if changed:
+                    context.changes = changed
             return self._copy_order(updated, include_version)
 
     def delete(
@@ -386,5 +400,9 @@ class OrderStore:
             check_expected_version(
                 expected_version, "order", order_id, current["version"]
             )
+            context = get_context()
+            if context is not None:
+                context.resource = "orders"
+                context.resource_id = order_id
             del self._orders[order_id]
             return True

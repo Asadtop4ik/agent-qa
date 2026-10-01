@@ -104,6 +104,14 @@ maximum of 500 saved keys.
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.
 
+## Audit log
+
+`GET /audit` and `GET /audit/{seq}` are admin-only views of the in-memory audit
+ring buffer. The list endpoint supports method, resource, actor, outcome, status,
+resource ID, sequence, order, and limit filters; entries include only selected
+field changes and never retain request bodies or API key values. Set
+`AGENT_QA_AUDIT_CAPACITY` to configure retention (10–5000 entries, default 500).
+
 ## Layout
 
 - `app.py` starts the HTTP service.
