@@ -123,6 +123,7 @@ class RoleApiTests(unittest.TestCase):
                 if route["path"].startswith(
                     (
                         "/admin/keys",
+                        "/admin/tenants",
                         "/admin/rate-limits",
                         "/admin/config",
                         "/audit",

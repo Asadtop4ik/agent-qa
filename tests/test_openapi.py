@@ -72,7 +72,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             self.assertIn("text/csv", operation["responses"]["200"]["content"])
             self.assertEqual(
                 {parameter["name"] for parameter in operation["parameters"]},
-                query_names,
+                query_names | {"X-Tenant"},
             )
         for path in ("/imports/products", "/imports/orders"):
             route = routes[("post", path)]
@@ -296,10 +296,14 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "since_seq",
                 "limit",
                 "order",
+                "tenant",
+                "X-Tenant",
             },
         )
         self.assertEqual(
-            listing["parameters"][-1]["schema"],
+            next(item for item in listing["parameters"] if item["name"] == "order")[
+                "schema"
+            ],
             {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
         )
         listing_schema = listing["responses"]["200"]["content"]["application/json"][
@@ -393,16 +397,15 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             "#/components/schemas/JobError",
         )
         self.assertTrue(spec["components"]["schemas"]["JobError"]["nullable"])
-        self.assertEqual(
-            spec["paths"]["/jobs/{id}"]["get"]["parameters"][-1]["name"],
+        self.assertIn(
             "wait_ms",
+            {item["name"] for item in spec["paths"]["/jobs/{id}"]["get"]["parameters"]},
         )
-        self.assertEqual(
-            spec["paths"]["/jobs/{id}/cancel"]["post"]["responses"]["409"][
-                "description"
-            ],
-            "The job is already terminal (job_not_cancellable).",
-        )
+        conflict_description = spec["paths"]["/jobs/{id}/cancel"]["post"]["responses"][
+            "409"
+        ]["description"]
+        self.assertIn("job_not_cancellable", conflict_description)
+        self.assertIn("tenant_limit", conflict_description)
 
     def test_key_management_routes_are_documented_with_roles_and_forbidden(self):
         spec = build_openapi(ROUTES, "keys-test")
@@ -440,8 +443,67 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "last_used_at",
                 "fingerprint",
                 "status",
+                "tenants",
             ],
         )
+
+    def test_tenant_routes_headers_admin_paths_and_key_allowlists_match_openapi(self):
+        spec = build_openapi(ROUTES, "tenant-test")
+        scoped = {
+            (route["method"].lower(), route["path"])
+            for route in ROUTES
+            if route["tenant_scoped"]
+        }
+        expected_scoped = {
+            ("get", "/orders"),
+            ("post", "/orders"),
+            ("get", "/products"),
+            ("post", "/products"),
+            ("get", "/categories"),
+            ("get", "/jobs"),
+            ("post", "/jobs"),
+            ("get", "/webhooks"),
+            ("post", "/webhooks"),
+            ("get", "/outbox"),
+            ("get", "/audit"),
+            ("get", "/exports/orders.csv"),
+            ("post", "/imports/orders"),
+            ("get", "/v2/orders"),
+        }
+        self.assertTrue(expected_scoped.issubset(scoped))
+        for method, path in scoped:
+            operation = spec["paths"][path][method]
+            with self.subTest(method=method, path=path):
+                self.assertIn(
+                    "X-Tenant",
+                    {item["name"] for item in operation.get("parameters", [])},
+                )
+                success = next(
+                    response
+                    for status, response in operation["responses"].items()
+                    if status.startswith("2")
+                )
+                self.assertIn("X-Tenant", success["headers"])
+                self.assertIn("400", operation["responses"])
+        self.assertIn("/admin/tenants", spec["paths"])
+        self.assertIn("/admin/tenants/{tenant}", spec["paths"])
+        for path in ("/admin/tenants", "/admin/tenants/{tenant}"):
+            route = next(route for route in ROUTES if route["path"] == path)
+            self.assertFalse(route["tenant_scoped"])
+            operation = spec["paths"][path][route["method"].lower()]
+            self.assertEqual(operation["x-required-role"], "admin")
+            self.assertNotIn("X-Tenant", json.dumps(operation.get("parameters", [])))
+        self.assertNotIn(
+            "X-Tenant",
+            {
+                item["name"]
+                for item in spec["paths"]["/whoami"]["get"].get("parameters", [])
+            },
+        )
+        key_schema = spec["paths"]["/admin/keys"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        self.assertEqual(key_schema["properties"]["tenants"]["maxItems"], 10)
 
     def test_bulk_routes_document_body_limits_and_result_statuses(self):
         spec = build_openapi(ROUTES, "bulk-test")
@@ -474,6 +536,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "Deprecation",
                 "Sunset",
                 "Link",
+                "X-Tenant",
             },
         )
         self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
@@ -638,6 +701,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "Deprecation",
                 "Sunset",
                 "Link",
+                "X-Tenant",
             },
         )
 

@@ -1,6 +1,7 @@
 """API-key authentication for the synthetic QA service."""
 
 from collections.abc import Mapping
+from typing import Any
 
 from agent_qa.config import API_KEY
 from agent_qa.keys import KeyStore
@@ -16,7 +17,7 @@ def api_key_from_headers(headers: Mapping[str, str]) -> str | None:
     return None
 
 
-def authenticate_api_key(headers: Mapping[str, str]) -> dict[str, str] | None:
+def authenticate_api_key(headers: Mapping[str, str]) -> dict[str, Any] | None:
     """Return authenticated key identity, updating its last-use timestamp."""
     return KEY_STORE.authenticate(api_key_from_headers(headers))
 

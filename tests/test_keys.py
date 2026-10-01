@@ -24,7 +24,12 @@ class KeyStoreTests(unittest.TestCase):
     def test_bootstrap_is_admin_and_cannot_be_rotated_or_revoked(self):
         self.assertEqual(
             self.store.authenticate("bootstrap-secret"),
-            {"key_id": "bootstrap", "role": "admin", "label": "bootstrap"},
+            {
+                "key_id": "bootstrap",
+                "role": "admin",
+                "label": "bootstrap",
+                "tenants": None,
+            },
         )
         for action in (self.store.rotate, self.store.revoke):
             with self.subTest(action=action.__name__):
@@ -40,9 +45,29 @@ class KeyStoreTests(unittest.TestCase):
                 store = KeyStore(secret, self.clock)
                 self.assertEqual(
                     store.authenticate(secret),
-                    {"key_id": "bootstrap", "role": "admin", "label": "bootstrap"},
+                    {
+                        "key_id": "bootstrap",
+                        "role": "admin",
+                        "label": "bootstrap",
+                        "tenants": None,
+                    },
                 )
                 self.assertIsNone(store.authenticate("x" * length))
+
+    def test_tenant_allowlist_is_retained_in_identity_and_metadata(self):
+        created = self.store.create("write", "tenant worker", ["north-1", "west"])
+        self.assertEqual(
+            self.store.authenticate(created["key"])["tenants"],
+            ["north-1", "west"],
+        )
+        self.assertEqual(
+            self.store.list_keys()["items"][1]["tenants"], ["north-1", "west"]
+        )
+        for tenant_list in ([], ["bad_name"], ["blue", "blue"], ["t"] * 11):
+            with self.subTest(tenants=tenant_list):
+                with self.assertRaises(ApiError) as error:
+                    self.store.create("read", "invalid", tenant_list)
+                self.assertEqual(error.exception.status, 400)
 
     def test_overlong_authentication_candidate_is_rejected_with_bounded_hash(self):
         store = KeyStore("b" * 4097, self.clock)

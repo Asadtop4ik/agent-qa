@@ -6,14 +6,16 @@ from collections import deque
 from copy import deepcopy
 from datetime import datetime, timezone
 import threading
+import re
 
 from agent_qa import settings
-from agent_qa.context import RequestContext
+from agent_qa.context import RequestContext, get_context
 
 _MIN_CAPACITY = 10
 _MAX_CAPACITY = 5000
 _MAX_TEXT = 256
 _MAX_ACTOR = 128
+_TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 _ALLOWED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _ALLOWED_RESOURCES = frozenset({"orders", "products", "keys", "jobs"})
 _CHANGE_TYPES = {
@@ -36,6 +38,21 @@ def _bounded_text(value: object, maximum: int = _MAX_TEXT) -> str:
     if not isinstance(value, str):
         return ""
     return value[:maximum]
+
+
+def _tenant_filter(value: object) -> str:
+    if value is None:
+        context = get_context()
+        value = context.tenant if context is not None else "default"
+    if value == "*":
+        return "*"
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 24
+        or not _TENANT_RE.fullmatch(value)
+    ):
+        raise ValueError("invalid tenant")
+    return value
 
 
 def _safe_changes(changes: object) -> dict[str, object] | None:
@@ -144,6 +161,13 @@ class AuditLog:
         elif 400 <= status < 500:
             outcome = "rejected"
         actor = context.actor if isinstance(context.actor, str) else "anonymous"
+        tenant = (
+            context.tenant
+            if isinstance(context.tenant, str)
+            and 1 <= len(context.tenant) <= 24
+            and _TENANT_RE.fullmatch(context.tenant)
+            else "default"
+        )
         if actor != "anonymous":
             actor = _bounded_text(actor, _MAX_ACTOR)
         role = (
@@ -182,6 +206,7 @@ class AuditLog:
                 "status": status,
                 "outcome": outcome,
                 "request_id": _bounded_text(context.request_id, 64),
+                "tenant": tenant,
                 "changes": _safe_changes(context.changes),
             }
             if replay:
@@ -201,6 +226,7 @@ class AuditLog:
         since_seq: int = 0,
         limit: int = 50,
         order: str = "desc",
+        tenant: str | None = None,
     ) -> dict[str, object]:
         """Return a filtered snapshot and buffer metadata."""
         if method is not None and (
@@ -244,6 +270,7 @@ class AuditLog:
             raise ValueError("invalid limit")
         if order not in {"asc", "desc"}:
             raise ValueError("invalid order")
+        tenant_filter = _tenant_filter(tenant)
         with self._lock:
             entries = deepcopy(list(self._entries))
             dropped = self._dropped
@@ -258,6 +285,7 @@ class AuditLog:
             and (outcome is None or entry["outcome"] == outcome)
             and (actor is None or entry["actor"] == actor)
             and (status is None or entry["status"] == status)
+            and (tenant_filter == "*" or entry["tenant"] == tenant_filter)
         ]
         matching.sort(key=lambda entry: int(entry["seq"]), reverse=order == "desc")
         total_matching = len(matching)
@@ -270,13 +298,16 @@ class AuditLog:
             "last_seq": last_seq,
         }
 
-    def get(self, seq: int) -> dict[str, object] | None:
+    def get(self, seq: int, tenant: str | None = None) -> dict[str, object] | None:
         """Return a detached entry snapshot for a retained sequence number."""
         if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
             return None
+        tenant_filter = _tenant_filter(tenant)
         with self._lock:
             for entry in self._entries:
-                if entry["seq"] == seq:
+                if entry["seq"] == seq and (
+                    tenant_filter == "*" or entry["tenant"] == tenant_filter
+                ):
                     return deepcopy(entry)
         return None
 

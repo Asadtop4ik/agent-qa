@@ -16,6 +16,7 @@ class RequestContext:
     resource: str | None = None
     resource_id: int | str | None = None
     changes: dict[str, object] | None = None
+    tenant: str = "default"
 
 
 _LOCAL = threading.local()

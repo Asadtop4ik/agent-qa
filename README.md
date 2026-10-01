@@ -59,6 +59,26 @@ securely. The service retains hashes in memory, and keeps at most 20 active
 non-bootstrap keys. Rotation can temporarily accept the previous secret during
 its grace period.
 
+## Tenants
+
+Resource routes use `X-Tenant` to select an isolated tenant. Names must match
+`^[a-z0-9][a-z0-9-]{0,23}$`; an omitted header selects `default`, and scoped
+responses echo the selected name. The first authorized write creates a tenant;
+reads of an unknown tenant return empty collections or resource-not-found
+responses without creating it. At most 10 tenants may exist. Admins can list
+tenant counts with `GET /admin/tenants` and remove a tenant with
+`DELETE /admin/tenants/{tenant}`. The default tenant is protected. A key created
+with a `tenants` list is limited to those names; keys without that field may
+access every tenant. `GET /whoami` and `GET /admin/keys` show each key's tenant
+allowlist (`null` means unrestricted).
+
+Admins can use `GET /audit` to view the selected tenant's records, query
+`?tenant=<name>` for another tenant, or use `?tenant=*` for all retained records.
+Audit records remain available after tenant data is purged. `/metrics` reports
+`agent_qa_orders` as the total across tenants, alongside
+`agent_qa_tenant_orders{tenant="..."}`, `agent_qa_tenant_products{tenant="..."}`,
+and `agent_qa_tenants` gauges.
+
 ## Configuration
 
 Admins can inspect settings through `GET /admin/config` and

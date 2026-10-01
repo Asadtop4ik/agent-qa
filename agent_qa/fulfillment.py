@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 class FulfillmentService:
     """Coordinate order mutations and product stock under a stable lock order."""
 
-    def __init__(self, orders: OrderStore, products: ProductStore) -> None:
+    def __init__(
+        self,
+        orders: OrderStore,
+        products: ProductStore,
+        lock: threading.RLock | None = None,
+    ) -> None:
         self._orders = orders
         self._products = products
-        self._lock = threading.RLock()
+        self._lock = lock or threading.RLock()
 
     def create(self, *, include_version: bool = False, **fields: Any) -> dict[str, Any]:
         normalized = validate_create(fields)

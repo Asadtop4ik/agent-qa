@@ -17,7 +17,7 @@ from agent_qa.products import ProductStore
 from agent_qa.server import Handler
 
 
-AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test", "tenants": None}
 
 
 class IdempotencyStoreTests(unittest.TestCase):

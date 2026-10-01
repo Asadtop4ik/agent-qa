@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from agent_qa.errors import ApiError
+from agent_qa import tenants as tenant_registry
 
 _ROLE_RANK = {"read": 1, "write": 2, "admin": 3}
 _MAX_ACTIVE_KEYS = 20
@@ -36,6 +37,7 @@ class _Key:
     label: str
     created_at: datetime
     secret_hash: bytes
+    tenants: tuple[str, ...] | None = None
     last_used_at: datetime | None = None
     prev_hash: bytes | None = None
     grace_expires_at: datetime | None = None
@@ -67,7 +69,7 @@ class KeyStore:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
 
-    def authenticate(self, secret: str | None) -> dict[str, str] | None:
+    def authenticate(self, secret: str | None) -> dict[str, object] | None:
         """Match every retained digest, without returning early on a match."""
         if not isinstance(secret, str):
             secret = ""
@@ -106,9 +108,14 @@ class KeyStore:
                 "key_id": matched.key_id,
                 "role": matched.role,
                 "label": matched.label,
+                "tenants": (
+                    list(matched.tenants) if matched.tenants is not None else None
+                ),
             }
 
-    def create(self, role: str, label: str) -> dict[str, str]:
+    def create(
+        self, role: str, label: str, tenants: list[str] | None = None
+    ) -> dict[str, object]:
         if not isinstance(role, str) or role not in _ROLE_RANK:
             raise ApiError(400, "invalid_role", "Role must be read, write, or admin")
         if not isinstance(label, str) or not 1 <= len(label) <= 40 or not label.strip():
@@ -119,6 +126,25 @@ class KeyStore:
             raise ApiError(
                 400, "invalid_label", "Label must contain valid Unicode"
             ) from error
+        tenant_names: tuple[str, ...] | None = None
+        if tenants is not None:
+            if not isinstance(tenants, list) or not 1 <= len(tenants) <= 10:
+                raise ApiError(
+                    400,
+                    "invalid_tenants",
+                    "tenants must contain 1-10 names",
+                )
+            validated: list[str] = []
+            for value in tenants:
+                try:
+                    validated.append(tenant_registry.validate_name(value))
+                except (ApiError, TypeError) as error:
+                    raise ApiError(
+                        400, "invalid_tenants", "tenants contains an invalid name"
+                    ) from error
+            if len(set(validated)) != len(validated):
+                raise ApiError(400, "invalid_tenants", "tenants must be unique")
+            tenant_names = tuple(validated)
         with self._lock:
             if len(self._keys) - 1 >= _MAX_ACTIVE_KEYS:
                 raise ApiError(409, "key_limit", "Maximum number of API keys reached")
@@ -126,13 +152,16 @@ class KeyStore:
             self._next_id += 1
             secret = f"qa_{role}_{secrets.token_hex(12)}"
             created = self._now()
-            self._keys[key_id] = _Key(key_id, role, label, created, _digest(secret))
+            self._keys[key_id] = _Key(
+                key_id, role, label, created, _digest(secret), tenants=tenant_names
+            )
             return {
                 "key_id": key_id,
                 "role": role,
                 "label": label,
                 "key": secret,
                 "created_at": _isoformat(created) or "",
+                "tenants": list(tenant_names) if tenant_names is not None else None,
             }
 
     def list_keys(self) -> dict[str, object]:
@@ -154,11 +183,14 @@ class KeyStore:
                         "last_used_at": _isoformat(record.last_used_at),
                         "fingerprint": record.secret_hash.hex()[:8],
                         "status": "grace" if grace else "active",
+                        "tenants": (
+                            list(record.tenants) if record.tenants is not None else None
+                        ),
                     }
                 )
             return {"items": items, "total": len(items)}
 
-    def rotate(self, key_id: str, grace_seconds: int = 0) -> dict[str, str]:
+    def rotate(self, key_id: str, grace_seconds: int = 0) -> dict[str, object]:
         if (
             isinstance(grace_seconds, bool)
             or not isinstance(grace_seconds, int)
@@ -184,6 +216,7 @@ class KeyStore:
                 "label": record.label,
                 "key": secret,
                 "created_at": _isoformat(record.created_at) or "",
+                "tenants": list(record.tenants) if record.tenants is not None else None,
             }
 
     def revoke(self, key_id: str) -> None:

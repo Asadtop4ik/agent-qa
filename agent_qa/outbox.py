@@ -191,6 +191,17 @@ class OutboxStore:
         if thread and thread is not threading.current_thread():
             thread.join(timeout)
 
+    def purge(self) -> None:
+        """Stop dispatch and discard tenant webhooks and queued events."""
+        self.stop(timeout=0.1)
+        with self._lock:
+            self._webhooks.clear()
+            self._entries.clear()
+            self._next_webhook_id = 1
+            self._next_entry_id = 1
+            self._next_event_id = 1
+            self._dropped = 0
+
     def create_webhook(self, payload: object) -> dict[str, object]:
         if not isinstance(payload, dict):
             raise _bad_request("invalid_webhook", "webhook body must be an object")

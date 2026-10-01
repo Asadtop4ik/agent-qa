@@ -49,6 +49,22 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 "410",
                 {"description": ("Deprecated API version has passed its sunset date.")},
             )
+        if route.get("tenant_scoped"):
+            tenant_errors = {"400": "invalid_tenant"}
+            if route.get("method") in {"POST", "PUT", "PATCH", "DELETE"}:
+                tenant_errors["409"] = "tenant_limit"
+            for status, code in tenant_errors.items():
+                operation["responses"].setdefault(
+                    status,
+                    {
+                        "description": f"Request failed ({code}).",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Error"}
+                            }
+                        },
+                    },
+                )
         for status, response in operation["responses"].items():
             if (
                 status.startswith("2")
@@ -324,6 +340,52 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                         response["content"] = {
                             "application/problem+json": {"schema": {"type": "object"}}
                         }
+        if route.get("tenant_scoped"):
+            parameters = operation.setdefault("parameters", [])
+            if not any(
+                parameter.get("name") == "X-Tenant" and parameter.get("in") == "header"
+                for parameter in parameters
+            ):
+                parameters.append(
+                    {
+                        "name": "X-Tenant",
+                        "in": "header",
+                        "required": False,
+                        "description": "Tenant name; defaults to 'default'.",
+                        "schema": {
+                            "type": "string",
+                            "pattern": "^[a-z0-9][a-z0-9-]{0,23}$",
+                            "default": "default",
+                        },
+                    }
+                )
+            tenant_header = {
+                "description": "Tenant selected for this response.",
+                "schema": {"type": "string"},
+            }
+            for response in operation["responses"].values():
+                response.setdefault("headers", {})["X-Tenant"] = deepcopy(tenant_header)
+            tenant_errors = {"400": "invalid_tenant"}
+            if route.get("method") in {"POST", "PUT", "PATCH", "DELETE"}:
+                tenant_errors["409"] = "tenant_limit"
+            for status, code in tenant_errors.items():
+                response = operation["responses"][status]
+                description = response.get("description", f"HTTP {status} response")
+                tenant_description = (
+                    "The X-Tenant value is invalid (invalid_tenant)."
+                    if code == "invalid_tenant"
+                    else "The tenant limit is reached (tenant_limit)."
+                )
+                if code not in description:
+                    response["description"] = f"{description} {tenant_description}"
+                response.setdefault(
+                    "content",
+                    {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }
+                    },
+                )
         paths.setdefault(path, {})[method] = operation
 
     return {

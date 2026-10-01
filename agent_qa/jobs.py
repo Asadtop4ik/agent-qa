@@ -154,6 +154,7 @@ class JobRunner:
         queue_limit: int = 20,
         retention: int = 100,
         clock: Callable[[], Any] = time.time,
+        tenant: str = "default",
     ) -> None:
         for name, value, minimum, maximum in (
             ("workers", workers, 1, 3),
@@ -172,6 +173,7 @@ class JobRunner:
         ):
             raise ValueError("handlers must map supported job types to callables")
         self._handlers = dict(handlers)
+        self.tenant = tenant
         self._workers_count = workers
         self._queue_limit = queue_limit
         self._retention = retention
@@ -232,6 +234,7 @@ class JobRunner:
             self._next_id += 1
             job = {
                 "id": job_id,
+                "tenant": self.tenant,
                 "type": name,
                 "params": normalized,
                 "status": "queued",
@@ -251,12 +254,14 @@ class JobRunner:
 
     @staticmethod
     def _copy(job: dict[str, Any]) -> dict[str, Any]:
-        return {
+        copied = {
             **job,
             "params": deepcopy(job["params"]),
             "result": deepcopy(job["result"]),
             "error": deepcopy(job["error"]),
         }
+        copied.pop("tenant", None)
+        return copied
 
     def list_jobs(
         self,
@@ -502,4 +507,16 @@ class JobRunner:
                 self._started = False
                 self._stopping = False
             self._prune_locked()
+            self._condition.notify_all()
+
+    def purge(self) -> None:
+        """Cancel worker activity and discard this runner's retained records."""
+        self.stop(timeout=0.1)
+        with self._condition:
+            for event in self._cancel_events.values():
+                event.set()
+            self._jobs.clear()
+            self._cancel_events.clear()
+            self._queue.clear()
+            self._terminal_order.clear()
             self._condition.notify_all()

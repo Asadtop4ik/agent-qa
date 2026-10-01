@@ -22,7 +22,7 @@ from agent_qa.server import Handler, allowed_methods
 MAX_STOCK = schemas.MAX_STOCK
 
 
-AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test", "tenants": None}
 
 
 class ProductApiTests(unittest.TestCase):

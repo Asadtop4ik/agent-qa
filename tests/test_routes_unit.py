@@ -26,7 +26,7 @@ from agent_qa.routes import (
 from agent_qa.schemas import SCHEMAS
 
 
-AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test", "tenants": None}
 
 
 class RouteUnitTests(unittest.TestCase):
