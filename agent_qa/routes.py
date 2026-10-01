@@ -40,10 +40,36 @@ from agent_qa.products import (
     validate_patch as validate_product_patch,
     validate_query as validate_product_query,
 )
+from agent_qa.ratelimit import LIMITER, validate_identity
 
 
 ORDER_STORE = OrderStore()
 PRODUCT_STORE = ProductStore()
+
+_RATE_LIMIT_POLICY_SCHEMA = {
+    "type": "object",
+    "required": ["burst", "refill_per_second"],
+    "properties": {
+        "burst": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "refill_per_second": {
+            "type": "number",
+            "minimum": 0.001,
+            "maximum": 10000,
+        },
+    },
+    "additionalProperties": False,
+}
+_RATE_LIMIT_REQUEST_SCHEMA = _RATE_LIMIT_POLICY_SCHEMA
+_RATE_LIMIT_IDENTITY = {
+    "name": "identity",
+    "in": "path",
+    "required": True,
+    "schema": {
+        "type": "string",
+        "pattern": "^(key|client|ip):[A-Za-z0-9._:-]{1,64}$",
+        "maxLength": 69,
+    },
+}
 
 
 def _header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -241,6 +267,63 @@ def revoke_api_key(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     auth.KEY_STORE.revoke(_key_id(path_params))
+    return 204, None, {"Content-Length": "0"}
+
+
+def list_rate_limits(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the default rate policy, per-identity overrides, and bucket count."""
+    return 200, LIMITER.snapshot(), {}
+
+
+def set_rate_limit(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    identity = (path_params or {}).get("identity", "")
+    if not validate_identity(identity):
+        raise ApiError(
+            400,
+            "validation_error",
+            "Invalid identity",
+            [{"field": "identity", "message": "Invalid identity"}],
+        )
+    errors = validate(_RATE_LIMIT_REQUEST_SCHEMA, payload)
+    if errors:
+        raise ApiError(400, "validation_error", "Invalid request body", errors)
+    assert isinstance(payload, dict)
+    burst = payload["burst"]
+    refill = payload["refill_per_second"]
+    LIMITER.set_override(identity, burst, refill)
+    return (
+        200,
+        {
+            "identity": identity,
+            "burst": burst,
+            "refill_per_second": refill,
+        },
+        {},
+    )
+
+
+def delete_rate_limit(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    identity = (path_params or {}).get("identity", "")
+    if not validate_identity(identity):
+        raise ApiError(
+            400,
+            "validation_error",
+            "Invalid identity",
+            [{"field": "identity", "message": "Invalid identity"}],
+        )
+    LIMITER.delete_override(identity)
     return 204, None, {"Content-Length": "0"}
 
 
@@ -1074,6 +1157,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getHealth",
         "summary": "Check service health",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1114,6 +1198,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getStatus",
         "summary": "Check service and fixture status",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1141,6 +1226,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getReady",
         "summary": "Check service readiness",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1162,6 +1248,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getPing",
         "summary": "Check service liveness",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1180,6 +1267,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getMetrics",
         "summary": "Read service metrics",
+        "rate_limited": False,
         "responses": ["200", "403"],
     },
     {
@@ -1782,6 +1870,80 @@ ROUTES = (
         "error_responses": {
             "404": "The key does not exist (key_not_found).",
             "409": "The bootstrap key is immutable (bootstrap_key_immutable).",
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/rate-limits",
+        "handler": list_rate_limits,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "listRateLimits",
+        "summary": "Read the default rate policy and identity overrides",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["default", "overrides", "buckets"],
+                "properties": {
+                    "default": _RATE_LIMIT_POLICY_SCHEMA,
+                    "overrides": {
+                        "type": "object",
+                        "additionalProperties": _RATE_LIMIT_POLICY_SCHEMA,
+                    },
+                    "buckets": {"type": "integer", "minimum": 0, "maximum": 1000},
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "PUT",
+        "path": "/admin/rate-limits/{identity}",
+        "handler": set_rate_limit,
+        "body": True,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "setRateLimit",
+        "summary": "Set a rate policy override for an identity",
+        "parameters": [_RATE_LIMIT_IDENTITY],
+        "request_schema": _RATE_LIMIT_REQUEST_SCHEMA,
+        "responses": ["200", "400", "401", "403", "409", "411", "413", "415"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["identity", "burst", "refill_per_second"],
+                "properties": {
+                    "identity": _RATE_LIMIT_IDENTITY["schema"],
+                    "burst": _RATE_LIMIT_POLICY_SCHEMA["properties"]["burst"],
+                    "refill_per_second": _RATE_LIMIT_POLICY_SCHEMA["properties"][
+                        "refill_per_second"
+                    ],
+                },
+                "additionalProperties": False,
+            }
+        },
+        "error_responses": {
+            "400": "Invalid identity or rate policy (validation_error).",
+            "409": "The rate policy override limit has been reached (override_limit).",
+        },
+    },
+    {
+        "method": "DELETE",
+        "path": "/admin/rate-limits/{identity}",
+        "handler": delete_rate_limit,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "deleteRateLimit",
+        "summary": "Remove a rate policy override and reset its bucket",
+        "parameters": [_RATE_LIMIT_IDENTITY],
+        "responses": ["204", "400", "401", "403", "404"],
+        "error_responses": {
+            "400": "Invalid identity (validation_error).",
+            "404": "The override does not exist (override_not_found).",
         },
     },
     {

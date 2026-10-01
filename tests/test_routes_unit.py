@@ -14,12 +14,15 @@ from agent_qa.errors import ApiError, envelope
 from agent_qa.orders import OrderStore
 from agent_qa.routes import (
     ROUTES,
+    delete_rate_limit,
     fixture,
     health,
+    list_rate_limits,
     list_orders,
     list_products,
     ping,
     ready,
+    set_rate_limit,
     status,
     version,
 )
@@ -30,6 +33,105 @@ AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_probe_and_rate_limit_admin_routes_are_exempt(self):
+        exempt_paths = {
+            "/ready",
+            "/health",
+            "/ping",
+            "/metrics",
+            "/status",
+            "/admin/rate-limits",
+            "/admin/rate-limits/{identity}",
+        }
+        exempt_routes = [route for route in ROUTES if route["path"] in exempt_paths]
+        self.assertEqual({route["path"] for route in exempt_routes}, exempt_paths)
+        self.assertTrue(
+            all(route.get("rate_limited") is False for route in exempt_routes)
+        )
+        for route in ROUTES:
+            if route["path"].startswith("/admin/rate-limits"):
+                self.assertEqual(route["role"], "admin")
+                self.assertTrue(route["auth_required"])
+
+    def test_rate_limit_admin_handlers_validate_and_use_limiter(self):
+        snapshot = {
+            "default": {"burst": 120, "refill_per_second": 60.0},
+            "overrides": {},
+            "buckets": 0,
+        }
+        with patch("agent_qa.routes.LIMITER.snapshot", return_value=snapshot):
+            self.assertEqual(list_rate_limits([]), (200, snapshot, {}))
+
+        with patch("agent_qa.routes.LIMITER.set_override") as set_override:
+            result = set_rate_limit(
+                [],
+                {"identity": "client:runner-1"},
+                {"burst": 10, "refill_per_second": 2.5},
+            )
+        self.assertEqual(
+            result,
+            (
+                200,
+                {
+                    "identity": "client:runner-1",
+                    "burst": 10,
+                    "refill_per_second": 2.5,
+                },
+                {},
+            ),
+        )
+        set_override.assert_called_once_with("client:runner-1", 10, 2.5)
+
+        with self.assertRaises(ApiError) as error:
+            set_rate_limit(
+                [],
+                {"identity": "client:bad identity"},
+                {"burst": 10, "refill_per_second": 2.5},
+            )
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.details[0]["field"], "identity")
+
+        with self.assertRaises(ApiError) as error:
+            set_rate_limit(
+                [],
+                {"identity": "client:runner-1"},
+                {"burst": True, "refill_per_second": 2.5},
+            )
+        self.assertEqual(error.exception.status, 400)
+
+        invalid_policies = (
+            {"burst": 0, "refill_per_second": 2.5},
+            {"burst": 10**5000, "refill_per_second": 2.5},
+            {"burst": 10, "refill_per_second": 0},
+            {"burst": 10, "refill_per_second": 10**5000},
+        )
+        for index, body in enumerate(invalid_policies):
+            with self.subTest(index=index):
+                with self.assertRaises(ApiError) as error:
+                    set_rate_limit([], {"identity": "client:runner-1"}, body)
+                self.assertEqual(error.exception.status, 400)
+
+        with patch("agent_qa.routes.LIMITER.delete_override", return_value=None):
+            self.assertEqual(
+                delete_rate_limit([], {"identity": "client:runner-1"}),
+                (204, None, {"Content-Length": "0"}),
+            )
+        with patch(
+            "agent_qa.routes.LIMITER.delete_override",
+            side_effect=ApiError(
+                404, "override_not_found", "Rate limit override not found"
+            ),
+        ):
+            with self.assertRaises(ApiError) as error:
+                delete_rate_limit([], {"identity": "client:runner-1"})
+        self.assertEqual(error.exception.status, 404)
+        self.assertEqual(error.exception.code, "override_not_found")
+
+        with self.assertRaises(ApiError) as error:
+            delete_rate_limit([], {"identity": "client:bad identity"})
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.details[0]["field"], "identity")
+
     def test_cursor_list_handlers_emit_relative_encoded_next_links(self):
         order_filters = {
             "status": "new",
@@ -97,6 +199,7 @@ class RouteUnitTests(unittest.TestCase):
             handler.command = "GET"
             handler.headers = Message()
             handler.rfile = BytesIO()
+            handler.client_address = ("127.0.0.1", 0)
             handler.request_id = "orders-route-test"
             handler._json = lambda *args: responses.append(args)
             Handler._handle(handler)
@@ -449,6 +552,7 @@ class RouteUnitTests(unittest.TestCase):
         handler.command = method
         handler.headers = headers
         handler.rfile = BytesIO(body)
+        handler.client_address = ("127.0.0.1", 0)
         handler.request_id = "dispatch-test"
         handler._json = lambda *args: responses.append(args)
         return handler, responses
@@ -511,6 +615,24 @@ class RouteUnitTests(unittest.TestCase):
                     Handler._dispatch(handler)
             self.assertEqual(error.exception.status, 400)
             self.assertEqual(error.exception.code, "invalid_json")
+
+    def test_rate_limit_admin_route_requires_admin_role(self):
+        from agent_qa.server import Handler
+
+        handler, responses = self.make_dispatcher(
+            "/admin/rate-limits", b"", method="GET"
+        )
+        with patch("agent_qa.server.authenticate_api_key", return_value=None):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 401)
+
+        read_identity = {"key_id": "reader", "role": "read", "label": "test"}
+        handler, responses = self.make_dispatcher(
+            "/admin/rate-limits", b"", method="GET"
+        )
+        with patch("agent_qa.server.authenticate_api_key", return_value=read_identity):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 403)
 
     def test_dispatch_validates_before_calling_handler(self):
         from agent_qa.server import Handler

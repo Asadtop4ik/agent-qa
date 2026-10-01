@@ -5,6 +5,18 @@ from agent_qa.metrics import MetricsRegistry, _escape_label
 
 
 class MetricsRegistryTests(unittest.TestCase):
+    def test_rate_limit_counter_has_only_bounded_identity_kinds(self):
+        registry = MetricsRegistry()
+        registry.record_rate_limited("key")
+        registry.record_rate_limited("client")
+        registry.record_rate_limited("ip")
+        rendered = registry.render(0, "test")
+        self.assertIn("# TYPE agent_qa_rate_limited_total counter", rendered)
+        self.assertIn('agent_qa_rate_limited_total{kind="key"} 1', rendered)
+        self.assertNotIn("identity", rendered)
+        with self.assertRaises(ValueError):
+            registry.record_rate_limited("key:secret")
+
     def test_render_includes_metric_metadata_and_sorted_samples(self):
         registry = MetricsRegistry()
         registry.record("PUT", "/ready", 405, 0.25)

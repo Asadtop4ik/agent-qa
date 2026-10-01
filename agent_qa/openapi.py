@@ -43,6 +43,40 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
             },
         }
+        rate_limited = route.get("rate_limited", True)
+        operation["x-rate-limited"] = rate_limited
+        if rate_limited:
+            rate_headers = {
+                "RateLimit-Limit": {
+                    "description": "The token bucket capacity for this identity.",
+                    "schema": {"type": "integer", "minimum": 1},
+                },
+                "RateLimit-Remaining": {
+                    "description": "Whole tokens currently available.",
+                    "schema": {"type": "integer", "minimum": 0},
+                },
+                "RateLimit-Reset": {
+                    "description": "Seconds until the token bucket is full.",
+                    "schema": {"type": "integer", "minimum": 0},
+                },
+            }
+            operation["responses"]["429"] = {
+                "description": "Rate limit exceeded (rate_limited).",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/Error"}
+                    }
+                },
+                "headers": {
+                    **deepcopy(rate_headers),
+                    "Retry-After": {
+                        "description": (
+                            "Seconds until another request token is available."
+                        ),
+                        "schema": {"type": "integer", "minimum": 1},
+                    },
+                },
+            }
         if route.get("conditional_headers"):
             conditional_errors = {
                 "400": (
@@ -208,6 +242,9 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 operation["responses"][status].setdefault("headers", {}).update(
                     deepcopy(headers)
                 )
+        if rate_limited:
+            for response in operation["responses"].values():
+                response.setdefault("headers", {}).update(deepcopy(rate_headers))
         if route.get("role", route["auth_required"]):
             operation["security"] = [{"ApiKeyAuth": []}]
         paths.setdefault(path, {})[method] = operation

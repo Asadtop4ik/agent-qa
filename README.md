@@ -27,6 +27,29 @@ securely. The service retains hashes in memory, and keeps at most 20 active
 non-bootstrap keys. Rotation can temporarily accept the previous secret during
 its grace period.
 
+## Rate limits
+
+Requests to registered routes use an in-memory token bucket with a default burst
+of 120 and refill of 60 tokens per second. Configure these defaults with
+`AGENT_QA_RATE_BURST` (1–100000) and
+`AGENT_QA_RATE_REFILL_PER_SECOND` (0.001–10000); invalid values use the
+defaults. Valid API keys are limited by key ID, then a valid `X-Client-Id`,
+then the client address. Limited responses include `RateLimit-Limit`,
+`RateLimit-Remaining`, and `RateLimit-Reset`; an exhausted bucket returns
+`429 rate_limited` with `Retry-After`.
+
+The service stores up to 1,000 identity buckets and evicts the least recently
+used full bucket when a new identity needs a slot. If all buckets are partial,
+an ordinary request for a new identity receives 429 without a new bucket. Admin
+PUT can replace the least recently used bucket when needed, then fills the
+target bucket. Admins can inspect policies with `GET /admin/rate-limits`, set an
+identity override with
+`PUT /admin/rate-limits/{identity}` and a JSON body such as
+`{"burst":10,"refill_per_second":2.5}`, or remove it with
+`DELETE /admin/rate-limits/{identity}`. Overrides are held in memory and reset
+when the service restarts; at most 100 are allowed. PUT fills or resets that
+identity's bucket. Probe routes and these policy endpoints are exempt.
+
 ## Products
 
 `GET /products` searches and filters the in-memory product catalog;

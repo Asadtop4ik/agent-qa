@@ -25,6 +25,7 @@ from agent_qa.context import (
 )
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
+from agent_qa.ratelimit import LIMITER
 from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
 
@@ -100,6 +101,7 @@ class Handler(BaseHTTPRequestHandler):
         set_context(RequestContext(request_id=self.request_id))
         self._request_started = perf_counter()
         self._response_recorded = False
+        self._rate_limit_headers = {}
         try:
             super().handle_one_request()
         finally:
@@ -122,7 +124,8 @@ class Handler(BaseHTTPRequestHandler):
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
         is_empty = status in {204, 304}
-        response_headers = headers or {}
+        response_headers = dict(getattr(self, "_rate_limit_headers", {}))
+        response_headers.update(headers or {})
         content_type = response_headers.get("Content-Type")
         if is_empty:
             encoded = b""
@@ -279,6 +282,7 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def _dispatch(self) -> None:
+        self._rate_limit_headers = {}
         parsed = urlsplit(self.path)
         matches = _path_routes(parsed.path)
         if not matches:
@@ -325,12 +329,38 @@ class Handler(BaseHTTPRequestHandler):
             "role", "write" if route.get("auth_required") else None
         )
         identity = None
-        if required_role is not None or self.command in {
-            "POST",
-            "PUT",
-            "PATCH",
-            "DELETE",
-        }:
+        limited = route.get("rate_limited", True) is not False
+        if limited:
+            identity = authenticate_api_key(self.headers)
+            bucket_identity = None
+            if identity is not None:
+                bucket_identity = f"key:{identity['key_id']}"
+            else:
+                client_id = self.headers.get("X-Client-Id", "")
+                if re.fullmatch(r"[A-Za-z0-9._-]{1,32}", client_id):
+                    bucket_identity = f"client:{client_id}"
+                else:
+                    address = getattr(self, "client_address", ("unknown",))[0]
+                    client_ip = str(address)[:64]
+                    bucket_identity = f"ip:{client_ip or 'unknown'}"
+            rate_result = LIMITER.consume(bucket_identity)
+            self._rate_limit_headers = rate_result.headers
+            if not rate_result.allowed:
+                REGISTRY.record_rate_limited(bucket_identity.split(":", 1)[0])
+                self._json(
+                    429,
+                    envelope(
+                        "rate_limited",
+                        "Rate limit exceeded",
+                        request_id=self.request_id,
+                    ),
+                    rate_result.headers,
+                )
+                return
+        if identity is None and (
+            required_role is not None
+            or self.command in {"POST", "PUT", "PATCH", "DELETE"}
+        ):
             identity = authenticate_api_key(self.headers)
         if context is not None and identity is not None:
             context.actor = identity.get("key_id", "anonymous")

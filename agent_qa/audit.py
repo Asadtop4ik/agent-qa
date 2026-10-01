@@ -149,7 +149,7 @@ class AuditLog:
         if not isinstance(context, RequestContext):
             raise TypeError("context must be a RequestContext")
         outcome = "success" if 200 <= status < 300 else "error"
-        if status in {401, 403}:
+        if status in {401, 403, 429}:
             outcome = "denied"
         elif 400 <= status < 500:
             outcome = "rejected"

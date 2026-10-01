@@ -94,6 +94,14 @@ class SchemaValidationTests(unittest.TestCase):
             ],
         )
 
+    def test_number_accepts_integers_and_fractions_but_bounds_extreme_values(self):
+        schema = {"type": "number", "minimum": 0.001, "maximum": 10000}
+        self.assertEqual(validate(schema, 12), [])
+        self.assertEqual(validate(schema, 1.25), [])
+        self.assertTrue(validate(schema, True))
+        self.assertTrue(validate(schema, float("inf")))
+        self.assertTrue(validate(schema, 10**5000))
+
     def test_nullable_type_accepts_null_and_non_nullable_type_rejects_it(self):
         schema = {
             "type": "object",

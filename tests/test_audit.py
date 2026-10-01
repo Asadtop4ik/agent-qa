@@ -10,6 +10,11 @@ from agent_qa.context import RequestContext
 
 
 class AuditLogTests(unittest.TestCase):
+    def test_rate_limit_outcome_is_denied(self):
+        log = AuditLog(10)
+        entry = log.append(RequestContext("request"), "POST", "/orders", "/orders", 429)
+        self.assertEqual(entry["outcome"], "denied")
+
     def test_capacity_configuration_is_clamped_and_invalid_values_default(self):
         for value, expected in (("1", 10), ("5000", 5000), ("9000", 5000)):
             with self.subTest(value=value), patch.dict(

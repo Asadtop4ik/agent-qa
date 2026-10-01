@@ -77,15 +77,57 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             operation = spec["paths"][route["path"]][route["method"].lower()]
             self.assertEqual(operation["x-required-role"], route["role"])
             self.assertEqual(route["auth_required"], route["role"] is not None)
+            self.assertEqual(
+                operation["x-rate-limited"], route.get("rate_limited", True)
+            )
             self.assertIn("403", operation["responses"])
+            expected_responses = set(route["responses"])
+            if route.get("rate_limited", True):
+                expected_responses.add("429")
+            self.assertEqual(set(operation["responses"]), expected_responses)
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
-            self.assertEqual(set(operation["responses"]), set(route["responses"]))
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
                 operation["requestBody"]["content"]["application/json"]["schema"],
                 route["request_schema"],
             )
+
+    def test_rate_limit_responses_and_admin_routes_are_documented(self):
+        spec = build_openapi(ROUTES, "rate-limit-test")
+        limited = spec["paths"]["/orders"]["get"]
+        self.assertTrue(limited["x-rate-limited"])
+        limited_headers = limited["responses"]["429"]["headers"]
+        self.assertEqual(
+            set(limited_headers),
+            {
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+                "Retry-After",
+            },
+        )
+        self.assertIn("RateLimit-Limit", limited["responses"]["403"]["headers"])
+        self.assertIn("rate_limited", json.dumps(limited["responses"]["429"]))
+        probe = spec["paths"]["/ready"]["get"]
+        self.assertFalse(probe["x-rate-limited"])
+        self.assertNotIn("429", probe["responses"])
+
+        paths = spec["paths"]
+        admin_listing = paths["/admin/rate-limits"]["get"]
+        identity_path = paths["/admin/rate-limits/{identity}"]
+        put = identity_path["put"]
+        delete = identity_path["delete"]
+        self.assertEqual(admin_listing["x-required-role"], "admin")
+        self.assertEqual(put["x-required-role"], "admin")
+        self.assertFalse(put["x-rate-limited"])
+        request_schema = put["requestBody"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            request_schema["properties"]["refill_per_second"]["type"],
+            "number",
+        )
+        self.assertIn("override_limit", json.dumps(put["responses"]["409"]))
+        self.assertIn("override_not_found", json.dumps(delete["responses"]["404"]))
 
     def test_key_management_routes_are_documented_with_roles_and_forbidden(self):
         spec = build_openapi(ROUTES, "keys-test")
@@ -146,7 +188,14 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 self.assertIn("BulkCreateResponse", json.dumps(operation["responses"]))
         self.assertEqual(
             spec["paths"]["/orders/bulk"]["post"]["responses"]["422"]["headers"].keys(),
-            {"Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+            {
+                "Idempotency-Key",
+                "Idempotent-Replay",
+                "X-Request-Id",
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+            },
         )
         self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
 
@@ -298,7 +347,15 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         success_headers = create["responses"]["201"]["headers"]
         self.assertEqual(
             set(success_headers),
-            {"ETag", "Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+            {
+                "ETag",
+                "Idempotency-Key",
+                "Idempotent-Replay",
+                "X-Request-Id",
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+            },
         )
 
         future_route = copy.deepcopy(ROUTES[0])
@@ -344,6 +401,7 @@ class OpenApiDriftTests(unittest.TestCase):
         env = {
             "APP_PORT": str(cls.port),
             "AGENT_QA_GIT_SHA": "openapi-test-sha",
+            "AGENT_QA_API_KEY": "openapi-test-admin-key",
         }
         cls.process = subprocess.Popen(
             [sys.executable, "app.py"],
@@ -370,8 +428,13 @@ class OpenApiDriftTests(unittest.TestCase):
         cls.process.wait(timeout=3)
 
     @classmethod
-    def request(cls, method, path):
-        request = Request(cls.base + path, method=method)
+    def request(cls, method, path, headers=None, data=None):
+        request = Request(
+            cls.base + path,
+            data=data,
+            headers=headers or {},
+            method=method,
+        )
         try:
             response = urlopen(request, timeout=2)
         except HTTPError as error:
@@ -395,6 +458,7 @@ class OpenApiDriftTests(unittest.TestCase):
             .replace("{name}", "CreateOrder")
             .replace("{key_id}", "key_1")
             .replace("{seq}", "1")
+            .replace("{identity}", "client:openapi-drift")
         )
 
     def test_route_table_and_spec_have_the_same_method_path_pairs(self):
@@ -471,6 +535,39 @@ class OpenApiDriftTests(unittest.TestCase):
                         self.assertEqual(status, 401)
                     else:
                         self.assertNotEqual(status, 401)
+
+    def test_live_rate_limit_admin_routes_match_documented_contract(self):
+        key_headers = {"X-API-Key": "openapi-test-admin-key"}
+        identity = "client:openapi-drift"
+
+        status, _, body = self.request("GET", "/admin/rate-limits", headers=key_headers)
+        self.assertEqual(status, 200)
+        listing = json.loads(body)
+        self.assertEqual(set(listing), {"default", "overrides", "buckets"})
+        self.assertNotIn(identity, listing["overrides"])
+
+        payload = json.dumps({"burst": 10, "refill_per_second": 2.5}).encode("utf-8")
+        status, _, body = self.request(
+            "PUT",
+            f"/admin/rate-limits/{identity}",
+            headers={**key_headers, "Content-Type": "application/json"},
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body),
+            {
+                "identity": identity,
+                "burst": 10,
+                "refill_per_second": 2.5,
+            },
+        )
+
+        status, _, body = self.request(
+            "DELETE", f"/admin/rate-limits/{identity}", headers=key_headers
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
 
     def test_order_enums_and_limits_come_from_orders_constants(self):
         spec = self.live_spec()
