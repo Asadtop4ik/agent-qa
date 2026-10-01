@@ -514,6 +514,11 @@ class OrderStore:
                 "revenue_cents": revenue_cents,
             }
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return detached order rows from one consistent store snapshot."""
+        with self._lock:
+            return [self._copy_order(order) for order in self._orders.values()]
+
     def clear(self) -> None:
         """Remove all tenant rows when its registry entry is purged."""
         with self._lock:

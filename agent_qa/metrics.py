@@ -20,6 +20,7 @@ _AUDIT_DROPPED_NAME = "agent_qa_audit_dropped_total"
 _JOBS_NAME = "agent_qa_jobs"
 _OUTBOX_NAME = "agent_qa_outbox"
 _OUTBOX_DROPPED_NAME = "agent_qa_outbox_dropped_total"
+_MAINTENANCE_NAME = "agent_qa_maintenance"
 _JOB_STATUSES = (
     "queued",
     "running",
@@ -94,6 +95,24 @@ class MetricsRegistry:
         with self._lock:
             self._rate_limited[kind] = self._rate_limited.get(kind, 0) + 1
 
+    def snapshot(self) -> dict[str, list[dict[str, object]]]:
+        """Return detached request counters and route duration aggregates."""
+        with self._lock:
+            requests = [
+                {
+                    "method": method,
+                    "route": route,
+                    "status": status,
+                    "count": count,
+                }
+                for (method, route, status), count in self._requests.items()
+            ]
+            durations = [
+                {"route": route, "count": count, "total_seconds": total}
+                for (_method, route), (total, count) in self._durations.items()
+            ]
+        return {"requests": requests, "durations": durations}
+
     def render(
         self,
         orders: int,
@@ -108,6 +127,7 @@ class MetricsRegistry:
         tenant_orders: dict[str, int] | None = None,
         tenant_products: dict[str, int] | None = None,
         tenant_count: int | None = None,
+        maintenance_enabled: bool | None = None,
     ) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
@@ -302,6 +322,15 @@ class MetricsRegistry:
                             str(max(0, int(outbox_dropped))),
                         )
                     ],
+                )
+            )
+        if maintenance_enabled is not None:
+            families.append(
+                (
+                    _MAINTENANCE_NAME,
+                    "Whether maintenance mode is enabled.",
+                    "gauge",
+                    [(_MAINTENANCE_NAME, (), "1" if maintenance_enabled else "0")],
                 )
             )
 

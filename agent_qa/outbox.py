@@ -645,5 +645,13 @@ class OutboxStore:
                 counts[entry["status"]] += 1
             return counts, self._dropped
 
+    def snapshot(self) -> dict[str, int]:
+        """Return one consistent count for each outbox status."""
+        with self._lock:
+            counts = {status: 0 for status in _STATUSES}
+            for entry in self._entries.values():
+                counts[entry["status"]] += 1
+            return counts
+
 
 OUTBOX = OutboxStore()

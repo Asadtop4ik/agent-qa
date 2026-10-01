@@ -286,6 +286,32 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 operation["responses"][status].setdefault("headers", {}).update(
                     deepcopy(headers)
                 )
+        if route.get("method") in {"POST", "PUT", "PATCH", "DELETE"} and not str(
+            route.get("path", "")
+        ).startswith("/admin/"):
+            maintenance = {
+                "description": "Configured maintenance retry delay in seconds.",
+                "schema": {"type": "string"},
+            }
+            response = operation["responses"].get("503")
+            if response is None:
+                response = {
+                    "description": (
+                        "Writes are temporarily rejected during maintenance."
+                    ),
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }
+                    },
+                    "headers": {},
+                }
+                operation["responses"]["503"] = response
+            else:
+                response["description"] += (
+                    " Writes are also rejected during maintenance."
+                )
+            response.setdefault("headers", {})["Retry-After"] = maintenance
         if operation["x-rate-limited"]:
             rate_headers = {
                 "RateLimit-Limit": {

@@ -392,6 +392,11 @@ class ProductStore:
 
             return run_bulk(items, apply_one, rollback, atomic)
 
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return detached product rows from one consistent store snapshot."""
+        with self._lock:
+            return [deepcopy(product) for product in self._products.values()]
+
     def export_rows(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
         """Return at most 1000 matching products for CSV export."""
         allowed = {"category", "active", "in_stock", "q"}

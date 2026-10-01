@@ -80,6 +80,23 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertTrue(rendered.endswith("\n"))
 
+    def test_snapshot_is_detached_and_maintenance_gauge_is_optional(self):
+        registry = MetricsRegistry()
+        registry.record("GET", "/health", 200, 0.125)
+        snapshot = registry.snapshot()
+        snapshot["requests"][0]["count"] = 100
+        snapshot["durations"].clear()
+        fresh = registry.snapshot()
+        self.assertEqual(fresh["requests"][0]["count"], 1)
+        self.assertEqual(fresh["durations"][0]["count"], 1)
+
+        without_gauge = registry.render(0, "test")
+        self.assertNotIn("agent_qa_maintenance", without_gauge)
+        enabled = registry.render(0, "test", maintenance_enabled=True)
+        disabled = registry.render(0, "test", maintenance_enabled=False)
+        self.assertIn("agent_qa_maintenance 1", enabled)
+        self.assertIn("agent_qa_maintenance 0", disabled)
+
     def test_unrecognized_methods_share_a_bounded_series(self):
         registry = MetricsRegistry()
         for index in range(100):
