@@ -150,6 +150,222 @@ _PRODUCT = {
 }
 
 SCHEMAS = {
+    "CreateJob": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["sleep", "orders_summary", "stock_report", "fail"],
+            },
+            "params": {"type": "object"},
+        },
+        "additionalProperties": False,
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["sleep"]},
+                    "params": {"$ref": "#/components/schemas/SleepJobParams"},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["orders_summary"]},
+                    "params": {"$ref": "#/components/schemas/OrdersSummaryJobParams"},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["stock_report"]},
+                    "params": {"$ref": "#/components/schemas/StockReportJobParams"},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "enum": ["fail"]},
+                    "params": {"$ref": "#/components/schemas/FailJobParams"},
+                },
+                "additionalProperties": False,
+            },
+        ],
+    },
+    "Job": {
+        "type": "object",
+        "required": [
+            "id",
+            "type",
+            "params",
+            "status",
+            "progress",
+            "result",
+            "error",
+            "cancel_requested",
+            "created_at",
+            "started_at",
+            "finished_at",
+        ],
+        "properties": {
+            "id": {"type": "integer", "minimum": 1},
+            "type": {
+                "type": "string",
+                "enum": ["sleep", "orders_summary", "stock_report", "fail"],
+            },
+            "params": {"type": "object"},
+            "status": {
+                "type": "string",
+                "enum": [
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                ],
+            },
+            "progress": {"type": "integer", "minimum": 0, "maximum": 100},
+            "result": {
+                "oneOf": [
+                    {"type": "object", "nullable": True, "enum": [None]},
+                    {"$ref": "#/components/schemas/SleepJobResult"},
+                    {"$ref": "#/components/schemas/OrdersSummaryJobResult"},
+                    {"$ref": "#/components/schemas/StockReportJobResult"},
+                ],
+            },
+            "error": {"$ref": "#/components/schemas/JobError"},
+            "cancel_requested": {"type": "boolean"},
+            "created_at": {"type": "string", "format": "date-time"},
+            "started_at": {"type": "string", "format": "date-time", "nullable": True},
+            "finished_at": {"type": "string", "format": "date-time", "nullable": True},
+        },
+        "additionalProperties": False,
+    },
+    "SleepJobParams": {
+        "type": "object",
+        "properties": {
+            "duration_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 5000,
+                "default": 100,
+            }
+        },
+        "additionalProperties": False,
+    },
+    "OrdersSummaryJobParams": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+    "StockReportJobParams": {
+        "type": "object",
+        "properties": {
+            "threshold": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1_000_000,
+                "default": 5,
+            }
+        },
+        "additionalProperties": False,
+    },
+    "FailJobParams": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "default": "boom",
+            }
+        },
+        "additionalProperties": False,
+    },
+    "SleepJobResult": {
+        "type": "object",
+        "required": ["slept_ms"],
+        "properties": {"slept_ms": {"type": "integer", "minimum": 0, "maximum": 5000}},
+        "additionalProperties": False,
+    },
+    "OrdersSummaryJobResult": {
+        "type": "object",
+        "required": ["orders", "by_status", "revenue_cents"],
+        "properties": {
+            "orders": {"type": "integer", "minimum": 0},
+            "by_status": {
+                "type": "object",
+                "required": ["new", "paid", "shipped", "cancelled"],
+                "properties": {
+                    "new": {"type": "integer", "minimum": 0},
+                    "paid": {"type": "integer", "minimum": 0},
+                    "shipped": {"type": "integer", "minimum": 0},
+                    "cancelled": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": False,
+            },
+            "revenue_cents": {"type": "integer", "minimum": 0},
+        },
+        "additionalProperties": False,
+    },
+    "StockReportJobResult": {
+        "type": "object",
+        "required": ["threshold", "low_stock"],
+        "properties": {
+            "threshold": {"type": "integer", "minimum": 0, "maximum": 1_000_000},
+            "low_stock": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["product_id", "sku", "stock"],
+                    "properties": {
+                        "product_id": {"type": "integer", "minimum": 1},
+                        "sku": {"type": "string", "minLength": 2, "maxLength": 32},
+                        "stock": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 1_000_000,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    },
+    "JobError": {
+        "type": "object",
+        "nullable": True,
+        "required": ["code", "message"],
+        "properties": {
+            "code": {"type": "string", "enum": ["job_failed", "job_crashed"]},
+            "message": {"type": "string", "minLength": 1, "maxLength": 100},
+        },
+        "additionalProperties": False,
+    },
+    "JobList": {
+        "type": "object",
+        "required": ["items", "total", "limit", "offset"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/Job"},
+            },
+            "total": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "offset": {"type": "integer", "minimum": 0},
+        },
+        "additionalProperties": False,
+    },
     "CreateOrdersBulk": {
         "type": "object",
         "required": ["items"],

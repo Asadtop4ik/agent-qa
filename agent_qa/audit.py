@@ -15,7 +15,7 @@ _MAX_CAPACITY = 5000
 _MAX_TEXT = 256
 _MAX_ACTOR = 128
 _ALLOWED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-_ALLOWED_RESOURCES = frozenset({"orders", "products", "keys"})
+_ALLOWED_RESOURCES = frozenset({"orders", "products", "keys", "jobs"})
 _CHANGE_TYPES = {
     "status": str,
     "total_cents": int,

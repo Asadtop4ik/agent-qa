@@ -715,3 +715,35 @@ class ProductStore:
                 }
                 for category, products in sorted(grouped.items())
             ]
+
+    def low_stock_snapshot(self, threshold: int) -> list[dict[str, Any]]:
+        """Copy low-stock rows in stock-count then ID order under one lock."""
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int)
+            or not 0 <= threshold <= 1_000_000
+        ):
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                [
+                    {
+                        "field": "params.threshold",
+                        "message": "Must be an integer from 0 to 1000000",
+                    }
+                ],
+            )
+        with self._lock:
+            return [
+                {
+                    "product_id": product["id"],
+                    "sku": product["sku"],
+                    "stock": product["stock"],
+                }
+                for product in sorted(
+                    self._products.values(),
+                    key=lambda item: (item["stock"], item["id"]),
+                )
+                if product["stock"] <= threshold
+            ]

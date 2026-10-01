@@ -8,7 +8,7 @@ from urllib.parse import quote, urlencode
 
 from agent_qa import auth
 from agent_qa.audit import AUDIT_LOG
-from agent_qa.config import FIXTURE_PATH, GIT_SHA
+from agent_qa.config import FIXTURE_PATH, GIT_SHA, job_retention, job_workers
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
 from agent_qa.context import get_context
 from agent_qa.errors import ApiError
@@ -33,6 +33,12 @@ from agent_qa.orders import (
     validate_patch,
     validate_query,
 )
+from agent_qa.jobs import (
+    JOB_STATUSES,
+    JOB_TYPES,
+    JobRunner,
+    make_builtin_handlers,
+)
 from agent_qa.products import (
     ProductStore,
     validate_adjust_stock,
@@ -44,6 +50,11 @@ from agent_qa.products import (
 
 ORDER_STORE = OrderStore()
 PRODUCT_STORE = ProductStore()
+JOB_RUNNER = JobRunner(
+    make_builtin_handlers(ORDER_STORE, PRODUCT_STORE),
+    workers=job_workers(),
+    retention=job_retention(),
+)
 
 
 def _header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -158,6 +169,7 @@ def metrics(
     order_count = ORDER_STORE.list(limit=1)[1]
     product_count = PRODUCT_STORE.list(limit=1)[1]
     audit_entries, audit_dropped = AUDIT_LOG.metrics_snapshot()
+    job_statuses = JOB_RUNNER.status_counts()
     return (
         200,
         REGISTRY.render(
@@ -166,6 +178,7 @@ def metrics(
             products=product_count,
             audit_entries=audit_entries,
             audit_dropped=audit_dropped,
+            job_statuses=job_statuses,
         ),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
@@ -705,6 +718,115 @@ def get_audit_entry(
     return 200, entry, {}
 
 
+def create_job(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Queue a validated background job."""
+    values = payload if isinstance(payload, dict) else {}
+    job = JOB_RUNNER.submit(values["type"], values.get("params"))
+    return 202, job, {"Location": f"/jobs/{job['id']}"}
+
+
+def list_jobs(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return filtered, paginated jobs in creation order."""
+    filters = validate_query_params(_JOB_LIST_QUERY_PARAMETERS, query)
+    return 200, JOB_RUNNER.list_jobs(**filters), {}
+
+
+def _job_id(path_params: dict[str, str] | None) -> int | None:
+    raw_id = (path_params or {}).get("id", "")
+    if len(raw_id) > 19 or not raw_id.isascii() or not raw_id.isdigit():
+        return None
+    try:
+        job_id = int(raw_id)
+    except ValueError:
+        return None
+    return job_id if job_id > 0 else None
+
+
+def get_job(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return a job, optionally waiting on its condition for completion."""
+    filters = validate_query_params(_JOB_WAIT_QUERY_PARAMETERS, query)
+    job_id = _job_id(path_params)
+    if job_id is None:
+        raise ApiError(404, "job_not_found", "Job not found")
+    job = JOB_RUNNER.get(job_id, wait_ms=filters.get("wait_ms", 0))
+    if job is None:
+        raise ApiError(404, "job_not_found", "Job not found")
+    return 200, job, {}
+
+
+def cancel_job(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Request cooperative cancellation of a queued or running job."""
+    job_id = _job_id(path_params)
+    if job_id is None:
+        raise ApiError(404, "job_not_found", "Job not found")
+    job = JOB_RUNNER.cancel(job_id)
+    if job is None:
+        raise ApiError(404, "job_not_found", "Job not found")
+    return 200, job, {}
+
+
+_JOB_LIST_QUERY_PARAMETERS = [
+    {
+        "name": "status",
+        "in": "query",
+        "schema": {"type": "string", "enum": list(JOB_STATUSES)},
+    },
+    {
+        "name": "type",
+        "in": "query",
+        "schema": {"type": "string", "enum": list(JOB_TYPES)},
+    },
+    {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 20,
+        },
+    },
+    {
+        "name": "offset",
+        "in": "query",
+        "schema": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": (1 << 63) - 1,
+            "default": 0,
+        },
+    },
+]
+_JOB_WAIT_QUERY_PARAMETERS = [
+    {
+        "name": "wait_ms",
+        "in": "query",
+        "schema": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5000,
+            "default": 0,
+        },
+    }
+]
+
+
 _ORDER_ID = {
     "name": "id",
     "in": "path",
@@ -757,7 +879,10 @@ _AUDIT_QUERY_PARAMETERS = [
     {
         "name": "resource",
         "in": "query",
-        "schema": {"type": "string", "enum": ["orders", "products", "keys"]},
+        "schema": {
+            "type": "string",
+            "enum": ["orders", "products", "keys", "jobs"],
+        },
     },
     {
         "name": "resource_id",
@@ -838,7 +963,7 @@ _AUDIT_ENTRY_SCHEMA = {
         "path": {"type": "string"},
         "resource": {
             "type": "string",
-            "enum": ["orders", "products", "keys"],
+            "enum": ["orders", "products", "keys", "jobs"],
             "nullable": True,
         },
         "resource_id": {
@@ -1794,6 +1919,97 @@ ROUTES = (
         "summary": "Read product category aggregates",
         "responses": ["200", "403"],
         "response_schemas": {"200": _CATEGORY_LIST_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "POST",
+        "path": "/jobs",
+        "handler": create_job,
+        "body": True,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "createJob",
+        "summary": "Queue a background job",
+        "request_schema": SCHEMAS["CreateJob"],
+        "responses": ["202", "400", "401", "403", "503"],
+        "response_schemas": {"202": {"$ref": "#/components/schemas/Job"}},
+        "response_headers": {
+            "202": {
+                "Location": {
+                    "description": "Relative URL of the queued job.",
+                    "schema": {"type": "string"},
+                }
+            },
+            "503": {
+                "Retry-After": {
+                    "description": "Retry after one second when the queue is full.",
+                    "schema": {"type": "string", "enum": ["1"]},
+                }
+            },
+        },
+        "error_responses": {
+            "400": "The job type or parameters are invalid.",
+            "503": "The queued job limit is reached (queue_full).",
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/jobs",
+        "handler": list_jobs,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "listJobs",
+        "summary": "List background jobs",
+        "parameters": _JOB_LIST_QUERY_PARAMETERS,
+        "responses": ["200", "400"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/JobList"}},
+        "error_responses": {"400": "Invalid or repeated filter parameter."},
+    },
+    {
+        "method": "GET",
+        "path": "/jobs/{id}",
+        "handler": get_job,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "getJob",
+        "summary": "Read a background job",
+        "parameters": [
+            {
+                "name": "id",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "integer", "minimum": 1},
+            },
+            *_JOB_WAIT_QUERY_PARAMETERS,
+        ],
+        "responses": ["200", "400", "404"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Job"}},
+        "error_responses": {
+            "400": "wait_ms must be an integer from 0 through 5000.",
+            "404": "The job does not exist (job_not_found).",
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/jobs/{id}/cancel",
+        "handler": cancel_job,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "cancelJob",
+        "summary": "Cancel a background job",
+        "parameters": [
+            {
+                "name": "id",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "integer", "minimum": 1},
+            }
+        ],
+        "responses": ["200", "401", "403", "404", "409"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Job"}},
+        "error_responses": {
+            "404": "The job does not exist (job_not_found).",
+            "409": "The job is already terminal (job_not_cancellable).",
+        },
     },
     {
         "method": "GET",

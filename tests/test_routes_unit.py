@@ -400,6 +400,106 @@ class RouteUnitTests(unittest.TestCase):
         self.assertEqual(error.exception.status, 413)
         self.assertEqual(error.exception.code, "payload_too_large")
 
+    def test_job_dispatch_validates_input_filters_and_sets_location(self):
+        from agent_qa.server import Handler
+
+        job = {
+            "id": 17,
+            "type": "sleep",
+            "params": {"duration_ms": 10},
+            "status": "queued",
+            "progress": 0,
+        }
+        handler, responses = self.make_dispatcher(
+            "/jobs", b'{"type":"sleep","params":{"duration_ms":10}}'
+        )
+        with (
+            patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY),
+            patch("agent_qa.routes.JOB_RUNNER.submit", return_value=job) as submit,
+        ):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 202)
+        self.assertEqual(responses[0][2], {"Location": "/jobs/17"})
+        submit.assert_called_once_with("sleep", {"duration_ms": 10})
+
+        handler, _ = self.make_dispatcher(
+            "/jobs", b'{"type":"sleep","params":{"duration_ms":5001}}'
+        )
+        with patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY):
+            with self.assertRaises(ApiError) as error:
+                Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.code, "validation_error")
+        self.assertEqual(error.exception.details[0]["field"], "params.duration_ms")
+
+        handler, responses = self.make_dispatcher(
+            "/jobs?status=failed&type=fail&limit=2&offset=1", b"", method="GET"
+        )
+        with patch(
+            "agent_qa.routes.JOB_RUNNER.list_jobs", return_value={"items": []}
+        ) as list_jobs:
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 200)
+        list_jobs.assert_called_once_with(
+            status="failed", type="fail", limit=2, offset=1
+        )
+
+    def test_job_wait_bounds_and_queue_full_retry_header(self):
+        from agent_qa.server import Handler
+
+        handler, _ = self.make_dispatcher("/jobs/17?wait_ms=5001", b"", method="GET")
+        with self.assertRaises(ApiError) as error:
+            Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.code, "invalid_query")
+
+        handler, responses = self.make_dispatcher("/jobs", b'{"type":"fail"}')
+        with (
+            patch("agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY),
+            patch(
+                "agent_qa.routes.JOB_RUNNER.submit",
+                side_effect=ApiError(503, "queue_full", "Job queue is full"),
+            ),
+        ):
+            Handler._handle(handler)
+        self.assertEqual(responses[0][0], 503)
+        self.assertEqual(responses[0][2], {"Retry-After": "1"})
+        self.assertEqual(responses[0][1]["error"]["code"], "queue_full")
+
+    def test_job_creation_records_job_resource_and_id_in_audit(self):
+        from agent_qa.audit import AuditLog
+        from agent_qa.context import RequestContext, clear_context, set_context
+        from agent_qa.server import Handler
+
+        audit = AuditLog(10)
+        job = {"id": 23, "type": "fail", "status": "queued"}
+        handler, responses = self.make_dispatcher("/jobs", b'{"type":"fail"}')
+        handler._request_started = 0
+        handler._response_recorded = False
+        handler._json = lambda status, body, headers=None: (
+            setattr(handler, "_audit_response_body", body),
+            responses.append((status, body, headers or {})),
+        )
+        set_context(RequestContext(request_id="jobs-audit-test"))
+        try:
+            with (
+                patch(
+                    "agent_qa.server.authenticate_api_key",
+                    return_value=AUTH_IDENTITY,
+                ),
+                patch("agent_qa.routes.JOB_RUNNER.submit", return_value=job),
+                patch("agent_qa.server.AUDIT_LOG", audit),
+                patch("agent_qa.server.REGISTRY.record"),
+                patch("agent_qa.server.write_access_log"),
+            ):
+                Handler._dispatch(handler)
+                Handler._record_response(handler, 202)
+            listing = audit.query(resource="jobs", resource_id="23")
+            self.assertEqual(listing["items"][0]["resource"], "jobs")
+            self.assertEqual(listing["items"][0]["resource_id"], 23)
+        finally:
+            clear_context()
+
     def test_order_request_schema_identity(self):
         create = next(
             route

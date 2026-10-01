@@ -38,6 +38,14 @@ class MetricsRegistryTests(unittest.TestCase):
                     'status="200"} 2',
                     'agent_qa_http_requests_total{method="PUT",route="/ready",'
                     'status="405"} 1',
+                    "# HELP agent_qa_jobs Current number of jobs by status.",
+                    "# TYPE agent_qa_jobs gauge",
+                    'agent_qa_jobs{status="cancelled"} 0',
+                    'agent_qa_jobs{status="cancelling"} 0',
+                    'agent_qa_jobs{status="failed"} 0',
+                    'agent_qa_jobs{status="queued"} 0',
+                    'agent_qa_jobs{status="running"} 0',
+                    'agent_qa_jobs{status="succeeded"} 0',
                     "# HELP agent_qa_orders Current number of orders.",
                     "# TYPE agent_qa_orders gauge",
                     "agent_qa_orders 3",
@@ -45,6 +53,16 @@ class MetricsRegistryTests(unittest.TestCase):
                 ]
             ),
         )
+
+    def test_job_gauge_has_all_statuses_and_snapshot_values(self):
+        rendered = MetricsRegistry().render(
+            0,
+            "test",
+            job_statuses={"queued": 2, "running": 1},
+        )
+        self.assertIn('agent_qa_jobs{status="queued"} 2', rendered)
+        self.assertIn('agent_qa_jobs{status="running"} 1', rendered)
+        self.assertEqual(rendered.count("agent_qa_jobs{status="), 6)
 
     def test_labels_escape_backslash_quote_and_newline(self):
         registry = MetricsRegistry()
@@ -81,7 +99,7 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertNotIn("CUSTOM-", rendered)
         self.assertEqual(rendered.count('method="'), 6)
-        self.assertLess(len(rendered), 1000)
+        self.assertLess(len(rendered), 1500)
 
     def test_render_uses_a_consistent_request_snapshot(self):
         registry = MetricsRegistry()
