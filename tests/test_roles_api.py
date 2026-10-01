@@ -114,6 +114,20 @@ class RoleApiTests(unittest.TestCase):
                     required_role = "admin"
                 elif route["path"] == "/whoami":
                     required_role = "read"
+                elif (
+                    route["path"]
+                    in {"/webhooks", "/webhooks/{id}", "/outbox", "/outbox/{id}"}
+                    and route["method"] == "GET"
+                ):
+                    required_role = "read"
+                elif route["path"] in {"/outbox/process", "/outbox/dispatcher"}:
+                    required_role = "admin"
+                elif route["path"] == "/outbox/{id}/requeue":
+                    required_role = "write"
+                elif route["path"] in {"/webhooks", "/webhooks/{id}"} and route[
+                    "method"
+                ] in {"POST", "PATCH", "DELETE"}:
+                    required_role = "write"
                 elif route["method"] in {"POST", "PATCH", "DELETE"} and route[
                     "path"
                 ].startswith(("/orders", "/products", "/jobs")):

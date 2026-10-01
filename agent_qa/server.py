@@ -24,6 +24,7 @@ from agent_qa.context import (
     set_context,
 )
 from agent_qa.orders import OrderError
+from agent_qa.outbox import OUTBOX
 from agent_qa.request_id import request_id
 from agent_qa.routes import JOB_RUNNER, ROUTES
 from agent_qa.validation import validate
@@ -575,4 +576,5 @@ def main() -> None:
         server.serve_forever()
     finally:
         JOB_RUNNER.stop(timeout=5)
+        OUTBOX.stop(timeout=5)
         server.server_close()
