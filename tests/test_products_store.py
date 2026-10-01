@@ -80,7 +80,17 @@ class ProductValidationTests(unittest.TestCase):
     def test_query_validates_filters_sort_and_bounds(self):
         self.assertEqual(
             validate_query([("active", "false"), ("limit", "2")]),
-            {"active": False, "limit": 2, "offset": 0, "sort": "id"},
+            {
+                "active": False,
+                "limit": 2,
+                "offset": 0,
+                "sort": "id",
+                "pagination": "offset",
+            },
+        )
+        self.assertEqual(
+            validate_query([("cursor", "opaque")]),
+            {"limit": 20, "sort": "id", "pagination": "cursor", "cursor": "opaque"},
         )
         invalid_queries = (
             [("active", "yes")],
@@ -92,6 +102,8 @@ class ProductValidationTests(unittest.TestCase):
             [("limit", "999999999999999999999999999999999999")],
             [("unknown", "x")],
             [("limit", "1"), ("limit", "2")],
+            [("cursor", "abc"), ("offset", "0")],
+            [("pagination", "offset"), ("cursor", "abc")],
         )
         for query in invalid_queries:
             with self.subTest(query=query), self.assertRaises(ApiError) as error:
@@ -229,6 +241,71 @@ class ProductStoreTests(unittest.TestCase):
         descending, _ = store.list(sort="-name", limit=3)
         self.assertEqual([item["id"] for item in ascending], [2, 3, 1])
         self.assertEqual([item["id"] for item in descending], [1, 2, 3])
+
+    def test_cursor_pages_keep_descending_ties_stable_across_mutations(self):
+        store = ProductStore()
+        for index in range(50):
+            store.create(
+                **product_fields(
+                    sku=f"BULK-{index + 1}",
+                    name=f"Product {index + 1}",
+                    price_cents=100,
+                )
+            )
+
+        items, total, cursor = store.list(
+            sort="-price_cents", limit=7, pagination="cursor"
+        )
+        seen = [item["id"] for item in items]
+        self.assertEqual(total, 50)
+        self.assertIsNotNone(cursor)
+        store.create(**product_fields(sku="BULK-51", price_cents=100))
+        self.assertTrue(store.delete(3))
+        self.assertTrue(store.delete(10))
+
+        while cursor is not None:
+            items, total, cursor = store.list(
+                sort="-price_cents",
+                limit=5 if len(seen) % 2 else 7,
+                pagination="cursor",
+                cursor=cursor,
+            )
+            seen.extend(item["id"] for item in items)
+        self.assertEqual(seen, [*range(1, 10), *range(11, 52)])
+        self.assertEqual(len(seen), len(set(seen)))
+        self.assertEqual(total, 49)
+
+    def test_cursor_first_page_rejects_explicit_offset(self):
+        store = ProductStore()
+
+        for offset in (0, 20):
+            with self.subTest(offset=offset), self.assertRaises(ApiError) as error:
+                store.list(pagination="cursor", offset=offset)
+            self.assertEqual(error.exception.code, "invalid_query")
+
+        self.assertEqual(store.list(pagination="cursor"), ([], 0, None))
+        self.assertEqual(store.list(offset=0), ([], 0))
+
+    def test_cursor_total_uses_filter_and_rejects_filter_or_sort_changes(self):
+        store = ProductStore()
+        store.create(**product_fields(sku="FILTER-1", category="match"))
+        store.create(**product_fields(sku="FILTER-2", category="match"))
+        store.create(**product_fields(sku="FILTER-3", category="other"))
+
+        items, total, cursor = store.list(
+            category="match", sort="name", limit=1, pagination="cursor"
+        )
+        self.assertEqual(total, 2)
+        self.assertEqual(len(items), 1)
+        self.assertIsNotNone(cursor)
+        for changed_query in (
+            {"category": "other", "sort": "name"},
+            {"category": "match", "sort": "-name"},
+        ):
+            with self.subTest(query=changed_query):
+                with self.assertRaises(ApiError) as error:
+                    store.list(**changed_query, limit=1, cursor=cursor)
+                self.assertEqual(error.exception.code, "cursor_mismatch")
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
     """Return validation errors for a bounded JSON-Schema subset.
 
     Supported keywords are type, required, properties, additionalProperties,
-    enum, minimum, maximum, minLength, maxLength, pattern, items, minItems,
+    enum, minimum, maximum, minLength, maxLength, nullable, pattern, items, minItems,
     maxItems, uniqueItems for bounded arrays, minProperties, x-fullMatch,
     x-nonBlank, x-nonZero, and x-exactlyOne.
     """
@@ -86,6 +86,8 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
             return
         if not isinstance(current_schema, dict):
             add(field, "Invalid schema")
+            return
+        if value is None and current_schema.get("nullable") is True:
             return
 
         enum = current_schema.get("enum")

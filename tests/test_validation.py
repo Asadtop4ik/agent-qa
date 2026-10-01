@@ -94,6 +94,21 @@ class SchemaValidationTests(unittest.TestCase):
             ],
         )
 
+    def test_nullable_type_accepts_null_and_non_nullable_type_rejects_it(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "next_cursor": {"type": "string", "nullable": True},
+                "cursor": {"type": "string"},
+            },
+        }
+        self.assertEqual(validate(schema, {"next_cursor": None}), [])
+        self.assertEqual(validate(schema, {"next_cursor": "opaque"}), [])
+        self.assertEqual(
+            validate(schema, {"cursor": None}),
+            [{"field": "cursor", "message": "Must be a string"}],
+        )
+
     def test_order_list_items_use_and_validate_the_named_order_schema(self):
         from agent_qa.schemas import SCHEMAS
 
@@ -114,11 +129,14 @@ class SchemaValidationTests(unittest.TestCase):
             "total": 1,
             "limit": 20,
             "offset": 0,
+            "next_cursor": None,
         }
         self.assertEqual(
             validate(SCHEMAS["OrderList"], response),
             [{"field": "items[0].id", "message": "Must be an integer"}],
         )
+        response["items"][0]["id"] = 1
+        self.assertEqual(validate(SCHEMAS["OrderList"], response), [])
 
     def test_property_named_body_keeps_its_nested_path(self):
         schema = {

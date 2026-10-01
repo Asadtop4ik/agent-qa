@@ -162,6 +162,23 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     "application/json": {"schema": deepcopy(route["request_schema"])}
                 },
             }
+        for status, description in route.get("error_responses", {}).items():
+            if status in operation["responses"]:
+                operation["responses"][status].update(
+                    {
+                        "description": description,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Error"}
+                            }
+                        },
+                    }
+                )
+        for status, headers in route.get("response_headers", {}).items():
+            if status in operation["responses"]:
+                operation["responses"][status].setdefault("headers", {}).update(
+                    deepcopy(headers)
+                )
         if route["auth_required"]:
             operation["security"] = [{"ApiKeyAuth": []}]
         paths.setdefault(path, {})[method] = operation
