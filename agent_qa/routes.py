@@ -1549,13 +1549,13 @@ ROUTES = (
         "method": "GET",
         "path": "/exports/products.csv",
         "handler": export_products_csv,
-        "role": None,
-        "auth_required": False,
+        "role": "read",
+        "auth_required": True,
         "operation_id": "exportProductsCsv",
         "summary": "Export filtered products as CSV",
         "produces": ["text/csv"],
         "parameters": _EXPORT_PRODUCT_QUERY,
-        "responses": ["200", "400", "406", "403"],
+        "responses": ["200", "400", "401", "406", "403"],
         "response_schemas": {"200": {"type": "string", "format": "binary"}},
         "response_headers": {
             "200": {
@@ -1570,13 +1570,13 @@ ROUTES = (
         "method": "GET",
         "path": "/exports/orders.csv",
         "handler": export_orders_csv,
-        "role": None,
-        "auth_required": False,
+        "role": "read",
+        "auth_required": True,
         "operation_id": "exportOrdersCsv",
         "summary": "Export filtered orders as CSV",
         "produces": ["text/csv"],
         "parameters": _EXPORT_ORDER_QUERY,
-        "responses": ["200", "400", "406", "403"],
+        "responses": ["200", "400", "401", "406", "403"],
         "response_schemas": {"200": {"type": "string", "format": "binary"}},
         "response_headers": {
             "200": {

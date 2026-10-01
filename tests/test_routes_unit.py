@@ -570,6 +570,8 @@ class RouteUnitTests(unittest.TestCase):
     def test_csv_export_negotiates_accept_and_rejects_unknown_filters(self):
         from agent_qa.server import Handler
 
+        read_identity = {**AUTH_IDENTITY, "role": "read"}
+
         for accept in (
             "application/json",
             "text/csv;q=0, */*;q=1",
@@ -578,13 +580,19 @@ class RouteUnitTests(unittest.TestCase):
                 "/exports/products.csv", b"", method="GET"
             )
             handler.headers["Accept"] = accept
-            Handler._dispatch(handler)
+            with patch(
+                "agent_qa.server.authenticate_api_key", return_value=read_identity
+            ):
+                Handler._dispatch(handler)
             self.assertEqual(responses[0][0], 406)
         handler, responses = self.make_dispatcher(
             "/exports/products.csv", b"", method="GET"
         )
         handler.headers["Accept"] = "*/*"
-        with patch("agent_qa.routes.PRODUCT_STORE.export_csv", return_value=[]):
+        with (
+            patch("agent_qa.routes.PRODUCT_STORE.export_csv", return_value=[]),
+            patch("agent_qa.server.authenticate_api_key", return_value=read_identity),
+        ):
             Handler._dispatch(handler)
         self.assertEqual(responses[0][0], 200)
         self.assertEqual(
@@ -600,7 +608,10 @@ class RouteUnitTests(unittest.TestCase):
         handler, _ = self.make_dispatcher(
             "/exports/products.csv?unexpected=x", b"", method="GET"
         )
-        with self.assertRaises(ApiError) as error:
+        with (
+            patch("agent_qa.server.authenticate_api_key", return_value=read_identity),
+            self.assertRaises(ApiError) as error,
+        ):
             Handler._dispatch(handler)
         self.assertEqual(error.exception.status, 400)
         self.assertEqual(error.exception.code, "invalid_query")
@@ -679,7 +690,11 @@ class RouteUnitTests(unittest.TestCase):
             method="GET",
         )
         handler.headers["Accept"] = "text/csv"
-        with patch("agent_qa.routes.ORDER_STORE", orders):
+        read_identity = {**AUTH_IDENTITY, "role": "read"}
+        with (
+            patch("agent_qa.routes.ORDER_STORE", orders),
+            patch("agent_qa.server.authenticate_api_key", return_value=read_identity),
+        ):
             Handler._dispatch(handler)
         self.assertEqual(responses[0][0], 200)
         self.assertTrue(

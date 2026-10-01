@@ -1,6 +1,8 @@
 """Focused tests for CSV parsing, rendering, and store imports."""
 
 import unittest
+from email.message import Message
+from io import BytesIO
 from unittest.mock import patch
 
 from agent_qa.csvio import (
@@ -14,9 +16,25 @@ from agent_qa.csvio import (
 from agent_qa.errors import ApiError
 from agent_qa.orders import OrderStore
 from agent_qa.products import ProductStore
+from agent_qa.server import Handler
 
 
 PRODUCT_HEADERS = ("sku", "name", "category", "price_cents", "stock", "tags", "active")
+
+
+class CsvRequestBodyTests(unittest.TestCase):
+    def test_truncated_csv_body_with_complete_record_prefix_is_rejected(self):
+        body = b"sku,name,category,price_cents\r\nGOOD-1,Good,food,10\r\n"
+        handler = object.__new__(Handler)
+        handler.headers = Message()
+        handler.headers["Content-Type"] = "text/csv"
+        handler.headers["Content-Length"] = str(len(body) + 10)
+        handler.rfile = BytesIO(body)
+
+        with self.assertRaises(ApiError) as raised:
+            handler._read_body(consumes=("text/csv",), require_object=False)
+
+        self.assertEqual(raised.exception.code, "invalid_csv")
 
 
 class CsvPureFunctionTests(unittest.TestCase):

@@ -122,6 +122,11 @@ class RoleApiTests(unittest.TestCase):
                     required_role = "admin"
                 elif route["path"] == "/whoami":
                     required_role = "read"
+                elif route["path"] in {
+                    "/exports/orders.csv",
+                    "/exports/products.csv",
+                }:
+                    required_role = "read"
                 elif route["method"] in {"POST", "PATCH", "DELETE"} and route[
                     "path"
                 ].startswith(("/orders", "/products", "/imports")):

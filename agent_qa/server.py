@@ -296,7 +296,15 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     parameters[name] = value
             try:
-                return self.rfile.read(length).decode("utf-8-sig")
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    raise ApiError(
+                        400,
+                        length_error_code,
+                        length_error_message,
+                        length_error_details,
+                    )
+                return body.decode("utf-8-sig")
             except UnicodeDecodeError as error:
                 raise ApiError(
                     400,
