@@ -237,7 +237,8 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(set(next_body), {"items", "total", "limit", "next_cursor"})
         self.assertEqual(next_body["items"], [second])
         self.assertIsNone(next_body["next_cursor"])
-        self.assertNotIn("Link", next_headers)
+        self.assertEqual(next_headers["Link"], '</v2/orders>; rel="successor-version"')
+        self.assertNotIn('rel="next"', next_headers["Link"])
 
     def test_search_query_endpoint_and_offset_pagination(self):
         customer = self.customer_id()

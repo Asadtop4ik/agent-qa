@@ -223,6 +223,7 @@ class RouteUnitTests(unittest.TestCase):
                 ("POST", "/products"),
                 ("POST", "/orders/bulk"),
                 ("POST", "/products/bulk"),
+                ("POST", "/v2/orders"),
             },
         )
 
@@ -727,6 +728,22 @@ class RouteUnitTests(unittest.TestCase):
                     Handler._dispatch(handler)
             self.assertEqual(error.exception.status, 400)
             self.assertEqual(error.exception.code, "invalid_json")
+
+    def test_deprecated_route_sunset_is_enforced_with_injected_clock(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+
+        from agent_qa.server import Handler
+
+        handler, responses = self.make_dispatcher("/orders", b"", method="GET")
+        handler.headers = Message()
+        enabled = SimpleNamespace(values={"AGENT_QA_ENFORCE_SUNSET": True})
+        after_sunset = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        with patch("agent_qa.versioning.settings.current", return_value=enabled):
+            with patch("agent_qa.versioning.utcnow", return_value=after_sunset):
+                Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 410)
+        self.assertEqual(responses[0][1]["error"]["code"], "api_version_sunset")
 
     def test_dispatch_validates_before_calling_handler(self):
         from agent_qa.server import Handler

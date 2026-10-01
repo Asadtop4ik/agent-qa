@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent_qa.conditional import parse_etag_list, weak_match
-from agent_qa.errors import ApiError
+from agent_qa.errors import ApiError, envelope
+from agent_qa.schemas import V2_CREATE_ORDER_SCHEMA
 from agent_qa.server import Handler
 
 
@@ -43,6 +44,112 @@ def response_header(handler, name):
 
 
 class ContentNegotiationHandlerTests(unittest.TestCase):
+    def test_version_headers_are_generated_and_successor_link_is_merged(self):
+        route = {
+            "path": "/fixture/{id}",
+            "method": "GET",
+            "api_version": "1",
+            "deprecated": True,
+            "successor": "/v2/fixture/{id}",
+        }
+        handler = make_handler("/fixture/17", headers={"Accept": "application/json"})
+        with patch("agent_qa.server.ROUTES", (route,)):
+            Handler._json(
+                handler,
+                200,
+                {"ok": True},
+                {"Link": '</next>; rel="next"'},
+            )
+        self.assertEqual(response_header(handler, "Deprecation"), "@1790812800")
+        self.assertEqual(
+            response_header(handler, "Sunset"), "Thu, 31 Dec 2026 23:59:59 GMT"
+        )
+        self.assertEqual(response_header(handler, "X-API-Version"), "1")
+        self.assertEqual(
+            response_header(handler, "Link"),
+            '</next>; rel="next", </v2/fixture/17>; rel="successor-version"',
+        )
+
+        error_handler = make_handler(
+            "/fixture/17", headers={"Accept": "application/json"}
+        )
+        with patch("agent_qa.server.ROUTES", (route,)):
+            Handler._json(error_handler, 404, envelope("missing", "Missing"))
+        self.assertEqual(response_header(error_handler, "Deprecation"), "@1790812800")
+        self.assertEqual(response_header(error_handler, "X-API-Version"), "1")
+
+    def test_v2_errors_always_use_problem_json(self):
+        route = {"path": "/v2/fixture", "method": "GET", "api_version": "2"}
+        handler = make_handler("/v2/fixture", headers={"Accept": "application/json"})
+        with patch("agent_qa.server.ROUTES", (route,)):
+            Handler._json(handler, 400, envelope("invalid", "Invalid"))
+        self.assertEqual(
+            response_header(handler, "Content-Type"),
+            "application/problem+json; charset=utf-8",
+        )
+        self.assertEqual(response_header(handler, "X-API-Version"), "2")
+
+    def test_v2_method_mismatch_still_enforces_json_acceptability(self):
+        route = {
+            "path": "/v2/orders",
+            "method": "GET",
+            "api_version": "2",
+            "role": None,
+            "auth_required": False,
+        }
+        for accept, expected_status in (
+            ("text/html", 406),
+            ("application/json", 405),
+        ):
+            with self.subTest(accept=accept):
+                handler = make_handler(
+                    "/v2/orders", method="POST", headers={"Accept": accept}
+                )
+                with patch("agent_qa.server.ROUTES", (route,)):
+                    Handler._handle(handler)
+                self.assertEqual(handler.status, expected_status)
+                self.assertEqual(response_header(handler, "X-API-Version"), "2")
+                self.assertEqual(
+                    response_header(handler, "Content-Type"),
+                    "application/problem+json; charset=utf-8",
+                )
+
+    def test_v2_dispatch_validation_reports_nested_v2_fields(self):
+        route = {
+            "path": "/v2/orders",
+            "method": "POST",
+            "api_version": "2",
+            "body": True,
+            "request_schema": V2_CREATE_ORDER_SCHEMA,
+            "role": None,
+            "auth_required": False,
+            "rate_limited": False,
+        }
+        payload = b'{"customer":{},"amount":{"total_cents":true}}'
+        handler = make_handler(
+            "/v2/orders",
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        handler.rfile = io.BytesIO(payload)
+        with patch("agent_qa.server.ROUTES", (route,)):
+            with patch("agent_qa.server.authenticate_api_key", return_value=None):
+                Handler._handle(handler)
+        response = json.loads(handler.wfile.getvalue())
+        self.assertEqual(handler.status, 400)
+        self.assertEqual(
+            {item["field"] for item in response["errors"]},
+            {"customer.id", "amount.total_cents"},
+        )
+        self.assertEqual(
+            response_header(handler, "Content-Type"),
+            "application/problem+json; charset=utf-8",
+        )
+
     def test_csv_body_reader_strips_bom_and_enforces_charset_and_utf8(self):
         handler = make_handler(headers={"Content-Type": "text/csv; charset=utf-8"})
         csv_body = b"\xef\xbb\xbfsku,name\r\na,Alpha\r\n"

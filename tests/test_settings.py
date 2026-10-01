@@ -84,6 +84,15 @@ class SettingsTests(unittest.TestCase):
         loaded = settings.load({"AGENT_QA_REQUIRE_IF_MATCH": "t" * 10000})
         self.assertFalse(loaded.valid)
 
+    def test_sunset_enforcement_defaults_off_and_parses_boolean(self):
+        self.assertIs(settings.load({}).values["AGENT_QA_ENFORCE_SUNSET"], False)
+        self.assertIs(
+            settings.load({"AGENT_QA_ENFORCE_SUNSET": "true"}).values[
+                "AGENT_QA_ENFORCE_SUNSET"
+            ],
+            True,
+        )
+
     def test_boolean_spellings_are_case_insensitive(self):
         for value in ("true", "TRUE", "1", "yes", "Yes"):
             with self.subTest(value=value):
