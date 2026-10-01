@@ -346,6 +346,8 @@ class Handler(BaseHTTPRequestHandler):
             rate_result = LIMITER.consume(bucket_identity)
             self._rate_limit_headers = rate_result.headers
             if not rate_result.allowed:
+                if context is not None and identity is not None:
+                    context.actor = identity.get("key_id", "anonymous")
                 REGISTRY.record_rate_limited(bucket_identity.split(":", 1)[0])
                 self._json(
                     429,

@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from agent_qa.audit import AuditLog
+from agent_qa.context import RequestContext, clear_context, set_context
 from agent_qa.errors import envelope
 from agent_qa.idempotency import IdempotencyStore
 from agent_qa.ratelimit import TokenBucketLimiter
@@ -133,6 +135,49 @@ class RateLimitDispatchTests(unittest.TestCase):
             Handler._dispatch(second)
         self.assertEqual(first.responses[0][0], 401)
         self.assertEqual(second.responses[0][0], 429)
+
+    def test_rate_limit_denial_audit_retains_authenticated_actor(self):
+        audit = AuditLog(10)
+        identity = {"key_id": "key-42", "role": "admin"}
+        called = []
+
+        def auditing_dispatcher():
+            handler = self.dispatcher()
+            handler._request_started = 0.0
+            handler._response_recorded = False
+
+            def record_json(status, body, headers=None):
+                handler.responses.append((status, body, headers or {}))
+                handler._audit_response_body = body
+                Handler._record_response(handler, status)
+
+            handler._json = record_json
+            return handler
+
+        with (
+            patch("agent_qa.server.ROUTES", (self.route(called),)),
+            patch("agent_qa.server.LIMITER", self.limiter),
+            patch("agent_qa.server.AUDIT_LOG", audit),
+            patch("agent_qa.server.REGISTRY.record"),
+            patch("agent_qa.server.REGISTRY.record_rate_limited"),
+            patch("agent_qa.server.write_access_log"),
+            patch("agent_qa.server.perf_counter", return_value=1.0),
+            patch("agent_qa.server.authenticate_api_key", return_value=identity),
+        ):
+            first = auditing_dispatcher()
+            self.addCleanup(clear_context)
+            set_context(RequestContext("first-request"))
+            Handler._dispatch(first)
+
+            denied = auditing_dispatcher()
+            set_context(RequestContext("denied-request"))
+            Handler._dispatch(denied)
+
+        self.assertEqual(first.responses[0][0], 200)
+        self.assertEqual(denied.responses[0][0], 429)
+        entry = audit.get(audit.last_seq)
+        self.assertEqual(entry["status"], 429)
+        self.assertEqual(entry["actor"], "key-42")
 
     def test_exempt_unmatched_and_method_mismatch_skip_buckets(self):
         called = []
