@@ -86,6 +86,7 @@ class ProductApiTests(unittest.TestCase):
     def test_route_table_has_authenticated_write_routes_and_expected_responses(self):
         expected = {
             ("POST", "/products"),
+            ("POST", "/products/bulk"),
             ("GET", "/products"),
             ("GET", "/products/{id}"),
             ("PATCH", "/products/{id}"),
@@ -105,6 +106,7 @@ class ProductApiTests(unittest.TestCase):
         }
         for method, path in (
             ("POST", "/products"),
+            ("POST", "/products/bulk"),
             ("PATCH", "/products/{id}"),
             ("DELETE", "/products/{id}"),
             ("POST", "/products/{id}/adjust-stock"),
@@ -118,6 +120,11 @@ class ProductApiTests(unittest.TestCase):
             )
         self.assertTrue(
             {"401", "409", "413", "415"}.issubset(response_codes[("POST", "/products")])
+        )
+        self.assertTrue(
+            {"201", "207", "401", "409", "413", "415", "422"}.issubset(
+                response_codes[("POST", "/products/bulk")]
+            )
         )
         self.assertTrue(
             {"401", "404", "409", "413", "415"}.issubset(

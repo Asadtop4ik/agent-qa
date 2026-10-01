@@ -288,6 +288,19 @@ def create_order(
     )
 
 
+def create_orders_bulk(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Create orders in sequence and return per-item results."""
+    values = payload if isinstance(payload, dict) else {}
+    status, body = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create_bulk(
+        values.get("items"), values.get("atomic", False)
+    )
+    return status, body, {}
+
+
 def list_orders(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -414,6 +427,19 @@ def create_product(
             "ETag": etag_for("product", product["id"], version),
         },
     )
+
+
+def create_products_bulk(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Create products in sequence and return per-item results."""
+    values = payload if isinstance(payload, dict) else {}
+    status, body = PRODUCT_STORE.create_bulk(
+        values.get("items"), values.get("atomic", False)
+    )
+    return status, body, {}
 
 
 def list_products(
@@ -1084,6 +1110,35 @@ ROUTES = (
         "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
     },
     {
+        "method": "POST",
+        "path": "/orders/bulk",
+        "handler": create_orders_bulk,
+        "body": True,
+        "auth_required": True,
+        "operation_id": "createOrdersBulk",
+        "summary": "Create orders in bulk",
+        "idempotent": True,
+        "idempotency_replay_statuses": [422],
+        "max_body_bytes": 65536,
+        "request_schema": SCHEMAS["CreateOrdersBulk"],
+        "responses": [
+            "201",
+            "207",
+            "400",
+            "401",
+            "409",
+            "411",
+            "413",
+            "415",
+            "422",
+        ],
+        "response_schemas": {
+            "201": {"$ref": "#/components/schemas/BulkCreateResponse"},
+            "207": {"$ref": "#/components/schemas/BulkCreateResponse"},
+            "422": {"$ref": "#/components/schemas/BulkCreateResponse"},
+        },
+    },
+    {
         "method": "DELETE",
         "path": "/orders/{id}",
         "handler": delete_order,
@@ -1133,6 +1188,35 @@ ROUTES = (
         "request_schema": _CREATE_PRODUCT_SCHEMA,
         "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
         "response_schemas": {"201": _PRODUCT_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "POST",
+        "path": "/products/bulk",
+        "handler": create_products_bulk,
+        "body": True,
+        "auth_required": True,
+        "operation_id": "createProductsBulk",
+        "summary": "Create products in bulk",
+        "idempotent": True,
+        "idempotency_replay_statuses": [422],
+        "max_body_bytes": 65536,
+        "request_schema": SCHEMAS["CreateProductsBulk"],
+        "responses": [
+            "201",
+            "207",
+            "400",
+            "401",
+            "409",
+            "411",
+            "413",
+            "415",
+            "422",
+        ],
+        "response_schemas": {
+            "201": {"$ref": "#/components/schemas/BulkCreateResponse"},
+            "207": {"$ref": "#/components/schemas/BulkCreateResponse"},
+            "422": {"$ref": "#/components/schemas/BulkCreateResponse"},
+        },
     },
     {
         "method": "GET",

@@ -71,14 +71,21 @@ Item orders reserve stock atomically and include product name and price snapshot
 their `total_cents` is computed from the line totals. Cancelling an item order
 releases its reservation once.
 
+`POST /orders/bulk` and `POST /products/bulk` accept `{"items":[...],"atomic":false}`
+with 1–50 create requests. Each result keeps its input index; the overall status
+is `201` when all succeed, `207` for mixed results, and `422` when all fail.
+Set `atomic` to `true` to roll back the full batch after any item fails. Bulk
+request bodies are limited to 65,536 bytes.
+
 `POST /orders` and `POST /products` accept an optional `Idempotency-Key` header
 (1–64 ASCII letters, digits, `.`, `_`, `:`, or `-`). The key is scoped to the API
 key, method, and exact path. Repeating the same JSON request replays its saved
-2xx response with `Idempotent-Replay: true`; only 2xx responses are saved. An
-invalid key returns `400`, reuse with a different request returns `422`, and a
-concurrent request returns `409`. Saved responses expire after 600 seconds by
-default (`AGENT_QA_IDEMPOTENCY_TTL_SECONDS`, range 1–86400), with a maximum of
-500 saved keys.
+2xx response with `Idempotent-Replay: true`; other create routes save only 2xx
+responses, while bulk routes replay the complete result for `201`, `207`, or
+`422`. An invalid key returns `400`, reuse with a different request returns
+`422`, and a concurrent request returns `409`. Saved responses expire after 600
+seconds by default (`AGENT_QA_IDEMPOTENCY_TTL_SECONDS`, range 1–86400), with a
+maximum of 500 saved keys.
 
 ## JSON schemas
 

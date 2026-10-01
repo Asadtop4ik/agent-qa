@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import threading
+from copy import deepcopy
 from typing import Any
 
+from agent_qa.bulk import run_bulk, validate_bulk_input
 from agent_qa.conditional import check_expected_version
 from agent_qa.errors import ApiError
 from agent_qa.orders import OrderError, OrderStore, validate_create, validate_patch
@@ -122,6 +124,40 @@ class FulfillmentService:
                 if not isinstance(error, (ApiError, OrderError)):
                     logger.exception("Unexpected failure creating item order")
                 raise
+
+    def create_bulk(
+        self, items: list[Any], atomic: bool = False
+    ) -> tuple[int, dict[str, Any]]:
+        """Create orders sequentially, optionally restoring orders and stock."""
+        validate_bulk_input(items, atomic)
+
+        def apply_one(item: Any) -> dict[str, Any]:
+            try:
+                return self.create(**validate_create(item))
+            except OrderError as error:
+                status = {
+                    "validation_error": 400,
+                    "store_full": 409,
+                }.get(error.code, 500)
+                raise ApiError(
+                    status, error.code, error.message, error.details
+                ) from error
+
+        with self._lock, self._products._lock, self._orders._lock:
+            orders_snapshot = deepcopy(self._orders._orders)
+            order_id_snapshot = self._orders._next_id
+            products_snapshot = deepcopy(self._products._products)
+            product_id_snapshot = self._products._next_id
+
+            def rollback() -> None:
+                self._orders._orders.clear()
+                self._orders._orders.update(deepcopy(orders_snapshot))
+                self._orders._next_id = order_id_snapshot
+                self._products._products.clear()
+                self._products._products.update(deepcopy(products_snapshot))
+                self._products._next_id = product_id_snapshot
+
+            return run_bulk(items, apply_one, rollback, atomic)
 
     def update(
         self,

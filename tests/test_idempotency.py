@@ -108,6 +108,18 @@ class IdempotencyStoreTests(unittest.TestCase):
         self.assertEqual(next_replay.response.body, {"nested": {"value": 1}})
         self.assertEqual(next_replay.response.headers, {"Location": "/orders/1"})
 
+    def test_non_success_response_requires_an_explicit_allowed_status(self):
+        scope = ("key", "bulk")
+        self.assertEqual(self.store.begin(scope, "body").kind, "new")
+        response = StoredResponse(422, {"results": []}, {})
+        with self.assertRaises(ValueError):
+            self.store.complete(scope, response)
+
+        self.store.complete(scope, response, allowed_statuses=(422,))
+        replay = self.store.begin(scope, "body")
+        self.assertEqual(replay.kind, "replay")
+        self.assertEqual(replay.response, response)
+
     def test_active_reservations_are_not_evicted_at_capacity(self):
         store = IdempotencyStore(ttl_seconds=10, capacity=2, clock=self.clock)
         first, second, third = (("key", str(value)) for value in range(3))
@@ -235,6 +247,27 @@ class IdempotencyApiTests(unittest.TestCase):
         self.assertEqual(replay[0], 201)
         self.assertEqual(replay[1], first[1])
         self.assertEqual(self.products.list()[1], 1)
+
+    def test_bulk_all_failed_result_is_replayed_as_a_complete_response(self):
+        payload = {"items": [{}]}
+        first = self.dispatch("POST", "/products/bulk", payload, key="bulk-all-failed")
+        replay = self.dispatch("POST", "/products/bulk", payload, key="bulk-all-failed")
+        self.assertEqual(first[0], 422)
+        self.assertEqual(replay[0], 422)
+        self.assertEqual(replay[1], first[1])
+        self.assertEqual(replay[2]["Idempotency-Key"], "bulk-all-failed")
+        self.assertEqual(replay[2]["Idempotent-Replay"], "true")
+        self.assertEqual(self.products.list()[1], 0)
+
+    def test_bulk_mixed_result_replays_without_creating_another_order(self):
+        payload = {"items": [self.order_payload(), {}]}
+        first = self.dispatch("POST", "/orders/bulk", payload, key="bulk-mixed")
+        replay = self.dispatch("POST", "/orders/bulk", payload, key="bulk-mixed")
+        self.assertEqual(first[0], 207)
+        self.assertEqual(replay[0], 207)
+        self.assertEqual(replay[1], first[1])
+        self.assertEqual(replay[2]["Idempotent-Replay"], "true")
+        self.assertEqual(self.orders.list()[1], 1)
 
     def test_schema_invalid_mismatch_precedes_validation_and_fresh_key_retries(self):
         valid = {"customer_id": "schema-order", "total_cents": 100}
