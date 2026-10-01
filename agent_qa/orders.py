@@ -271,7 +271,7 @@ class OrderStore:
                 [{"field": "offset", "message": "Invalid offset"}],
             )
         cursor_mode = pagination == "cursor" or cursor is not None
-        if cursor_mode and (cursor is not None and offset != DEFAULT_OFFSET):
+        if cursor_mode and offset != DEFAULT_OFFSET:
             raise OrderError(
                 "invalid_query",
                 "Invalid query parameters",

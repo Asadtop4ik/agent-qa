@@ -311,11 +311,14 @@ def _validate_store_query(query: dict[str, Any]) -> None:
             raise _invalid_store_query("offset")
     if "pagination" in query and query["pagination"] not in {"offset", "cursor"}:
         raise _invalid_store_query("pagination")
-    if "cursor" in query and (
-        not isinstance(query["cursor"], str)
-        or query.get("pagination") == "offset"
-        or "offset" in query
-    ):
+    if (
+        "cursor" in query
+        and (
+            not isinstance(query["cursor"], str)
+            or query.get("pagination") == "offset"
+            or "offset" in query
+        )
+    ) or (query.get("pagination") == "cursor" and "offset" in query):
         raise _invalid_store_query("cursor")
 
 

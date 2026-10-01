@@ -177,6 +177,13 @@ class OrderStoreTests(unittest.TestCase):
                 store.list(**query)
             self.assertEqual(error.exception.code, "invalid_query")
 
+    def test_cursor_first_page_rejects_nondefault_offset(self):
+        store = OrderStore()
+        with self.assertRaises(OrderError) as error:
+            store.list(pagination="cursor", offset=20)
+        self.assertEqual(error.exception.code, "invalid_query")
+        self.assertEqual(error.exception.details[0]["field"], "cursor")
+
     def test_transition_rules_and_total_lock(self):
         store = OrderStore()
         order = store.create("customer-a", 100)

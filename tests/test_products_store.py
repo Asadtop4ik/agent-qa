@@ -275,6 +275,17 @@ class ProductStoreTests(unittest.TestCase):
         self.assertEqual(len(seen), len(set(seen)))
         self.assertEqual(total, 49)
 
+    def test_cursor_first_page_rejects_explicit_offset(self):
+        store = ProductStore()
+
+        for offset in (0, 20):
+            with self.subTest(offset=offset), self.assertRaises(ApiError) as error:
+                store.list(pagination="cursor", offset=offset)
+            self.assertEqual(error.exception.code, "invalid_query")
+
+        self.assertEqual(store.list(pagination="cursor"), ([], 0, None))
+        self.assertEqual(store.list(offset=0), ([], 0))
+
     def test_cursor_total_uses_filter_and_rejects_filter_or_sort_changes(self):
         store = ProductStore()
         store.create(**product_fields(sku="FILTER-1", category="match"))
