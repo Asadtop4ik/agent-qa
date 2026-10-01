@@ -1,5 +1,7 @@
 """API error types and response body construction."""
 
+from http import HTTPStatus
+
 
 class ApiError(Exception):
     """An expected API error with an HTTP status and public details."""
@@ -31,3 +33,32 @@ def envelope(
     if details is not None:
         error["details"] = details
     return {"error": error}
+
+
+def problem(
+    status: int,
+    code: str,
+    message: str,
+    details: list[dict[str, str]] | None = None,
+    *,
+    request_id: str | None = None,
+    instance: str = "",
+) -> dict[str, object]:
+    """Build an RFC 9457 problem response with service-specific extensions."""
+    try:
+        title = HTTPStatus(status).phrase
+    except ValueError:
+        title = "Unknown Status"
+    body: dict[str, object] = {
+        "type": f"https://agent-qa.invalid/problems/{code}",
+        "title": title,
+        "status": status,
+        "detail": message,
+        "instance": instance,
+        "code": code,
+    }
+    if request_id is not None:
+        body["request_id"] = request_id
+    if details is not None:
+        body["errors"] = details
+    return body

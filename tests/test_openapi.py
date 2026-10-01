@@ -269,6 +269,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
             expected_responses = set(route["responses"])
+            expected_responses.add("406")
             if route.get("rate_limited", True):
                 expected_responses.add("429")
             self.assertEqual(set(operation["responses"]), expected_responses)
@@ -594,6 +595,25 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         non_post_operation = non_post_spec["paths"]["/orders/bulk"]["get"]
         self.assertNotIn("parameters", non_post_operation)
         self.assertNotIn("409", non_post_operation["responses"])
+
+    def test_every_operation_documents_automatic_406_and_negotiation(self):
+        spec = build_openapi(ROUTES, "negotiation-test")
+        for path, path_item in spec["paths"].items():
+            for method, operation in path_item.items():
+                with self.subTest(path=path, method=method):
+                    self.assertIn("406", operation["responses"])
+                    self.assertIn(
+                        "Accept", operation["responses"]["406"]["description"]
+                    )
+        description = spec["info"]["description"]
+        for term in (
+            "application/problem+json",
+            "RFC 9457",
+            "Accept-Encoding",
+            "Content-Encoding",
+            "256 bytes",
+        ):
+            self.assertIn(term, description)
 
 
 class OpenApiDriftTests(unittest.TestCase):
@@ -967,7 +987,10 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertNotIn("content", delete_response)
 
         metrics_response = spec["paths"]["/metrics"]["get"]["responses"]["200"]
-        self.assertNotIn("application/json", metrics_response.get("content", {}))
+        self.assertEqual(
+            metrics_response["content"],
+            {"text/plain": {"schema": {"type": "string"}}},
+        )
 
     def test_operation_ids_are_unique(self):
         spec = self.live_spec()

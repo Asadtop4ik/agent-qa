@@ -14,6 +14,24 @@ curl http://127.0.0.1:8080/ready
 
 Order write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before starting the service to configure the key. If the variable is unset or empty, the service uses the documented synthetic fallback `qa-synthetic-key`; this fallback is for synthetic QA environments only. Read endpoints and `POST /schemas/{name}/validate` remain public.
 
+## HTTP content negotiation
+
+Send `Accept` to choose a successful response type; routes return JSON unless
+documented otherwise (`GET /metrics` returns `text/plain`). Requests that do
+not accept a route's response type receive `406 not_acceptable` before the
+handler runs. JSON routes still return JSON when only
+`application/problem+json` is acceptable. With no `Accept` header or only
+`*/*`, errors keep the `{"error":...}` envelope; when
+`application/problem+json` is accepted at least as strongly as JSON, all errors
+use RFC 9457 problem details. Error responses include `Vary: Accept`.
+
+Responses with a non-empty body of at least 256 bytes use deterministic gzip
+when `Accept-Encoding` permits it. Body-bearing responses vary on
+`Accept-Encoding`; `GET /ready` and `GET /ping` are never compressed. The
+service does not decompress request bodies; a request
+with `Content-Encoding` other than `identity` receives
+`415 unsupported_content_encoding` after authentication.
+
 ## API key roles
 
 The configured bootstrap key is an immutable `admin` key. Key roles form the

@@ -13,6 +13,7 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         method = route["method"].lower()
         path = route["path"]
         response_schemas = route.get("response_schemas", {})
+        produces = route.get("produces", ["application/json"])
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
@@ -26,7 +27,7 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     **(
                         {
                             "content": {
-                                "application/json": {
+                                produces[0]: {
                                     "schema": deepcopy(response_schemas[status])
                                 }
                             }
@@ -38,6 +39,16 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 for status in route["responses"]
             },
         }
+        for status, response in operation["responses"].items():
+            if (
+                status.startswith("2")
+                and status not in response_schemas
+                and produces != ["application/json"]
+            ):
+                response["content"] = {
+                    media_type: {"schema": {"type": "string"}}
+                    for media_type in produces
+                }
         operation["responses"]["403"] = {
             "description": "The API key role is insufficient (forbidden).",
             "content": {
@@ -60,6 +71,15 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 },
             }
             operation["responses"]["429"] = error_response
+        operation["responses"]["406"] = {
+            "description": (
+                "No route response representation is acceptable according to "
+                "Accept (not_acceptable)."
+            ),
+            "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+            },
+        }
         if route.get("conditional_headers"):
             conditional_errors = {
                 "400": (
@@ -248,7 +268,21 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
 
     return {
         "openapi": "3.0.3",
-        "info": {"title": "agent-qa", "version": "1.0.0", "x-git-sha": git_sha},
+        "info": {
+            "title": "agent-qa",
+            "version": "1.0.0",
+            "x-git-sha": git_sha,
+            "description": (
+                "Requests may negotiate successful response types with Accept. "
+                "Errors use the standard error envelope unless "
+                "application/problem+json is accepted at least as strongly as "
+                "application/json; then errors use RFC 9457 problem details. "
+                "Responses with bodies may be compressed with gzip when accepted "
+                "by Accept-Encoding and the body is at least 256 bytes. "
+                "Request Content-Encoding values other than identity are rejected "
+                "with 415 unsupported_content_encoding."
+            ),
+        },
         "paths": paths,
         "components": {
             "securitySchemes": {

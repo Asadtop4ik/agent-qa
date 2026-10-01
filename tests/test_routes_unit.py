@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_qa.config import GIT_SHA
-from agent_qa.errors import ApiError, envelope
+from agent_qa.errors import ApiError, envelope, problem
 from agent_qa.orders import OrderStore
 from agent_qa.routes import (
     ROUTES,
@@ -30,6 +30,32 @@ AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
 
 
 class RouteUnitTests(unittest.TestCase):
+    def test_problem_response_includes_rfc9457_fields_and_optional_errors(self):
+        result = problem(
+            422,
+            "invalid_request",
+            "The request is invalid.",
+            [{"field": "name", "message": "required"}],
+            request_id="req-123",
+            instance="/orders",
+        )
+        self.assertEqual(
+            result,
+            {
+                "type": "https://agent-qa.invalid/problems/invalid_request",
+                "title": "Unprocessable Entity",
+                "status": 422,
+                "detail": "The request is invalid.",
+                "instance": "/orders",
+                "code": "invalid_request",
+                "request_id": "req-123",
+                "errors": [{"field": "name", "message": "required"}],
+            },
+        )
+        self.assertNotIn(
+            "errors", problem(404, "not_found", "No resource.", instance="/missing")
+        )
+
     def test_require_if_match_uses_registered_boolean_variants(self):
         from agent_qa.routes import _expected_version
 
