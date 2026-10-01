@@ -12,6 +12,7 @@ from agent_qa import schemas
 from agent_qa.errors import ApiError
 from agent_qa.openapi import build_openapi
 from agent_qa.products import ProductStore
+from agent_qa.ratelimit import TokenBucketLimiter
 from agent_qa.config import GIT_SHA
 from agent_qa.routes import ROUTES
 from agent_qa.server import Handler, allowed_methods
@@ -32,8 +33,11 @@ class ProductApiTests(unittest.TestCase):
             "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
         )
         self.auth_patch.start()
+        self.limiter_patch = patch("agent_qa.server.LIMITER", TokenBucketLimiter())
+        self.limiter_patch.start()
 
     def tearDown(self):
+        self.limiter_patch.stop()
         self.auth_patch.stop()
         self.store_patch.stop()
 
@@ -609,6 +613,7 @@ class ProductApiTests(unittest.TestCase):
                 "413",
                 "415",
                 "428",
+                "429",
             },
         )
 
