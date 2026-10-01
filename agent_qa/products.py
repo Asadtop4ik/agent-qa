@@ -150,7 +150,7 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
     pagination = values.get("pagination", "offset")
     if pagination not in {"offset", "cursor"}:
         errors.append({"field": "pagination", "message": "Must be offset or cursor"})
-    if "cursor" in values and explicit_offset:
+    if explicit_offset and (pagination == "cursor" or "cursor" in values):
         errors.append(
             {"field": "cursor", "message": "Cannot combine cursor and offset"}
         )

@@ -374,6 +374,8 @@ class ProductApiTests(unittest.TestCase):
             ("limit=0", "limit"),
             ("limit=101", "limit"),
             ("offset=-1", "offset"),
+            ("pagination=cursor&offset=20", "cursor"),
+            ("pagination=cursor&offset=0", "cursor"),
             ("cursor=abc&offset=1", "cursor"),
             ("pagination=offset&cursor=abc", "cursor"),
             ("offset=" + "9" * 5000, "offset"),

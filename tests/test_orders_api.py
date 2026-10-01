@@ -191,6 +191,8 @@ class OrdersApiTests(unittest.TestCase):
             "limit=1&limit=2",
             "cursor=abc&offset=1",
             "pagination=offset&cursor=abc",
+            "pagination=cursor&offset=20",
+            "pagination=cursor&offset=0",
         ):
             with self.subTest(query=query):
                 self.assert_error(
