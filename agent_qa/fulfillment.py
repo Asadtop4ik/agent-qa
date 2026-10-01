@@ -6,6 +6,7 @@ import logging
 import threading
 from typing import Any
 
+from agent_qa.conditional import check_expected_version
 from agent_qa.errors import ApiError
 from agent_qa.orders import OrderError, OrderStore, validate_create, validate_patch
 from agent_qa.products import ProductStore
@@ -22,11 +23,14 @@ class FulfillmentService:
         self._products = products
         self._lock = threading.RLock()
 
-    def create(self, **fields: Any) -> dict[str, Any]:
+    def create(self, *, include_version: bool = False, **fields: Any) -> dict[str, Any]:
         normalized = validate_create(fields)
         if "total_cents" in normalized:
             with self._lock, self._products._lock, self._orders._lock:
-                return self._orders._create_locked({**normalized, "items": []})
+                created = self._orders._create_locked({**normalized, "items": []})
+                return self._orders._copy_order(
+                    self._orders._orders[created["id"]], include_version
+                )
 
         lines = normalized["items"]
         prepared: list[dict[str, Any]] = []
@@ -101,12 +105,15 @@ class FulfillmentService:
             next_id = self._orders._next_id
             try:
                 self._products.reserve(reserve_lines)
-                return self._orders._create_locked(
+                created = self._orders._create_locked(
                     {
                         "customer_id": normalized["customer_id"],
                         "total_cents": total_cents,
                         "items": prepared,
                     }
+                )
+                return self._orders._copy_order(
+                    self._orders._orders[created["id"]], include_version
                 )
             except Exception as error:
                 self._products._restore_stock_locked(stock_snapshot)
@@ -116,7 +123,14 @@ class FulfillmentService:
                     logger.exception("Unexpected failure creating item order")
                 raise
 
-    def update(self, order_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
+    def update(
+        self,
+        order_id: int,
+        changes: dict[str, Any],
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+        include_version: bool = False,
+    ) -> dict[str, Any] | None:
         fields = validate_patch(changes)
         with self._lock, self._products._lock, self._orders._lock:
             current = self._orders._orders.get(order_id)
@@ -129,13 +143,23 @@ class FulfillmentService:
                 and bool(current.get("items"))
             )
             if not should_release:
-                return self._orders.update(order_id, fields)
+                return self._orders.update(
+                    order_id,
+                    fields,
+                    expected_version=expected_version,
+                    include_version=include_version,
+                )
 
             product_ids = {item["product_id"] for item in current["items"]}
             stock_snapshot = self._products._snapshot_stock_locked(product_ids)
-            order_snapshot = self._orders._copy_order(current)
+            order_snapshot = self._orders._copy_order(current, include_version=True)
             try:
-                updated = self._orders.update(order_id, fields)
+                updated = self._orders.update(
+                    order_id,
+                    fields,
+                    expected_version=expected_version,
+                    include_version=include_version,
+                )
                 self._products.release(self._stock_lines(current["items"]))
                 return updated
             except Exception as error:
@@ -145,25 +169,33 @@ class FulfillmentService:
                     logger.exception("Unexpected failure cancelling item order")
                 raise
 
-    def delete(self, order_id: int) -> bool:
+    def delete(
+        self,
+        order_id: int,
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+    ) -> bool:
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
             return False
         with self._lock, self._products._lock, self._orders._lock:
             current = self._orders._orders.get(order_id)
             if current is None:
                 return False
+            check_expected_version(
+                expected_version, "order", order_id, current["version"]
+            )
             should_release = current["status"] not in {"cancelled", "shipped"} and bool(
                 current.get("items")
             )
             if not should_release:
-                return self._orders.delete(order_id)
+                return self._orders.delete(order_id, expected_version=expected_version)
 
             product_ids = {item["product_id"] for item in current["items"]}
             stock_snapshot = self._products._snapshot_stock_locked(product_ids)
-            order_snapshot = self._orders._copy_order(current)
+            order_snapshot = self._orders._copy_order(current, include_version=True)
             try:
                 self._products.release(self._stock_lines(current["items"]))
-                return self._orders.delete(order_id)
+                return self._orders.delete(order_id, expected_version=expected_version)
             except Exception as error:
                 self._products._restore_stock_locked(stock_snapshot)
                 self._orders._orders[order_id] = order_snapshot

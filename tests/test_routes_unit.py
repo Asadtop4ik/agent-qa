@@ -163,6 +163,31 @@ class RouteUnitTests(unittest.TestCase):
         self.assertEqual(responses[0][1]["error"]["code"], "insufficient_stock")
         self.assertEqual(responses[0][1]["error"]["details"], details)
 
+    def test_json_304_is_empty_and_omits_content_type_and_length(self):
+        from agent_qa.server import Handler
+
+        for method in ("GET", "HEAD"):
+            with self.subTest(method=method):
+                handler = object.__new__(Handler)
+                handler.command = method
+                handler.request_id = "conditional-test"
+                handler.wfile = BytesIO()
+                sent_headers = []
+                handler._record_response = lambda status: None
+                handler.send_response = lambda status: None
+                handler.send_header = lambda name, value: sent_headers.append(
+                    (name, value)
+                )
+                handler.end_headers = lambda: None
+                Handler._json(handler, 304, None, {"ETag": '"o1.1"'})
+
+                header_names = [name for name, _ in sent_headers]
+                self.assertNotIn("Content-Type", header_names)
+                self.assertNotIn("Content-Length", header_names)
+                self.assertIn(("X-Request-Id", "conditional-test"), sent_headers)
+                self.assertIn(("ETag", '"o1.1"'), sent_headers)
+                self.assertEqual(handler.wfile.getvalue(), b"")
+
     def test_order_id_rejects_unbounded_numeric_path(self):
         from agent_qa.routes import _order_id
 

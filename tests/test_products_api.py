@@ -1,7 +1,9 @@
 """Socket-free tests for the product route handlers and HTTP dispatcher."""
 
+import hashlib
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from io import BytesIO
 from unittest.mock import patch
@@ -31,12 +33,16 @@ class ProductApiTests(unittest.TestCase):
         self.store_patch.stop()
 
     @staticmethod
-    def dispatch(method, path, payload=None, content_type="application/json"):
+    def dispatch(
+        method, path, payload=None, content_type="application/json", extra_headers=None
+    ):
         raw = json.dumps(payload).encode("utf-8") if payload is not None else b""
         headers = Message()
         if payload is not None:
             headers["Content-Length"] = str(len(raw))
             headers["Content-Type"] = content_type
+        for name, value in (extra_headers or {}).items():
+            headers[name] = value
         responses = []
         handler = object.__new__(Handler)
         handler.path = path
@@ -57,7 +63,9 @@ class ProductApiTests(unittest.TestCase):
                         "details": error.details,
                     }
                 },
-                {},
+                {"ETag": error.current_etag}
+                if getattr(error, "current_etag", None)
+                else {},
             )
         status, body, response_headers = responses[0]
         return status, body, response_headers
@@ -505,8 +513,126 @@ class ProductApiTests(unittest.TestCase):
         )
         self.assertEqual(
             paths["/products/{id}/adjust-stock"]["post"]["responses"].keys(),
-            {"200", "400", "401", "404", "409", "411", "413", "415"},
+            {"200", "400", "401", "404", "409", "411", "412", "413", "415", "428"},
         )
+
+    def test_product_etags_and_if_match_dispatch(self):
+        _, product, created_headers = self.create()
+        created_etag = created_headers["ETag"]
+        self.assertNotIn("version", product)
+        path = f"/products/{product['id']}"
+
+        status, current, headers = self.dispatch("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["ETag"], created_etag)
+        status, listing, headers = self.dispatch("GET", "/products")
+        canonical = json.dumps(
+            listing, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()[:16]
+        self.assertEqual(headers["ETag"], f'W/"{digest}"')
+        status, body, headers = self.dispatch(
+            "GET", "/products", extra_headers={"If-None-Match": headers["ETag"]}
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+        status, body, headers = self.dispatch(
+            "GET", "/products", extra_headers={"If-None-Match": f'"{digest}"'}
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+        status, body, headers = self.dispatch(
+            "GET", "/products", extra_headers={"If-None-Match": "*"}
+        )
+        self.assertEqual(status, 304)
+        self.assertIsNone(body)
+        self.assertIn("ETag", headers)
+
+        status, error, headers = self.dispatch(
+            "PATCH", path, {"name": "Changed"}, extra_headers={"If-Match": '"stale"'}
+        )
+        self.assertEqual(status, 412)
+        self.assertEqual(error["error"]["code"], "precondition_failed")
+        self.assertEqual(headers["ETag"], created_etag)
+        self.assertEqual(self.store.get(product["id"])["name"], "Widget")
+        status, error, _ = self.dispatch(
+            "PATCH",
+            path,
+            {"name": "Changed"},
+            extra_headers={"If-Match": f"W/{created_etag}"},
+        )
+        self.assertEqual(status, 412)
+        self.assertEqual(error["error"]["code"], "precondition_failed")
+        status, error, _ = self.dispatch(
+            "PATCH", path, {"name": "Changed"}, extra_headers={"If-Match": "p1.1"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(error["error"]["code"], "invalid_precondition")
+        status, error, _ = self.dispatch(
+            "PATCH", path, {}, extra_headers={"If-Match": "not-an-etag"}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(error["error"]["code"], "validation_error")
+        status, updated, headers = self.dispatch(
+            "PATCH",
+            path,
+            {"name": "Changed"},
+            extra_headers={"If-Match": f'"unrelated", {created_etag}'},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["ETag"], created_etag.rsplit(".", 1)[0] + '.2"')
+
+    def test_stock_and_delete_preconditions_preserve_state_and_error_order(self):
+        _, product, headers = self.create()
+        path = f"/products/{product['id']}"
+        before = self.store.get(product["id"], include_version=True)
+        for method, target, payload in (
+            ("POST", path + "/adjust-stock", {"delta": -1}),
+            ("DELETE", path, None),
+        ):
+            with self.subTest(method=method):
+                status, error, current_headers = self.dispatch(
+                    method, target, payload, extra_headers={"If-Match": '"stale"'}
+                )
+                self.assertEqual(status, 412)
+                self.assertEqual(error["error"]["code"], "precondition_failed")
+                self.assertEqual(current_headers["ETag"], headers["ETag"])
+                self.assertEqual(
+                    self.store.get(product["id"], include_version=True), before
+                )
+        status, error, _ = self.dispatch(
+            "PATCH",
+            "/products/999",
+            {"name": "Changed"},
+            extra_headers={"If-Match": "malformed"},
+        )
+        self.assertEqual(status, 404)
+        with patch.dict("os.environ", {"AGENT_QA_REQUIRE_IF_MATCH": "true"}):
+            status, error, _ = self.dispatch("PATCH", path, {"name": "Changed"})
+        self.assertEqual(status, 428)
+        self.assertEqual(error["error"]["code"], "precondition_required")
+
+    def test_same_if_match_allows_exactly_one_concurrent_patch(self):
+        _, product, created_headers = self.create()
+        expected = created_headers["ETag"]
+
+        def update(index):
+            from agent_qa.routes import patch_product
+
+            try:
+                return patch_product(
+                    [],
+                    {"id": str(product["id"])},
+                    {"name": f"Concurrent {index}"},
+                    request_headers={"If-Match": expected},
+                )[0]
+            except ApiError as error:
+                return error.status
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            statuses = list(executor.map(update, range(20)))
+        self.assertEqual(statuses.count(200), 1)
+        self.assertEqual(statuses.count(412), 19)
 
 
 if __name__ == "__main__":

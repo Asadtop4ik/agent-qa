@@ -7,6 +7,7 @@ import re
 import threading
 from typing import Any
 
+from agent_qa.conditional import check_expected_version
 from agent_qa.errors import ApiError
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
@@ -198,8 +199,13 @@ def _next_timestamp(previous: str) -> str:
     return now.isoformat().replace("+00:00", "Z")
 
 
-def _copy_product(product: dict[str, Any]) -> dict[str, Any]:
-    return {**product, "tags": list(product["tags"])}
+def _copy_product(
+    product: dict[str, Any], include_version: bool = False
+) -> dict[str, Any]:
+    copied = {**product, "tags": list(product["tags"])}
+    if not include_version:
+        copied.pop("version", None)
+    return copied
 
 
 def _invalid_store_query(field: str) -> ApiError:
@@ -283,7 +289,7 @@ class ProductStore:
         self._next_id = 1
         self._lock = threading.RLock()
 
-    def create(self, **fields: Any) -> dict[str, Any]:
+    def create(self, *, include_version: bool = False, **fields: Any) -> dict[str, Any]:
         valid = validate_create(fields)
         with self._lock:
             if any(
@@ -305,11 +311,14 @@ class ProductStore:
                 **valid,
                 "created_at": timestamp,
                 "updated_at": timestamp,
+                "version": 1,
             }
             self._products[product_id] = product
-            return _copy_product(product)
+            return _copy_product(product, include_version)
 
-    def get(self, product_id: int) -> dict[str, Any] | None:
+    def get(
+        self, product_id: int, *, include_version: bool = False
+    ) -> dict[str, Any] | None:
         if (
             isinstance(product_id, bool)
             or not isinstance(product_id, int)
@@ -318,9 +327,18 @@ class ProductStore:
             return None
         with self._lock:
             product = self._products.get(product_id)
-            return _copy_product(product) if product is not None else None
+            return (
+                _copy_product(product, include_version) if product is not None else None
+            )
 
-    def update(self, product_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
+    def update(
+        self,
+        product_id: int,
+        changes: dict[str, Any],
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+        include_version: bool = False,
+    ) -> dict[str, Any] | None:
         fields = validate_patch(changes)
         if (
             isinstance(product_id, bool)
@@ -332,12 +350,25 @@ class ProductStore:
             current = self._products.get(product_id)
             if current is None:
                 return None
+            check_expected_version(
+                expected_version, "product", product_id, current["version"]
+            )
             updated_at = _next_timestamp(current["updated_at"])
-            updated = {**current, **fields, "updated_at": updated_at}
+            updated = {
+                **current,
+                **fields,
+                "updated_at": updated_at,
+                "version": current["version"] + 1,
+            }
             self._products[product_id] = updated
-            return _copy_product(updated)
+            return _copy_product(updated, include_version)
 
-    def delete(self, product_id: int) -> bool:
+    def delete(
+        self,
+        product_id: int,
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+    ) -> bool:
         if (
             isinstance(product_id, bool)
             or not isinstance(product_id, int)
@@ -345,7 +376,14 @@ class ProductStore:
         ):
             return False
         with self._lock:
-            return self._products.pop(product_id, None) is not None
+            current = self._products.get(product_id)
+            if current is None:
+                return False
+            check_expected_version(
+                expected_version, "product", product_id, current["version"]
+            )
+            del self._products[product_id]
+            return True
 
     def _change_stock_locked(
         self, product_id: int, delta: int
@@ -364,11 +402,19 @@ class ProductStore:
             **current,
             "stock": stock,
             "updated_at": _next_timestamp(current["updated_at"]),
+            "version": current["version"] + 1,
         }
         self._products[product_id] = updated
         return updated
 
-    def adjust_stock(self, product_id: int, delta: int) -> dict[str, Any] | None:
+    def adjust_stock(
+        self,
+        product_id: int,
+        delta: int,
+        *,
+        expected_version: int | tuple[str, ...] | str | None = None,
+        include_version: bool = False,
+    ) -> dict[str, Any] | None:
         valid = validate_adjust_stock({"delta": delta})
         if (
             isinstance(product_id, bool)
@@ -377,8 +423,16 @@ class ProductStore:
         ):
             return None
         with self._lock:
+            current = self._products.get(product_id)
+            if current is None:
+                return None
+            check_expected_version(
+                expected_version, "product", product_id, current["version"]
+            )
             updated = self._change_stock_locked(product_id, valid["delta"])
-            return _copy_product(updated) if updated is not None else None
+            return (
+                _copy_product(updated, include_version) if updated is not None else None
+            )
 
     def reserve(self, lines: list[dict[str, Any]]) -> None:
         """Atomically decrement stock for validated order lines.

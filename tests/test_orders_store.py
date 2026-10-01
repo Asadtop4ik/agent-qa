@@ -1,6 +1,8 @@
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
+from agent_qa.conditional import PreconditionFailed, etag_for
 from agent_qa.orders import (
     MAX_ORDERS,
     OrderError,
@@ -59,6 +61,27 @@ class OrderValidationTests(unittest.TestCase):
 
 
 class OrderStoreTests(unittest.TestCase):
+    def test_versions_are_hidden_by_default_and_preconditions_are_atomic(self):
+        store = OrderStore()
+        created = store.create("customer-a", 1500, include_version=True)
+        self.assertEqual(created["version"], 1)
+        self.assertNotIn("version", store.get(created["id"]))
+
+        expected = (etag_for("order", created["id"], 1),)
+        barrier = threading.Barrier(20)
+
+        def patch(_):
+            barrier.wait(timeout=10)
+            try:
+                return store.update(1, {"status": "paid"}, expected_version=expected)
+            except PreconditionFailed:
+                return None
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            results = list(executor.map(patch, range(20)))
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(store.get(1, include_version=True)["version"], 2)
+
     def test_created_order_fields_and_monotonic_ids_after_delete(self):
         store = OrderStore()
         first = store.create("customer-a", 1500)

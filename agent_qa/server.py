@@ -90,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
     def _json(
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
-        is_empty = status == 204
+        is_empty = status in {204, 304}
         response_headers = headers or {}
         content_type = response_headers.get("Content-Type")
         if is_empty:
@@ -105,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(
                 "Content-Type", content_type or "application/json; charset=utf-8"
             )
-        self.send_header("Content-Length", str(len(encoded)))
+        if status != 304:
+            self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-Id", self.request_id)
         for name, value in response_headers.items():
@@ -293,7 +294,18 @@ class Handler(BaseHTTPRequestHandler):
                         "Request validation failed",
                         errors,
                     )
-            status, body, headers = route["handler"](query, path_params, payload)
+            conditional_headers = route.get("conditional_headers")
+            if conditional_headers:
+                request_headers = {}
+                for name in conditional_headers:
+                    values = self.headers.get_all(name, [])
+                    if values:
+                        request_headers[name] = ", ".join(values)
+                status, body, headers = route["handler"](
+                    query, path_params, payload, request_headers=request_headers
+                )
+            else:
+                status, body, headers = route["handler"](query, path_params, payload)
         except Exception:
             if idempotency_scope is not None:
                 IDEMPOTENCY_STORE.abort(idempotency_scope)
@@ -329,6 +341,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             (dispatch or self._dispatch)()
         except ApiError as error:
+            response_headers = {}
+            current_etag = getattr(error, "current_etag", None)
+            if current_etag is not None:
+                response_headers["ETag"] = current_etag
             self._json(
                 error.status,
                 envelope(
@@ -337,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
                     error.details,
                     request_id=self.request_id,
                 ),
+                response_headers,
             )
         except OrderError as error:
             status = {
