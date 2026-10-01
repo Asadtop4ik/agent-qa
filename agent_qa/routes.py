@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 from urllib.parse import quote, urlencode
 
 from agent_qa import auth
@@ -57,6 +58,7 @@ from agent_qa.products import (
     validate_patch as validate_product_patch,
     validate_query as validate_product_query,
 )
+from agent_qa.ratelimit import RATE_LIMITER
 
 
 ORDER_STORE = OrderStore()
@@ -953,6 +955,72 @@ def get_audit_entry(
     return 200, entry, {}
 
 
+def _rate_limit_identity(path_params: dict[str, str] | None) -> str:
+    identity = (path_params or {}).get("identity", "")
+    if (
+        len(identity) > 71
+        or re.fullmatch(r"(?:key|client|ip):[A-Za-z0-9._:-]{1,64}", identity) is None
+    ):
+        raise ApiError(
+            400,
+            "validation_error",
+            "Invalid request path",
+            [
+                {
+                    "field": "identity",
+                    "message": "Must be a valid rate limit identity",
+                }
+            ],
+        )
+    return identity
+
+
+def list_rate_limits(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the default rate limit policy and current overrides."""
+    return 200, RATE_LIMITER.snapshot(), {}
+
+
+def put_rate_limit(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Set an identity-specific rate limit policy and reset its bucket."""
+    identity = _rate_limit_identity(path_params)
+    errors = validate(SCHEMAS["RateLimitOverrideRequest"], payload)
+    if errors:
+        raise ApiError(400, "validation_error", "Request validation failed", errors)
+    assert isinstance(payload, dict)
+    burst = payload["burst"]
+    refill_per_second = payload["refill_per_second"]
+    RATE_LIMITER.set_override(identity, burst, refill_per_second)
+    return (
+        200,
+        {
+            "identity": identity,
+            "burst": burst,
+            "refill_per_second": refill_per_second,
+        },
+        {},
+    )
+
+
+def delete_rate_limit(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Remove an identity-specific rate limit policy and reset its bucket."""
+    identity = _rate_limit_identity(path_params)
+    if not RATE_LIMITER.delete_override(identity):
+        raise ApiError(404, "override_not_found", "Rate limit override not found")
+    return 204, None, {}
+
+
 def create_webhook(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -1584,6 +1652,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getHealth",
         "summary": "Check service health",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1624,6 +1693,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getStatus",
         "summary": "Check service and fixture status",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1651,6 +1721,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getReady",
         "summary": "Check service readiness",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1672,6 +1743,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getPing",
         "summary": "Check service liveness",
+        "rate_limited": False,
         "responses": ["200", "403"],
         "response_schemas": {
             "200": {
@@ -1690,6 +1762,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getMetrics",
         "summary": "Read service metrics",
+        "rate_limited": False,
         "responses": ["200", "403"],
     },
     {
@@ -2267,6 +2340,75 @@ ROUTES = (
                 },
                 "additionalProperties": False,
             }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/rate-limits",
+        "handler": list_rate_limits,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "listRateLimits",
+        "summary": "Read the default rate limit policy and overrides",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/RateLimitList"}},
+    },
+    {
+        "method": "PUT",
+        "path": "/admin/rate-limits/{identity}",
+        "handler": put_rate_limit,
+        "body": True,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "putRateLimit",
+        "summary": "Set a rate limit override and reset its bucket",
+        "parameters": [
+            {
+                "name": "identity",
+                "in": "path",
+                "required": True,
+                "schema": {
+                    "type": "string",
+                    "maxLength": 71,
+                    "pattern": "^(key|client|ip):[A-Za-z0-9._:-]{1,64}$",
+                },
+            }
+        ],
+        "request_schema": SCHEMAS["RateLimitOverrideRequest"],
+        "responses": ["200", "400", "401", "403", "409", "411", "413", "415"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/RateLimitOverride"}},
+        "error_responses": {
+            "400": "The identity or override values are invalid (validation_error).",
+            "409": "The override limit has been reached (override_limit).",
+        },
+    },
+    {
+        "method": "DELETE",
+        "path": "/admin/rate-limits/{identity}",
+        "handler": delete_rate_limit,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "deleteRateLimit",
+        "summary": "Remove a rate limit override and reset its bucket",
+        "parameters": [
+            {
+                "name": "identity",
+                "in": "path",
+                "required": True,
+                "schema": {
+                    "type": "string",
+                    "maxLength": 71,
+                    "pattern": "^(key|client|ip):[A-Za-z0-9._:-]{1,64}$",
+                },
+            }
+        ],
+        "responses": ["204", "400", "401", "403", "404"],
+        "error_responses": {
+            "400": "The identity is invalid (validation_error).",
+            "404": "The override does not exist (override_not_found).",
         },
     },
     {

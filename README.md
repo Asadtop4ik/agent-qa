@@ -27,6 +27,18 @@ securely. The service retains hashes in memory, and keeps at most 20 active
 non-bootstrap keys. Rotation can temporarily accept the previous secret during
 its grace period.
 
+## Rate limits
+
+Requests use an in-memory token bucket keyed by a valid API key, then a valid
+`X-Client-Id`, then the client IP. Defaults are a burst of 120 requests and a
+refill of 60 requests per second; set `AGENT_QA_RATE_BURST` and
+`AGENT_QA_RATE_REFILL_PER_SECOND` to change them. Limited responses include
+`RateLimit-*` headers, and exhausted buckets return `429 rate_limited` with
+`Retry-After`. Admins can inspect policies at `GET /admin/rate-limits`, set an
+override with `PUT /admin/rate-limits/{identity}` using `burst` and
+`refill_per_second`, or remove one with `DELETE /admin/rate-limits/{identity}`.
+Overrides and buckets are held in memory and reset when the service restarts.
+
 ## Products
 
 `GET /products` searches and filters the in-memory product catalog;

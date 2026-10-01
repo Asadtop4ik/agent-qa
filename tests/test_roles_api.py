@@ -110,7 +110,9 @@ class RoleApiTests(unittest.TestCase):
                 path = route["path"]
                 for part in ("{id}", "{name}", "{key_id}", "{seq}"):
                     path = path.replace(part, "sample")
-                if route["path"].startswith(("/admin/keys", "/audit")):
+                if route["path"].startswith(
+                    ("/admin/keys", "/admin/rate-limits", "/audit")
+                ):
                     required_role = "admin"
                 elif route["path"] == "/whoami":
                     required_role = "read"
@@ -135,10 +137,11 @@ class RoleApiTests(unittest.TestCase):
                 else:
                     required_role = None
                 self.assertEqual(route["role"], required_role)
+                dispatch_route = {**route, "rate_limited": False}
                 for key in self.credentials:
                     with self.subTest(path=route["path"], key=key is not None):
                         harness = Harness(route["method"], path, key=key)
-                        with patch("agent_qa.server.ROUTES", (route,)):
+                        with patch("agent_qa.server.ROUTES", (dispatch_route,)):
                             status, body, headers = self.dispatch(harness)
                         if required_role is None:
                             expected = 400

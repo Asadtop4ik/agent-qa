@@ -165,6 +165,7 @@ class AuditRequestRecordingTests(unittest.TestCase):
             "path": "/public-write",
             "handler": lambda *_args: (201, {"ok": True}, {}),
             "auth_required": False,
+            "rate_limited": False,
         }
         identity = {"key_id": "key-public", "role": "read", "label": "public"}
         set_context(RequestContext("public-write"))

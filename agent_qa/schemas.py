@@ -150,6 +150,64 @@ _PRODUCT = {
 }
 
 SCHEMAS = {
+    "RateLimitPolicy": {
+        "type": "object",
+        "required": ["burst", "refill_per_second"],
+        "properties": {
+            "burst": {"type": "integer", "minimum": 1, "maximum": 100000},
+            "refill_per_second": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 10000,
+            },
+        },
+        "additionalProperties": False,
+    },
+    "RateLimitOverrideRequest": {
+        "type": "object",
+        "required": ["burst", "refill_per_second"],
+        "properties": {
+            "burst": {"type": "integer", "minimum": 1, "maximum": 100000},
+            "refill_per_second": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 10000,
+            },
+        },
+        "additionalProperties": False,
+    },
+    "RateLimitOverrides": {
+        "type": "object",
+        "additionalProperties": {"$ref": "#/components/schemas/RateLimitPolicy"},
+    },
+    "RateLimitList": {
+        "type": "object",
+        "required": ["default", "overrides", "buckets"],
+        "properties": {
+            "default": {"$ref": "#/components/schemas/RateLimitPolicy"},
+            "overrides": {"$ref": "#/components/schemas/RateLimitOverrides"},
+            "buckets": {"type": "integer", "minimum": 0, "maximum": 1000},
+        },
+        "additionalProperties": False,
+    },
+    "RateLimitOverride": {
+        "type": "object",
+        "required": ["identity", "burst", "refill_per_second"],
+        "properties": {
+            "identity": {
+                "type": "string",
+                "maxLength": 71,
+                "pattern": "^(key|client|ip):[A-Za-z0-9._:-]{1,64}$",
+            },
+            "burst": {"type": "integer", "minimum": 1, "maximum": 100000},
+            "refill_per_second": {
+                "type": "number",
+                "minimum": 0.001,
+                "maximum": 10000,
+            },
+        },
+        "additionalProperties": False,
+    },
     "CreateJob": {
         "type": "object",
         "required": ["type"],

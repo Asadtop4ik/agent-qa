@@ -1,6 +1,7 @@
 """HTTP server adapter for the route handlers."""
 
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -26,12 +27,15 @@ from agent_qa.context import (
 from agent_qa.orders import OrderError
 from agent_qa.outbox import OUTBOX
 from agent_qa.request_id import request_id
+from agent_qa.ratelimit import RATE_LIMITER
 from agent_qa.routes import JOB_RUNNER, ROUTES
 from agent_qa.validation import validate
 
 LOGGER = logging.getLogger(__name__)
 IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -101,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
         set_context(RequestContext(request_id=self.request_id))
         self._request_started = perf_counter()
         self._response_recorded = False
+        self._rate_headers = {}
+        if hasattr(self, "_rate_retry_after"):
+            del self._rate_retry_after
         try:
             super().handle_one_request()
         finally:
@@ -123,7 +130,10 @@ class Handler(BaseHTTPRequestHandler):
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
         is_empty = status in {204, 304}
-        response_headers = headers or {}
+        response_headers = dict(headers or {})
+        response_headers.update(getattr(self, "_rate_headers", {}))
+        if status == 429 and hasattr(self, "_rate_retry_after"):
+            response_headers["Retry-After"] = str(self._rate_retry_after)
         content_type = response_headers.get("Content-Type")
         if is_empty:
             encoded = b""
@@ -326,16 +336,40 @@ class Handler(BaseHTTPRequestHandler):
             "role", "write" if route.get("auth_required") else None
         )
         identity = None
-        if required_role is not None or self.command in {
-            "POST",
-            "PUT",
-            "PATCH",
-            "DELETE",
-        }:
+        needs_authentication = (
+            required_role is not None
+            or self.command in {"POST", "PUT", "PATCH", "DELETE"}
+            or route.get("rate_limited", True)
+        )
+        if needs_authentication:
             identity = authenticate_api_key(self.headers)
         if context is not None and identity is not None:
             context.actor = identity.get("key_id", "anonymous")
             context.role = identity.get("role")
+        if route.get("rate_limited", True):
+            key_id = identity.get("key_id") if identity is not None else None
+            client_id = self.headers.get("X-Client-Id", "")
+            if isinstance(key_id, str) and _KEY_ID_PATTERN.fullmatch(key_id):
+                rate_kind, rate_identity = "key", f"key:{key_id}"
+            elif len(client_id) <= 32 and _CLIENT_ID_PATTERN.fullmatch(client_id):
+                rate_kind, rate_identity = "client", f"client:{client_id}"
+            else:
+                address = getattr(self, "client_address", ("unknown",))[0]
+                try:
+                    rate_ip = ipaddress.ip_address(address).compressed
+                except (ValueError, TypeError):
+                    rate_ip = "unknown"
+                rate_kind, rate_identity = "ip", f"ip:{rate_ip}"
+            rate_decision = RATE_LIMITER.consume(rate_identity, rate_kind)
+            self._rate_headers = {
+                "RateLimit-Limit": str(rate_decision.limit),
+                "RateLimit-Remaining": str(rate_decision.remaining),
+                "RateLimit-Reset": str(rate_decision.reset_after),
+            }
+            if not rate_decision.allowed:
+                self._rate_retry_after = rate_decision.retry_after
+                REGISTRY.record_rate_limited(rate_kind)
+                raise ApiError(429, "rate_limited", "Rate limit exceeded")
         if required_role is not None and identity is None:
             self._json(
                 401,

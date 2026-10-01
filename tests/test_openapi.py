@@ -80,6 +80,37 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             ready_route["response_schemas"]["200"],
         )
 
+    def test_rate_limit_metadata_documents_headers_and_exemptions(self):
+        spec = build_openapi(ROUTES, "rate-limit-drift")
+        for route in ROUTES:
+            operation = spec["paths"][route["path"]][route["method"].lower()]
+            rate_limited = route.get("rate_limited", True)
+            self.assertEqual(operation["x-rate-limited"], rate_limited)
+            if rate_limited:
+                self.assertIn("429", operation["responses"])
+                self.assertIn("rate_limited", json.dumps(operation["responses"]["429"]))
+                for response in operation["responses"].values():
+                    self.assertTrue(
+                        {"RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset"}
+                        <= set(response.get("headers", {}))
+                    )
+            else:
+                self.assertNotIn("429", operation["responses"])
+
+        for path in ("/health", "/ready", "/ping", "/metrics", "/status"):
+            self.assertFalse(spec["paths"][path]["get"]["x-rate-limited"])
+        self.assertFalse(spec["paths"]["/admin/rate-limits"]["get"]["x-rate-limited"])
+        put_override = spec["paths"]["/admin/rate-limits/{identity}"]["put"]
+        self.assertEqual(put_override["x-required-role"], "admin")
+        self.assertIn(
+            "override_limit",
+            json.dumps(
+                spec["paths"]["/admin/rate-limits/{identity}"]["put"]["responses"][
+                    "409"
+                ]
+            ),
+        )
+
     def test_outbox_routes_roles_schemas_and_error_responses_match_openapi(self):
         spec = build_openapi(ROUTES, "outbox-drift")
         expected_roles = {
@@ -196,7 +227,10 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             self.assertIn("403", operation["responses"])
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
-            self.assertEqual(set(operation["responses"]), set(route["responses"]))
+            expected_responses = set(route["responses"])
+            if route.get("rate_limited", True):
+                expected_responses.add("429")
+            self.assertEqual(set(operation["responses"]), expected_responses)
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
                 operation["requestBody"]["content"]["application/json"]["schema"],
@@ -317,7 +351,14 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 self.assertIn("BulkCreateResponse", json.dumps(operation["responses"]))
         self.assertEqual(
             spec["paths"]["/orders/bulk"]["post"]["responses"]["422"]["headers"].keys(),
-            {"Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+            {
+                "Idempotency-Key",
+                "Idempotent-Replay",
+                "X-Request-Id",
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+            },
         )
         self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
 
@@ -469,7 +510,15 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         success_headers = create["responses"]["201"]["headers"]
         self.assertEqual(
             set(success_headers),
-            {"ETag", "Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+            {
+                "ETag",
+                "Idempotency-Key",
+                "Idempotent-Replay",
+                "X-Request-Id",
+                "RateLimit-Limit",
+                "RateLimit-Remaining",
+                "RateLimit-Reset",
+            },
         )
 
         future_route = copy.deepcopy(ROUTES[0])
