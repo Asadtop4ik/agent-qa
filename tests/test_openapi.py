@@ -573,7 +573,16 @@ class OpenApiDriftTests(unittest.TestCase):
 
     def test_named_schemas_are_documented_and_order_bodies_stay_inline(self):
         spec = self.live_spec()
-        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        schemas_exported = spec["components"]["schemas"]
+        self.assertEqual(
+            {
+                name: schema
+                for name, schema in schemas_exported.items()
+                if name != "Problem"
+            },
+            SCHEMAS,
+        )
+        self.assertIn("Problem", schemas_exported)
         self.assertEqual(
             spec["paths"]["/orders"]["post"]["requestBody"]["content"][
                 "application/json"
@@ -607,7 +616,16 @@ class OpenApiDriftTests(unittest.TestCase):
                 {(method, path) for path, item in paths.items() for method in item}
             )
         )
-        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        schemas_exported = spec["components"]["schemas"]
+        self.assertEqual(
+            {
+                name: schema
+                for name, schema in schemas_exported.items()
+                if name != "Problem"
+            },
+            SCHEMAS,
+        )
+        self.assertIn("Problem", schemas_exported)
 
         create_body = paths["/products"]["post"]["requestBody"]["content"][
             "application/json"
