@@ -77,6 +77,12 @@ SETTINGS: dict[str, Setting] = {
         False,
         "Require If-Match for conditional updates.",
     ),
+    "AGENT_QA_ENFORCE_SUNSET": Setting(
+        "AGENT_QA_ENFORCE_SUNSET",
+        "bool",
+        False,
+        "Return 410 for deprecated routes after their sunset date.",
+    ),
     "AGENT_QA_AUDIT_CAPACITY": Setting(
         "AGENT_QA_AUDIT_CAPACITY",
         "int",

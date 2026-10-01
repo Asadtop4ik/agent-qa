@@ -4,6 +4,7 @@ from copy import deepcopy
 from typing import Any, Iterable
 
 from agent_qa.schemas import SCHEMAS
+from agent_qa.versioning import DEPRECATED_EPOCH, SUNSET_HTTP_DATE
 
 
 def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, Any]:
@@ -39,6 +40,15 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 for status in route["responses"]
             },
         }
+        api_version = route.get("api_version")
+        if api_version is not None:
+            operation["x-api-version"] = str(api_version)
+        if route.get("deprecated"):
+            operation["deprecated"] = True
+            operation["responses"].setdefault(
+                "410",
+                {"description": ("Deprecated API version has passed its sunset date.")},
+            )
         for status, response in operation["responses"].items():
             if (
                 status.startswith("2")
@@ -279,6 +289,41 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 response.setdefault("headers", {}).update(deepcopy(rate_headers))
         if route.get("role", route["auth_required"]):
             operation["security"] = [{"ApiKeyAuth": []}]
+        if api_version is not None:
+            version_header = {
+                "description": "API version used for this response.",
+                "schema": {"type": "string", "enum": [str(api_version)]},
+            }
+            for response in operation["responses"].values():
+                headers = response.setdefault("headers", {})
+                headers["X-API-Version"] = deepcopy(version_header)
+                if route.get("deprecated"):
+                    headers["Deprecation"] = {
+                        "description": "RFC 9745 deprecation date.",
+                        "schema": {"type": "string", "example": f"@{DEPRECATED_EPOCH}"},
+                    }
+                    headers["Sunset"] = {
+                        "description": "RFC 8594 sunset date.",
+                        "schema": {"type": "string", "example": SUNSET_HTTP_DATE},
+                    }
+                    successor = route.get("successor")
+                    if isinstance(successor, str):
+                        existing_link = headers.get("Link", {})
+                        description = existing_link.get("description", "")
+                        if description:
+                            description += " A successor-version link is also present."
+                        else:
+                            description = "Successor API version."
+                        headers["Link"] = {
+                            "description": description,
+                            "schema": {"type": "string"},
+                        }
+            if str(api_version) == "2":
+                for status, response in operation["responses"].items():
+                    if status.startswith("4") or status.startswith("5"):
+                        response["content"] = {
+                            "application/problem+json": {"schema": {"type": "object"}}
+                        }
         paths.setdefault(path, {})[method] = operation
 
     return {

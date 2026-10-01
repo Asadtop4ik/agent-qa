@@ -56,6 +56,19 @@ _ORDER_ITEM_INPUT = {
     },
     "additionalProperties": False,
 }
+_V2_ORDER_ITEM_INPUT = {
+    "type": "object",
+    "required": ["product_id", "quantity"],
+    "properties": {
+        "product_id": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": (1 << 63) - 1,
+        },
+        "quantity": {"type": "integer", "minimum": 1, "maximum": MAX_ORDER_QUANTITY},
+    },
+    "additionalProperties": False,
+}
 _STATUS = {"type": "string", "enum": list(STATUSES)}
 _SKU = {
     "type": "string",
@@ -939,3 +952,110 @@ SCHEMAS.update(
         },
     }
 )
+
+V2_CREATE_ORDER_SCHEMA = {
+    "type": "object",
+    "required": ["customer"],
+    "properties": {
+        "customer": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": _CUSTOMER_ID},
+            "additionalProperties": False,
+        },
+        "amount": {
+            "type": "object",
+            "required": ["total_cents"],
+            "properties": {"total_cents": _TOTAL_CENTS},
+            "additionalProperties": False,
+        },
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_ORDER_ITEMS,
+            "items": _V2_ORDER_ITEM_INPUT,
+        },
+    },
+    "oneOf": [{"required": ["items"]}, {"required": ["amount"]}],
+    "x-exactlyOne": ["items", "amount"],
+    "additionalProperties": False,
+}
+
+V2_UPDATE_ORDER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": _STATUS,
+        "amount": {
+            "type": "object",
+            "required": ["total_cents"],
+            "properties": {"total_cents": _TOTAL_CENTS},
+            "additionalProperties": False,
+        },
+    },
+    "minProperties": 1,
+    "additionalProperties": False,
+}
+
+V2_ORDER_SCHEMA = {
+    "type": "object",
+    "required": [
+        "id",
+        "customer",
+        "amount",
+        "status",
+        "items",
+        "created_at",
+        "links",
+    ],
+    "properties": {
+        "id": {"type": "integer", "minimum": 1},
+        "customer": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": _CUSTOMER_ID},
+            "additionalProperties": False,
+        },
+        "amount": {
+            "type": "object",
+            "required": ["total_cents", "currency"],
+            "properties": {
+                "total_cents": _TOTAL_CENTS,
+                "currency": {"type": "string", "enum": ["USD"]},
+            },
+            "additionalProperties": False,
+        },
+        "status": _STATUS,
+        "items": {"type": "array", "items": _ORDER_ITEM},
+        "created_at": {"type": "string", "format": "date-time"},
+        "links": {
+            "type": "object",
+            "required": ["self"],
+            "properties": {"self": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+V2_ORDER_LIST_SCHEMA = {
+    "type": "object",
+    "required": ["data", "page"],
+    "properties": {
+        "data": {"type": "array", "items": V2_ORDER_SCHEMA},
+        "page": {
+            "type": "object",
+            "required": ["limit", "next_cursor", "total"],
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": MIN_LIMIT,
+                    "maximum": MAX_LIMIT,
+                },
+                "next_cursor": {"type": "string", "nullable": True},
+                "total": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}

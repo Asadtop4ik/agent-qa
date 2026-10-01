@@ -24,6 +24,41 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_version_metadata_and_v2_paths_match_openapi(self):
+        spec = build_openapi(ROUTES, "version-drift")
+        for path in ("/orders", "/orders/{id}", "/orders/bulk", "/orders/search"):
+            with self.subTest(path=path):
+                for method, operation in spec["paths"][path].items():
+                    self.assertTrue(operation["deprecated"])
+                    self.assertEqual(operation["x-api-version"], "1")
+                    for response in operation["responses"].values():
+                        headers = response["headers"]
+                        self.assertIn("Deprecation", headers)
+                        self.assertIn("Sunset", headers)
+                        self.assertIn("Link", headers)
+                        self.assertEqual(
+                            headers["X-API-Version"]["schema"]["enum"], ["1"]
+                        )
+
+        for path, methods in (
+            ("/v2/orders", {"get", "post"}),
+            ("/v2/orders/{id}", {"get", "patch", "delete"}),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(set(spec["paths"][path]), methods)
+                for method, operation in spec["paths"][path].items():
+                    self.assertEqual(operation["x-api-version"], "2")
+                    self.assertNotIn("deprecated", operation)
+                    for status, response in operation["responses"].items():
+                        self.assertEqual(
+                            response["headers"]["X-API-Version"]["schema"]["enum"],
+                            ["2"],
+                        )
+                        if status.startswith(("4", "5")):
+                            self.assertIn(
+                                "application/problem+json", response["content"]
+                            )
+
     def test_csv_route_metadata_matches_openapi(self):
         spec = build_openapi(ROUTES, "csv-drift")
         routes = {(route["method"].lower(), route["path"]): route for route in ROUTES}
@@ -305,6 +340,8 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             expected_responses.add("406")
             if route.get("rate_limited", True):
                 expected_responses.add("429")
+            if route.get("deprecated"):
+                expected_responses.add("410")
             self.assertEqual(set(operation["responses"]), expected_responses)
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
@@ -433,6 +470,10 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "RateLimit-Limit",
                 "RateLimit-Remaining",
                 "RateLimit-Reset",
+                "X-API-Version",
+                "Deprecation",
+                "Sunset",
+                "Link",
             },
         )
         self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
@@ -593,6 +634,10 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "RateLimit-Limit",
                 "RateLimit-Remaining",
                 "RateLimit-Reset",
+                "X-API-Version",
+                "Deprecation",
+                "Sunset",
+                "Link",
             },
         )
 

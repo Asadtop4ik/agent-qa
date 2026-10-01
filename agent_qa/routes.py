@@ -28,6 +28,11 @@ from agent_qa.schemas import (
     MAX_PRODUCT_QUERY_LENGTH,
     PRODUCT_SORTS,
     SCHEMAS,
+    STATUSES,
+    V2_CREATE_ORDER_SCHEMA,
+    V2_ORDER_LIST_SCHEMA,
+    V2_ORDER_SCHEMA,
+    V2_UPDATE_ORDER_SCHEMA,
 )
 from agent_qa.searchdsl import (
     FIELD_METADATA,
@@ -38,6 +43,7 @@ from agent_qa.searchdsl import (
     supported_operators,
 )
 from agent_qa.validation import validate, validate_query_params
+from agent_qa.versioning import versions_document
 from agent_qa.orders import (
     OrderError,
     OrderStore,
@@ -336,6 +342,15 @@ def version(
     )
 
 
+def versions(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the published API version lifecycle document."""
+    return 200, versions_document(), {}
+
+
 def openapi(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -520,6 +535,208 @@ def delete_order(
     request_headers: dict[str, str] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order and return an empty response body."""
+    order_id = _order_id(path_params)
+    if order_id is None or ORDER_STORE.get(order_id) is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    expected_version = _expected_version(request_headers)
+    if not FulfillmentService(ORDER_STORE, PRODUCT_STORE).delete(
+        order_id, expected_version=expected_version
+    ):
+        raise ApiError(404, "order_not_found", "Order not found")
+    OUTBOX.emit("order.deleted", {"id": order_id})
+    return 204, None, {"Content-Length": "0"}
+
+
+def _v2_order(order: dict[str, object]) -> dict[str, object]:
+    order_id = order["id"]
+    return {
+        "id": order_id,
+        "customer": {"id": order["customer_id"]},
+        "amount": {"total_cents": order["total_cents"], "currency": "USD"},
+        "status": order["status"],
+        "items": [dict(item) for item in order.get("items", [])],
+        "created_at": order["created_at"],
+        "links": {"self": f"/v2/orders/{order_id}"},
+    }
+
+
+def _v2_body(payload: object, schema: dict[str, object]) -> dict[str, object]:
+    errors = validate(schema, payload)
+    if errors:
+        for error in errors:
+            field = error["field"]
+            error["field"] = field[5:] if field.startswith("body.") else field
+        raise ApiError(400, "validation_error", "Request validation failed", errors)
+    return payload  # type: ignore[return-value]
+
+
+def _v2_query(query: list[tuple[str, str]]) -> dict[str, object]:
+    filters = validate_query_params(
+        [
+            {
+                "name": "limit",
+                "in": "query",
+                "schema": {
+                    "type": "integer",
+                    "minimum": MIN_LIMIT,
+                    "maximum": MAX_LIMIT,
+                    "default": DEFAULT_LIMIT,
+                },
+            },
+            {
+                "name": "cursor",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "maxLength": MAX_CURSOR_LENGTH,
+                },
+            },
+            {
+                "name": "status",
+                "in": "query",
+                "schema": {"type": "string", "enum": list(STATUSES)},
+            },
+            {
+                "name": "customer",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                },
+            },
+            {
+                "name": "sort",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "enum": ["id", "-id"],
+                    "default": "id",
+                },
+            },
+        ],
+        query,
+    )
+    if "customer" in filters and not filters["customer"].strip():
+        raise ApiError(
+            400,
+            "invalid_query",
+            "Query validation failed",
+            [{"field": "customer", "message": "Must not be blank"}],
+        )
+    filters["pagination"] = "cursor"
+    filters["customer_id"] = filters.pop("customer", None)
+    return filters
+
+
+def create_order_v2(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Create an order using the v2 resource representation."""
+    body = _v2_body(payload, V2_CREATE_ORDER_SCHEMA)
+    customer = body["customer"]
+    values: dict[str, object] = {"customer_id": customer["id"]}  # type: ignore[index]
+    if "items" in body:
+        values["items"] = body["items"]
+    else:
+        values["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
+    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create(
+        **values, include_version=True
+    )
+    version = order.pop("version")
+    OUTBOX.emit("order.created", dict(order))
+    result = _v2_order(order)
+    return (
+        201,
+        result,
+        {
+            "Location": result["links"]["self"],  # type: ignore[index]
+            "ETag": etag_for("order", order["id"], version),
+        },
+    )
+
+
+def list_orders_v2(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return cursor-paginated orders using the v2 representation."""
+    filters = _v2_query(query)
+    try:
+        orders, total, next_cursor = ORDER_STORE.list(**filters)
+    except OrderError as error:
+        raise ApiError(400, error.code, error.message, error.details) from error
+    body = {
+        "data": [_v2_order(order) for order in orders],
+        "page": {
+            "limit": filters["limit"],
+            "next_cursor": next_cursor,
+            "total": total,
+        },
+    }
+    etag = _list_etag(body)
+    headers = {"ETag": etag}
+    if _if_none_match(request_headers, etag):
+        return 304, None, headers
+    return 200, body, headers
+
+
+def get_order_v2(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Read an order in the v2 representation."""
+    order_id = _order_id(path_params)
+    order = ORDER_STORE.get(order_id, include_version=True) if order_id else None
+    if order is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    version = order.pop("version")
+    etag = etag_for("order", order_id, version)
+    if _if_none_match(request_headers, etag):
+        return 304, None, {"ETag": etag}
+    return 200, _v2_order(order), {"ETag": etag}
+
+
+def patch_order_v2(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Update an order with v2 fields and conditional semantics."""
+    body = _v2_body(payload, V2_UPDATE_ORDER_SCHEMA)
+    changes: dict[str, object] = {}
+    if "status" in body:
+        changes["status"] = body["status"]
+    if "amount" in body:
+        changes["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
+    order_id = _order_id(path_params)
+    if order_id is None or ORDER_STORE.get(order_id) is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    expected_version = _expected_version(request_headers)
+    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).update(
+        order_id, changes, expected_version=expected_version, include_version=True
+    )
+    if order is None:
+        raise ApiError(404, "order_not_found", "Order not found")
+    version = order.pop("version")
+    OUTBOX.emit("order.updated", dict(order))
+    return 200, _v2_order(order), {"ETag": etag_for("order", order_id, version)}
+
+
+def delete_order_v2(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+    request_headers: dict[str, str] | None = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Delete an order using the shared fulfillment service."""
     order_id = _order_id(path_params)
     if order_id is None or ORDER_STORE.get(order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
@@ -2287,6 +2504,16 @@ ROUTES = (
     },
     {
         "method": "GET",
+        "path": "/versions",
+        "handler": versions,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "getApiVersions",
+        "summary": "Read API version lifecycle information",
+        "responses": ["200", "403"],
+    },
+    {
+        "method": "GET",
         "path": "/openapi.json",
         "handler": openapi,
         "role": None,
@@ -2416,6 +2643,9 @@ ROUTES = (
         "method": "GET",
         "path": "/orders",
         "handler": list_orders,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders",
         "role": None,
         "auth_required": False,
         "operation_id": "listOrders",
@@ -2514,6 +2744,9 @@ ROUTES = (
         "method": "GET",
         "path": "/orders/search",
         "handler": search_orders,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders",
         "role": None,
         "auth_required": False,
         "operation_id": "searchOrders",
@@ -2532,6 +2765,9 @@ ROUTES = (
         "method": "POST",
         "path": "/orders",
         "handler": create_order,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders",
         "body": True,
         "role": "write",
         "auth_required": True,
@@ -2547,6 +2783,9 @@ ROUTES = (
         "method": "POST",
         "path": "/orders/bulk",
         "handler": create_orders_bulk,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders",
         "body": True,
         "role": "write",
         "auth_required": True,
@@ -2578,6 +2817,9 @@ ROUTES = (
         "method": "DELETE",
         "path": "/orders/{id}",
         "handler": delete_order,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders/{id}",
         "role": "write",
         "auth_required": True,
         "operation_id": "deleteOrder",
@@ -2590,6 +2832,9 @@ ROUTES = (
         "method": "GET",
         "path": "/orders/{id}",
         "handler": get_order,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders/{id}",
         "role": None,
         "auth_required": False,
         "operation_id": "getOrder",
@@ -2603,6 +2848,9 @@ ROUTES = (
         "method": "PATCH",
         "path": "/orders/{id}",
         "handler": patch_order,
+        "api_version": "1",
+        "deprecated": True,
+        "successor": "/v2/orders/{id}",
         "body": True,
         "role": "write",
         "auth_required": True,
@@ -2623,6 +2871,143 @@ ROUTES = (
             "403",
         ],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
+        "conditional_headers": ["If-Match"],
+    },
+    {
+        "method": "GET",
+        "path": "/v2/orders",
+        "handler": list_orders_v2,
+        "api_version": "2",
+        "role": None,
+        "auth_required": False,
+        "operation_id": "listOrdersV2",
+        "summary": "List orders using the v2 representation",
+        "parameters": [
+            _IF_NONE_MATCH,
+            {
+                "name": "limit",
+                "in": "query",
+                "schema": {
+                    "type": "integer",
+                    "minimum": MIN_LIMIT,
+                    "maximum": MAX_LIMIT,
+                    "default": DEFAULT_LIMIT,
+                },
+            },
+            {
+                "name": "cursor",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "maxLength": MAX_CURSOR_LENGTH,
+                },
+            },
+            {
+                "name": "status",
+                "in": "query",
+                "schema": _STATUS_SCHEMA,
+            },
+            {
+                "name": "customer",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                },
+            },
+            {
+                "name": "sort",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "enum": ["id", "-id"],
+                    "default": "id",
+                },
+            },
+        ],
+        "responses": ["200", "304", "400", "403"],
+        "response_schemas": {"200": V2_ORDER_LIST_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
+    },
+    {
+        "method": "POST",
+        "path": "/v2/orders",
+        "handler": create_order_v2,
+        "api_version": "2",
+        "body": True,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "createOrderV2",
+        "summary": "Create an order using the v2 representation",
+        "idempotent": True,
+        "etag_response": True,
+        "request_schema": V2_CREATE_ORDER_SCHEMA,
+        "responses": [
+            "201",
+            "400",
+            "401",
+            "409",
+            "411",
+            "413",
+            "415",
+            "422",
+            "403",
+        ],
+        "response_schemas": {"201": V2_ORDER_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/v2/orders/{id}",
+        "handler": get_order_v2,
+        "api_version": "2",
+        "role": None,
+        "auth_required": False,
+        "operation_id": "getOrderV2",
+        "summary": "Read an order using the v2 representation",
+        "parameters": [_ORDER_ID, _IF_NONE_MATCH],
+        "responses": ["200", "304", "400", "404", "403"],
+        "response_schemas": {"200": V2_ORDER_SCHEMA},
+        "conditional_headers": ["If-None-Match"],
+    },
+    {
+        "method": "PATCH",
+        "path": "/v2/orders/{id}",
+        "handler": patch_order_v2,
+        "api_version": "2",
+        "body": True,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "updateOrderV2",
+        "summary": "Update an order using the v2 representation",
+        "parameters": [_ORDER_ID, _IF_MATCH],
+        "request_schema": V2_UPDATE_ORDER_SCHEMA,
+        "responses": [
+            "200",
+            "400",
+            "401",
+            "404",
+            "409",
+            "412",
+            "413",
+            "415",
+            "428",
+            "403",
+        ],
+        "response_schemas": {"200": V2_ORDER_SCHEMA},
+        "conditional_headers": ["If-Match"],
+    },
+    {
+        "method": "DELETE",
+        "path": "/v2/orders/{id}",
+        "handler": delete_order_v2,
+        "api_version": "2",
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "deleteOrderV2",
+        "summary": "Delete an order using the v2 representation",
+        "parameters": [_ORDER_ID, _IF_MATCH],
+        "responses": ["204", "400", "401", "404", "412", "428", "403"],
         "conditional_headers": ["If-Match"],
     },
     {

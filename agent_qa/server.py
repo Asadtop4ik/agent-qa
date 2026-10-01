@@ -39,6 +39,8 @@ from agent_qa.negotiation import (
 )
 from agent_qa.routes import JOB_RUNNER, ROUTES
 from agent_qa.validation import validate
+from agent_qa.versioning import response_headers as version_headers
+from agent_qa.versioning import map_v2_error_body, sunset_reached
 
 LOGGER = logging.getLogger(__name__)
 IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
@@ -197,18 +199,48 @@ class Handler(BaseHTTPRequestHandler):
     ) -> None:
         is_empty = status in {204, 304}
         response_headers = dict(headers or {})
-        response_headers.update(getattr(self, "_rate_headers", {}))
-        if status == 429 and hasattr(self, "_rate_retry_after"):
-            response_headers["Retry-After"] = str(self._rate_retry_after)
         raw_path = getattr(self, "path", "") or ""
         try:
             instance = urlsplit(raw_path).path
         except ValueError:
             instance = ""
+        route_matches = _path_routes(instance)
+        route_match = next(
+            (
+                (route, params)
+                for route, params in route_matches
+                if route.get("method") == getattr(self, "command", None)
+            ),
+            route_matches[0] if route_matches else (None, {}),
+        )
+        version_route, version_params = route_match
+        if version_route is not None:
+            generated = version_headers(version_route, version_params)
+            for name, value in generated.items():
+                if name.lower() == "link":
+                    current_link = next(
+                        (key for key in response_headers if key.lower() == "link"),
+                        None,
+                    )
+                    if current_link is not None:
+                        response_headers[current_link] = (
+                            f"{response_headers[current_link]}, {value}"
+                        )
+                        continue
+                response_headers[name] = value
+        response_headers.update(getattr(self, "_rate_headers", {}))
+        if status == 429 and hasattr(self, "_rate_retry_after"):
+            response_headers["Retry-After"] = str(self._rate_retry_after)
         accept = _joined_header(getattr(self, "headers", None), "Accept")
         if status >= 400:
             _merge_vary(response_headers, "Accept")
-            if prefers_problem(accept):
+            is_v2 = (
+                version_route is not None
+                and str(version_route.get("api_version")) == "2"
+            )
+            if is_v2:
+                body = map_v2_error_body(body)
+            if is_v2 or prefers_problem(accept):
                 body = _problem_body(status, body, instance, self.request_id)
                 response_headers["Content-Type"] = (
                     "application/problem+json; charset=utf-8"
@@ -440,9 +472,37 @@ class Handler(BaseHTTPRequestHandler):
             (match for match in matches if match[0]["method"] == self.command), None
         )
         if selected is None:
+            is_v2_path = any(
+                str(route.get("api_version")) == "2" for route, _ in matches
+            )
+            accept = _joined_header(self.headers, "Accept")
+            if (
+                is_v2_path
+                and accept is not None
+                and best_match(parse_accept(accept), ["application/json"]) is None
+            ):
+                self._json(
+                    406,
+                    envelope(
+                        "not_acceptable",
+                        "No acceptable representation is available",
+                        request_id=self.request_id,
+                    ),
+                )
+                return
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        if sunset_reached(route):
+            self._json(
+                410,
+                envelope(
+                    "api_version_sunset",
+                    "This API version has passed its sunset date",
+                    request_id=self.request_id,
+                ),
+            )
+            return
         accept = _joined_header(self.headers, "Accept")
         if accept is not None:
             produces = route.get("produces", ["application/json"])
@@ -451,7 +511,12 @@ class Handler(BaseHTTPRequestHandler):
             offered = list(produces)
             if "application/json" in offered:
                 offered.append("application/problem+json")
-            if best_match(parse_accept(accept), offered) is None:
+            acceptable_types = (
+                ["application/json"]
+                if str(route.get("api_version")) == "2"
+                else offered
+            )
+            if best_match(parse_accept(accept), acceptable_types) is None:
                 self._json(
                     406,
                     envelope(

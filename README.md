@@ -79,6 +79,7 @@ ignoring case.
 | `AGENT_QA_API_KEY` | str (secret) | `***` | 1–4096 characters | API key required for authenticated requests. |
 | `AGENT_QA_IDEMPOTENCY_TTL_SECONDS` | int | `600` | 1–86400 | Lifetime of stored idempotent responses in seconds. |
 | `AGENT_QA_REQUIRE_IF_MATCH` | bool | `false` | See boolean values above | Require If-Match for conditional updates. |
+| `AGENT_QA_ENFORCE_SUNSET` | bool | `false` | See boolean values above | Return 410 for deprecated routes after their sunset date. |
 | `AGENT_QA_AUDIT_CAPACITY` | int | `500` | 10–5000 | Maximum number of audit entries retained in memory. |
 | `AGENT_QA_RATE_BURST` | int | `120` | 1–100000 | Token bucket request burst size. |
 | `AGENT_QA_RATE_REFILL_PER_SECOND` | float | `60.0` | 0.001–10000.0 | Token bucket refill rate per second. |
@@ -158,6 +159,14 @@ Request checks run in this order: authentication, body parsing and validation,
 resource lookup, precondition format, precondition match, then domain rules.
 
 ## Orders
+
+`GET /versions` reports supported API versions. The v1 order routes remain
+available with deprecation and successor headers; `GET /v2/orders` and the
+v2 item routes use the nested customer and amount representation, with cursor
+pagination by default. V1 and v2 share order storage, inventory reservations,
+ETags, idempotency, audit records, and events. After December 31, 2026,
+deprecated order routes return `410 api_version_sunset` only when
+`AGENT_QA_ENFORCE_SUNSET=true`; enforcement is off by default.
 
 `POST /orders` accepts either the legacy `{"customer_id":"...","total_cents":1500}`
 shape or `{"customer_id":"...","items":[{"product_id":1,"quantity":2}]}`.
