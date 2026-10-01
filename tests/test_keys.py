@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from agent_qa.errors import ApiError
-from agent_qa.keys import KeyStore
+from agent_qa.keys import KeyStore, _digest
 
 
 class Clock:
@@ -32,6 +32,26 @@ class KeyStoreTests(unittest.TestCase):
                     action("bootstrap")
                 self.assertEqual(error.exception.status, 409)
                 self.assertEqual(error.exception.code, "bootstrap_key_immutable")
+
+    def test_long_bootstrap_secrets_remain_authenticatable(self):
+        for length in (4096, 4097, 16384):
+            with self.subTest(length=length):
+                secret = "b" * length
+                store = KeyStore(secret, self.clock)
+                self.assertEqual(
+                    store.authenticate(secret),
+                    {"key_id": "bootstrap", "role": "admin", "label": "bootstrap"},
+                )
+                self.assertIsNone(store.authenticate("x" * length))
+
+    def test_overlong_authentication_candidate_is_rejected_with_bounded_hash(self):
+        store = KeyStore("b" * 4097, self.clock)
+        candidate = "x" * 4098
+
+        with patch("agent_qa.keys._digest", wraps=_digest) as digest:
+            self.assertIsNone(store.authenticate(candidate))
+
+        digest.assert_called_once_with("")
 
     def test_grace_rotation_expires_old_key_at_boundary(self):
         created = self.store.create("write", "operator")

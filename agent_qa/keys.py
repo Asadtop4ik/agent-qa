@@ -46,6 +46,7 @@ class KeyStore:
 
     def __init__(self, bootstrap_secret: str, clock: Callable[[], datetime] = _utc_now):
         self._clock = clock
+        self._max_secret_length = max(_MAX_SECRET_LENGTH, len(bootstrap_secret))
         self._lock = threading.RLock()
         self._keys: dict[str, _Key] = {
             "bootstrap": _Key(
@@ -72,7 +73,7 @@ class KeyStore:
             secret = ""
             usable = False
         else:
-            usable = 0 < len(secret) <= _MAX_SECRET_LENGTH
+            usable = 0 < len(secret) <= self._max_secret_length
         try:
             supplied_hash = _digest(secret if usable else "")
         except UnicodeEncodeError:
