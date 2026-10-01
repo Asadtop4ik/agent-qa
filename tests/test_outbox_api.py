@@ -66,6 +66,16 @@ class Harness:
     def _read_json_body(self, require_object=True, max_body_bytes=4096):
         return Handler._read_json_body(self, require_object, max_body_bytes)
 
+    def _read_request_body(
+        self,
+        consumes=("application/json",),
+        require_object=True,
+        max_body_bytes=4096,
+    ):
+        return Handler._read_request_body(
+            self, consumes, require_object, max_body_bytes
+        )
+
     def _record_response(self, status):
         Handler._record_response(self, status)
 

@@ -333,8 +333,11 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _read_json_body(
-        self, require_object: bool = True, max_body_bytes: int = 4096
+    def _read_request_body(
+        self,
+        consumes: list[str] | tuple[str, ...] = ("application/json",),
+        require_object: bool = True,
+        max_body_bytes: int = 4096,
     ) -> object:
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -356,18 +359,48 @@ class Handler(BaseHTTPRequestHandler):
         if length > max_body_bytes:
             raise ApiError(413, "payload_too_large", "Request body is too large")
         content_type = self.headers.get("Content-Type", "")
-        if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        media_type, *parameters = content_type.split(";")
+        media_type = media_type.strip().lower()
+        if media_type not in consumes:
             raise ApiError(
-                415, "unsupported_media_type", "Content-Type must be application/json"
+                415,
+                "unsupported_media_type",
+                f"Content-Type must be {' or '.join(consumes)}",
             )
+        charsets = []
+        for parameter in parameters:
+            key, separator, value = parameter.partition("=")
+            if key.strip().lower() == "charset":
+                charsets.append(value.strip().strip('"').lower() if separator else "")
+        if media_type == "text/csv" and (
+            len(charsets) > 1 or (charsets and charsets[0] != "utf-8")
+        ):
+            raise ApiError(415, "unsupported_media_type", "CSV charset must be UTF-8")
         try:
-            body = self.rfile.read(length).decode("utf-8")
+            raw = self.rfile.read(length)
+            body = raw.decode("utf-8-sig" if media_type == "text/csv" else "utf-8")
+            if media_type == "text/csv":
+                return body
             payload = json.loads(
                 body,
                 parse_constant=_reject_json_constant,
                 parse_float=_parse_finite_float,
             )
-        except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        except UnicodeDecodeError as error:
+            code = "invalid_csv" if media_type == "text/csv" else "invalid_json"
+            message = (
+                "Request body must be valid UTF-8 CSV"
+                if media_type == "text/csv"
+                else "Request body must be valid JSON"
+            )
+            details = [{"field": "body", "message": "Must be valid UTF-8"}]
+            raise ApiError(
+                400,
+                code,
+                message,
+                details if media_type == "text/csv" else None,
+            ) from error
+        except (ValueError, RecursionError) as error:
             raise ApiError(
                 400, "invalid_json", "Request body must be valid JSON"
             ) from error
@@ -383,6 +416,14 @@ class Handler(BaseHTTPRequestHandler):
             elif isinstance(value, list):
                 pending.extend((child, depth + 1) for child in value)
         return payload
+
+    def _read_json_body(
+        self, require_object: bool = True, max_body_bytes: int = 4096
+    ) -> object:
+        """Compatibility wrapper retained for direct handler tests."""
+        return self._read_request_body(
+            ("application/json",), require_object, max_body_bytes
+        )
 
     def _dispatch(self) -> None:
         try:
@@ -538,7 +579,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = (
-            self._read_json_body(
+            self._read_request_body(
+                consumes=route.get("consumes", ["application/json"]),
                 require_object=route.get("json_object_only", True),
                 max_body_bytes=route.get("max_body_bytes", 4096),
             )

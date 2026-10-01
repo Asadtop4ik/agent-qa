@@ -51,6 +51,16 @@ class Harness:
     def end_headers(self):
         pass
 
+    def _read_request_body(
+        self,
+        consumes=("application/json",),
+        require_object=True,
+        max_body_bytes=4096,
+    ):
+        return Handler._read_request_body(
+            self, consumes, require_object, max_body_bytes
+        )
+
     def _read_json_body(self, require_object=True, max_body_bytes=4096):
         return Handler._read_json_body(self, require_object, max_body_bytes)
 
@@ -137,19 +147,25 @@ class RoleApiTests(unittest.TestCase):
                     required_role = "write"
                 elif route["method"] in {"POST", "PATCH", "DELETE"} and route[
                     "path"
-                ].startswith(("/orders", "/products", "/jobs")):
+                ].startswith(("/orders", "/products", "/jobs", "/imports")):
                     required_role = "write"
                 else:
                     required_role = None
                 self.assertEqual(route["role"], required_role)
                 dispatch_route = {**route, "rate_limited": False}
+                body_error_status = (
+                    415
+                    if "application/json"
+                    not in route.get("consumes", ["application/json"])
+                    else 400
+                )
                 for key in self.credentials:
                     with self.subTest(path=route["path"], key=key is not None):
                         harness = Harness(route["method"], path, key=key)
                         with patch("agent_qa.server.ROUTES", (dispatch_route,)):
                             status, body, headers = self.dispatch(harness)
                         if required_role is None:
-                            expected = 400
+                            expected = body_error_status
                         elif key is None or key == "invalid-secret":
                             expected = 401
                         else:
@@ -158,7 +174,7 @@ class RoleApiTests(unittest.TestCase):
                             expected = (
                                 403
                                 if rank[identity["role"]] < rank[required_role]
-                                else 400
+                                else body_error_status
                             )
                         self.assertEqual(status, expected)
                         if status in {401, 403}:

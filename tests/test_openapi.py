@@ -24,6 +24,39 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_csv_route_metadata_matches_openapi(self):
+        spec = build_openapi(ROUTES, "csv-drift")
+        routes = {(route["method"].lower(), route["path"]): route for route in ROUTES}
+        for path, query_names in (
+            ("/exports/products.csv", {"category", "active", "in_stock", "q"}),
+            ("/exports/orders.csv", {"status", "customer_id"}),
+        ):
+            route = routes[("get", path)]
+            operation = spec["paths"][path]["get"]
+            self.assertEqual(route["produces"], ["text/csv"])
+            self.assertIn("text/csv", operation["responses"]["200"]["content"])
+            self.assertEqual(
+                {parameter["name"] for parameter in operation["parameters"]},
+                query_names,
+            )
+        for path in ("/imports/products", "/imports/orders"):
+            route = routes[("post", path)]
+            operation = spec["paths"][path]["post"]
+            self.assertEqual(route["role"], "write")
+            self.assertEqual(route["consumes"], ["text/csv"])
+            self.assertEqual(route["max_body_bytes"], 65536)
+            self.assertEqual(
+                operation["requestBody"]["content"]["text/csv"]["schema"]["type"],
+                "string",
+            )
+            self.assertEqual(operation["x-max-body-bytes"], 65536)
+            self.assertIn("mode", {item["name"] for item in operation["parameters"]})
+            self.assertIn(
+                "on_error",
+                {item["name"] for item in operation["parameters"]},
+            )
+            self.assertIn("422", operation["responses"])
+
     def test_admin_config_routes_document_roles_and_schemas(self):
         spec = build_openapi(ROUTES, "config-drift")
         expected = {
@@ -563,7 +596,9 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             },
         )
 
-        future_route = copy.deepcopy(ROUTES[0])
+        future_route = copy.deepcopy(
+            next(route for route in ROUTES if route["path"] == "/ready")
+        )
         future_route.update(
             {
                 "method": "POST",
@@ -690,7 +725,9 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(spec_pairs, route_pairs)
 
     def test_build_openapi_uses_routes_argument(self):
-        synthetic = copy.deepcopy(ROUTES[0])
+        synthetic = copy.deepcopy(
+            next(route for route in ROUTES if route["path"] == "/ready")
+        )
         synthetic.update(
             {
                 "method": "GET",

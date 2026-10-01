@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
+import logging
 import threading
 from typing import Any
 
 from agent_qa.conditional import check_expected_version
 from agent_qa.context import get_context
+from agent_qa.csvio import coerce_row
 from agent_qa.pagination import (
     decode_cursor,
     encode_cursor,
@@ -30,6 +33,8 @@ from agent_qa.schemas import (
     STATUSES as STATUSES,
 )
 from agent_qa.validation import validate
+
+logger = logging.getLogger(__name__)
 
 
 class OrderError(Exception):
@@ -213,6 +218,135 @@ class OrderStore:
         )
         with self._lock:
             return self._create_locked({**fields, "items": []}, include_version)
+
+    def export_rows(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return at most 1000 orders matching the CSV export filters."""
+        allowed = {"status", "customer_id"}
+        unsupported = set(filters) - allowed
+        if unsupported:
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [
+                    {"field": key, "message": "Unsupported query parameter"}
+                    for key in unsupported
+                ],
+            )
+        if "status" in filters and filters["status"] not in ORDER_STATUSES:
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": "status", "message": "Must be a supported order status"}],
+            )
+        if "customer_id" in filters and not (
+            isinstance(filters["customer_id"], str)
+            and MIN_CUSTOMER_ID_LENGTH
+            <= len(filters["customer_id"])
+            <= MAX_CUSTOMER_ID_LENGTH
+            and filters["customer_id"].strip()
+        ):
+            raise OrderError(
+                "invalid_query",
+                "Invalid query parameters",
+                [{"field": "customer_id", "message": "Invalid customer ID"}],
+            )
+        with self._lock:
+            result = []
+            for order_id in sorted(self._orders):
+                order = self._orders[order_id]
+                if (
+                    filters.get("status") is not None
+                    and order["status"] != filters["status"]
+                ):
+                    continue
+                if (
+                    filters.get("customer_id") is not None
+                    and order["customer_id"] != filters["customer_id"]
+                ):
+                    continue
+                result.append(
+                    {
+                        **self._copy_order(order),
+                        "items_count": len(order.get("items", [])),
+                    }
+                )
+                if len(result) == 1000:
+                    break
+            return result
+
+    def import_rows(
+        self,
+        rows: list[tuple[int, dict[str, str]]],
+        mode: str = "apply",
+        on_error: str = "abort",
+    ) -> tuple[int, dict[str, Any]]:
+        """Validate CSV rows and optionally create legacy-form orders atomically."""
+        if mode not in {"apply", "validate"} or on_error not in {"abort", "skip"}:
+            raise ValueError("invalid import policy")
+        with self._lock:
+            prepared: list[tuple[int, dict[str, Any]]] = []
+            errors: list[dict[str, Any]] = []
+            for line, raw in rows:
+                try:
+                    fields = validate_create(coerce_row("orders", raw))
+                    prepared.append((line, fields))
+                except OrderError as error:
+                    details = error.details or [
+                        {"field": "row", "message": error.message}
+                    ]
+                    errors.extend(
+                        {
+                            "line": line,
+                            "field": detail["field"],
+                            "message": detail["message"],
+                        }
+                        for detail in details
+                    )
+
+            created = 0
+            applied = False
+            should_apply = mode == "apply" and (not errors or on_error == "skip")
+            if should_apply and prepared:
+                if len(self._orders) + len(prepared) > self._capacity:
+                    errors.append(
+                        {
+                            "line": prepared[-1][0],
+                            "field": "row",
+                            "message": "Order store is full",
+                        }
+                    )
+                    prepared = []
+                    should_apply = False
+                else:
+                    orders_snapshot = deepcopy(self._orders)
+                    next_id_snapshot = self._next_id
+                    try:
+                        for _line, fields in prepared:
+                            self._create_locked({**fields, "items": []})
+                            created += 1
+                    except Exception:
+                        logger.exception("Unexpected error applying order CSV import")
+                        self._orders.clear()
+                        self._orders.update(orders_snapshot)
+                        self._next_id = next_id_snapshot
+                        raise
+                    applied = created > 0
+            if mode == "validate":
+                status = 200
+            elif errors and on_error == "abort":
+                status = 422
+            elif errors and created == 0:
+                status = 422
+            else:
+                status = 201
+            return status, {
+                "mode": mode,
+                "rows": len(rows),
+                "created": created,
+                "failed": len({error["line"] for error in errors}),
+                "applied": applied,
+                "errors": errors,
+            }
 
     def _create_locked(
         self, fields: dict[str, Any], include_version: bool = False

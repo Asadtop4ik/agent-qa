@@ -219,11 +219,26 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     response.setdefault("headers", {}).update(deepcopy(replay_headers))
         elif route.get("parameters"):
             operation["parameters"] = deepcopy(route["parameters"])
+        consumes = route.get("consumes", ["application/json"])
         if route.get("request_schema") is not None:
             operation["requestBody"] = {
                 "required": True,
                 "content": {
-                    "application/json": {"schema": deepcopy(route["request_schema"])}
+                    media_type: {"schema": deepcopy(route["request_schema"])}
+                    for media_type in consumes
+                },
+            }
+        elif route.get("body") and route.get("consumes"):
+            operation["requestBody"] = {
+                "required": True,
+                "content": {
+                    media_type: {
+                        "schema": {
+                            "type": "string",
+                            "description": "UTF-8 CSV text.",
+                        }
+                    }
+                    for media_type in consumes
                 },
             }
         if route.get("body"):
