@@ -30,6 +30,7 @@ _EVENT_FILTERS = frozenset((*_EVENT_TYPES, "order.*", "product.*", "*"))
 _STATUSES = ("pending", "retrying", "delivered", "failed")
 _MAX_WEBHOOKS = 20
 _MAX_CAPACITY = 500
+_ATTEMPT_HISTORY_LIMIT = 100
 _MAX_ID = 2**31 - 1
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z", re.IGNORECASE)
 
@@ -535,6 +536,8 @@ class OutboxStore:
                     "signature": signature,
                 }
                 entry["attempts"].append(attempt)
+                if len(entry["attempts"]) > _ATTEMPT_HISTORY_LIMIT:
+                    del entry["attempts"][:-_ATTEMPT_HISTORY_LIMIT]
                 entry["_cycle_attempts"] = n
                 counts["processed"] += 1
                 if http_status == 200:
@@ -609,12 +612,14 @@ class OutboxStore:
             )
         if set(payload) - {"enabled", "interval_ms"}:
             raise _bad_request("invalid_dispatcher", "unsupported dispatcher field")
-        enabled = payload.get("enabled", self._dispatcher["enabled"])
-        interval = payload.get("interval_ms", self._dispatcher["interval_ms"])
-        if type(enabled) is not bool:
-            raise _bad_request("invalid_value", "enabled must be a boolean", "enabled")
-        interval = _bounded_integer(interval, 100, 60000, "interval_ms")
         with self._lock:
+            enabled = payload.get("enabled", self._dispatcher["enabled"])
+            interval = payload.get("interval_ms", self._dispatcher["interval_ms"])
+            if type(enabled) is not bool:
+                raise _bad_request(
+                    "invalid_value", "enabled must be a boolean", "enabled"
+                )
+            interval = _bounded_integer(interval, 100, 60000, "interval_ms")
             self._dispatcher = {"enabled": enabled, "interval_ms": interval}
             result = dict(self._dispatcher)
             self._wake.set()

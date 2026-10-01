@@ -119,6 +119,36 @@ class OutboxStoreTests(unittest.TestCase):
         self.assertEqual(final["status"], "delivered")
         self.assertEqual([attempt["n"] for attempt in final["attempts"]], [1, 2, 1])
 
+    def test_requeue_keeps_bounded_recent_attempt_history_and_resets_budget(self):
+        self.store.create_webhook(
+            webhook("https://fail.invalid/hook", max_attempts=2, backoff_base_ms=0)
+        )
+        self.store.emit("order.created", {"id": 1})
+        item_id = self.store.list_outbox([])["items"][-1]["id"]
+        first_cycle_time = self.clock.value
+
+        for cycle in range(51):
+            self.store.process_due(now=self.clock.value)
+            self.store.process_due(now=self.clock.value)
+            if cycle < 50:
+                self.assertEqual(self.store.get_outbox(item_id)["status"], "failed")
+                self.store.requeue(item_id)
+            self.clock.value += 1
+
+        attempts = self.store.get_outbox(item_id)["attempts"]
+        self.assertEqual(len(attempts), 100)
+        self.assertEqual([attempt["n"] for attempt in attempts[:2]], [1, 2])
+        self.assertEqual([attempt["n"] for attempt in attempts[-2:]], [1, 2])
+        self.assertEqual(
+            [attempt["timestamp"] for attempt in attempts[:2]],
+            [first_cycle_time + 1] * 2,
+        )
+        self.assertEqual(
+            [attempt["timestamp"] for attempt in attempts[-2:]],
+            [first_cycle_time + 50] * 2,
+        )
+        self.assertEqual(self.store.get_outbox(item_id)["status"], "failed")
+
     def test_capacity_evicts_oldest_terminal_then_counts_dropped(self):
         store = OutboxStore(clock=self.clock, capacity=1, start_dispatcher=False)
         store.create_webhook(webhook())
@@ -230,6 +260,52 @@ class OutboxStoreTests(unittest.TestCase):
         store.configure_dispatcher({"enabled": False})
         store.stop(timeout=1)
         self.assertFalse(first_thread.is_alive())
+
+    def test_concurrent_partial_dispatcher_updates_use_current_defaults(self):
+        store = OutboxStore(clock=self.clock, start_dispatcher=False)
+        lock = store._lock
+        defaults_barrier = threading.Barrier(2)
+
+        class DefaultsBarrierLock:
+            def __enter__(self):
+                if threading.current_thread().name.startswith("dispatcher-race-"):
+                    defaults_barrier.wait(timeout=2)
+                lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                lock.release()
+
+        store._lock = DefaultsBarrierLock()
+        errors = []
+
+        def configure(payload):
+            try:
+                store.configure_dispatcher(payload)
+            except Exception as error:  # surfaced in the main test thread
+                errors.append(error)
+
+        workers = [
+            threading.Thread(
+                name="dispatcher-race-disable",
+                target=configure,
+                args=({"enabled": False},),
+            ),
+            threading.Thread(
+                name="dispatcher-race-interval",
+                target=configure,
+                args=({"interval_ms": 500},),
+            ),
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=3)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertFalse(store._dispatcher["enabled"])
+        self.assertEqual(store._dispatcher["interval_ms"], 500)
 
     def test_concurrent_processing_rechecks_updated_schedule(self):
         store = OutboxStore(clock=self.clock, start_dispatcher=False)
