@@ -1137,16 +1137,6 @@ def validate_config(
                 "Request validation failed",
                 [{"field": name, "message": "Must be a string"}],
             )
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as error:
-            raise ApiError(
-                400,
-                "validation_error",
-                "Request validation failed",
-                [{"field": name, "message": "Must be valid UTF-8 text"}],
-            ) from error
-
     loaded = settings.load(env)
     return (
         200,

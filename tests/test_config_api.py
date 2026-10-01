@@ -33,6 +33,24 @@ class ConfigApiTests(unittest.TestCase):
         self.assertNotIn("private-token-value", repr(result))
         self.assertNotIn("private-token-value", repr(secret))
 
+    def test_validate_accepts_unpaired_surrogates_for_settings_validation(self):
+        payload = {
+            "env": {
+                "AGENT_QA_GIT_SHA": "build-revision",
+                "APP_PORT": "\ud800",
+                "FUTURE_SETTING": "\udfff",
+            }
+        }
+        with patch("agent_qa.routes.settings.load", wraps=settings.load) as load:
+            status, result, headers = validate_config([], payload=payload)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers, {})
+        load.assert_called_once_with(payload["env"])
+        self.assertFalse(result["valid"])
+        self.assertEqual([item["field"] for item in result["errors"]], ["APP_PORT"])
+        self.assertEqual(result["unknown"], ["FUTURE_SETTING"])
+
     def test_unknown_setting_is_not_found(self):
         with self.assertRaises(ApiError) as error:
             get_config_setting([], {"name": "AGENT_QA_NOT_REGISTERED"})
@@ -230,8 +248,12 @@ class ConfigApiTests(unittest.TestCase):
         self.assertEqual(body["error"]["details"][0]["field"], "env.APP_PORT")
 
         status, body, _ = dispatch({"env": {"AGENT_QA_API_KEY": "\ud800"}})
-        self.assertEqual(status, 400)
-        self.assertEqual(body["error"]["code"], "validation_error")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["valid"])
+        self.assertEqual(
+            [item["field"] for item in body["errors"]], ["AGENT_QA_API_KEY"]
+        )
+        self.assertEqual(body["unknown"], [])
         self.assertNotIn("\\ud800", repr(body))
 
 
