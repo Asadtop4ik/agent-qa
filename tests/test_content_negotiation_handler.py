@@ -44,6 +44,39 @@ def response_header(handler, name):
 
 
 class ContentNegotiationHandlerTests(unittest.TestCase):
+    def test_send_error_propagates_trace_and_adds_timing_headers(self):
+        trace_id = "0123456789abcdef0123456789abcdef"
+        handler = make_handler(
+            "/malformed",
+            headers={
+                "traceparent": f"00-{trace_id}-0123456789abcdef-00",
+                "X-Request-Id": "client-request-id",
+            },
+        )
+
+        Handler.send_error(handler, 400, "Bad request")
+
+        response_traceparent = response_header(handler, "traceparent")
+        self.assertTrue(response_traceparent.startswith(f"00-{trace_id}-"))
+        self.assertTrue(response_traceparent.endswith("-01"))
+        self.assertIsNotNone(response_header(handler, "Server-Timing"))
+        self.assertEqual(response_header(handler, "X-Request-Id"), "client-request-id")
+
+    def test_head_and_method_not_allowed_responses_include_trace_headers(self):
+        head = make_handler("/fixture", method="HEAD")
+        Handler._json(head, 200, {"ok": True})
+        self.assertIsNotNone(response_header(head, "traceparent"))
+        self.assertIsNotNone(response_header(head, "Server-Timing"))
+        self.assertEqual(head.wfile.getvalue(), b"")
+
+        method_error = make_handler("/fixture", method="PUT")
+        Handler._method_not_allowed(
+            method_error, [({"path": "/fixture", "method": "GET"}, {})]
+        )
+        self.assertEqual(method_error.status, 405)
+        self.assertIsNotNone(response_header(method_error, "traceparent"))
+        self.assertIsNotNone(response_header(method_error, "Server-Timing"))
+
     def test_version_headers_are_generated_and_successor_link_is_merged(self):
         route = {
             "path": "/fixture/{id}",

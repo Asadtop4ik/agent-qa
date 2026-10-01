@@ -3,6 +3,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import math
 import platform
 import re
 from urllib.parse import quote, urlencode
@@ -18,6 +19,7 @@ from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
 from agent_qa.outbox import OUTBOX
 from agent_qa.openapi import build_openapi
+from agent_qa.tracing import span as trace_span
 from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.schemas import (
     DEFAULT_LIMIT,
@@ -91,6 +93,12 @@ def _job_runner() -> JobRunner:
 
 def _outbox_store():
     return OUTBOX if _tenant_name() == "default" else tenants.current().outbox
+
+
+def _store_call(operation: str, callback, *args, **kwargs):
+    """Run a real store operation inside a bounded, safe trace span."""
+    with trace_span("store", op=operation):
+        return callback(*args, **kwargs)
 
 
 def _header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -444,9 +452,10 @@ def create_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create an order."""
     values = validate_create(payload)
-    order = FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).create(**values, include_version=True)
+    )
+    order = _store_call("create", service.create, **values, include_version=True)
     version = order.pop("version")
     _outbox_store().emit("order.created", dict(order))
     return (
@@ -466,9 +475,15 @@ def create_orders_bulk(
 ) -> tuple[int, object, dict[str, str]]:
     """Create orders in sequence and return per-item results."""
     values = payload if isinstance(payload, dict) else {}
-    status, body = FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).create_bulk(values.get("items"), values.get("atomic", False))
+    )
+    status, body = _store_call(
+        "create_bulk",
+        service.create_bulk,
+        values.get("items"),
+        values.get("atomic", False),
+    )
     if isinstance(body, dict):
         for result in body.get("results", []):
             if result.get("status") == 201 and isinstance(result.get("data"), dict):
@@ -488,7 +503,8 @@ def list_orders(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated orders."""
     filters = validate_query(query)
-    result = _order_store().list(**filters)
+    store = _order_store()
+    result = _store_call("list", store.list, **filters)
     if filters["pagination"] == "cursor":
         items, total, next_cursor = result
         body = {
@@ -533,8 +549,9 @@ def get_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Return one order or the standard missing-order error."""
     order_id = _order_id(path_params)
+    store = _order_store()
     order = (
-        _order_store().get(order_id, include_version=True)
+        _store_call("read", store.get, order_id, include_version=True)
         if order_id is not None
         else None
     )
@@ -558,12 +575,21 @@ def patch_order(
     order_id = _order_id(path_params)
     if order_id is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    if _order_store().get(order_id) is None:
+    store = _order_store()
+    if _store_call("read", store.get, order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    order = FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).update(order_id, changes, expected_version=expected_version, include_version=True)
+    )
+    order = _store_call(
+        "update",
+        service.update,
+        order_id,
+        changes,
+        expected_version=expected_version,
+        include_version=True,
+    )
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
@@ -579,12 +605,19 @@ def delete_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order and return an empty response body."""
     order_id = _order_id(path_params)
-    if order_id is None or _order_store().get(order_id) is None:
+    store = _order_store()
+    if order_id is None or _store_call("read", store.get, order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    if not FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).delete(order_id, expected_version=expected_version):
+    )
+    if not _store_call(
+        "delete",
+        service.delete,
+        order_id,
+        expected_version=expected_version,
+    ):
         raise ApiError(404, "order_not_found", "Order not found")
     _outbox_store().emit("order.deleted", {"id": order_id})
     return 204, None, {"Content-Length": "0"}
@@ -685,9 +718,10 @@ def create_order_v2(
         values["items"] = body["items"]
     else:
         values["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
-    order = FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).create(**values, include_version=True)
+    )
+    order = _store_call("create", service.create, **values, include_version=True)
     version = order.pop("version")
     _outbox_store().emit("order.created", dict(order))
     result = _v2_order(order)
@@ -710,7 +744,8 @@ def list_orders_v2(
     """Return cursor-paginated orders using the v2 representation."""
     filters = _v2_query(query)
     try:
-        orders, total, next_cursor = _order_store().list(**filters)
+        store = _order_store()
+        orders, total, next_cursor = _store_call("list", store.list, **filters)
     except OrderError as error:
         raise ApiError(400, error.code, error.message, error.details) from error
     body = {
@@ -736,7 +771,12 @@ def get_order_v2(
 ) -> tuple[int, object, dict[str, str]]:
     """Read an order in the v2 representation."""
     order_id = _order_id(path_params)
-    order = _order_store().get(order_id, include_version=True) if order_id else None
+    store = _order_store()
+    order = (
+        _store_call("read", store.get, order_id, include_version=True)
+        if order_id
+        else None
+    )
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
@@ -760,12 +800,21 @@ def patch_order_v2(
     if "amount" in body:
         changes["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
     order_id = _order_id(path_params)
-    if order_id is None or _order_store().get(order_id) is None:
+    store = _order_store()
+    if order_id is None or _store_call("read", store.get, order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    order = FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).update(order_id, changes, expected_version=expected_version, include_version=True)
+    )
+    order = _store_call(
+        "update",
+        service.update,
+        order_id,
+        changes,
+        expected_version=expected_version,
+        include_version=True,
+    )
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
@@ -781,12 +830,19 @@ def delete_order_v2(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order using the shared fulfillment service."""
     order_id = _order_id(path_params)
-    if order_id is None or _order_store().get(order_id) is None:
+    store = _order_store()
+    if order_id is None or _store_call("read", store.get, order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    if not FulfillmentService(
+    service = FulfillmentService(
         _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
-    ).delete(order_id, expected_version=expected_version):
+    )
+    if not _store_call(
+        "delete",
+        service.delete,
+        order_id,
+        expected_version=expected_version,
+    ):
         raise ApiError(404, "order_not_found", "Order not found")
     _outbox_store().emit("order.deleted", {"id": order_id})
     return 204, None, {"Content-Length": "0"}
@@ -798,8 +854,12 @@ def create_product(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create a product."""
-    product = _product_store().create(
-        **validate_product_create(payload), include_version=True
+    store = _product_store()
+    product = _store_call(
+        "create",
+        store.create,
+        **validate_product_create(payload),
+        include_version=True,
     )
     version = product.pop("version")
     _outbox_store().emit("product.created", dict(product))
@@ -820,8 +880,12 @@ def create_products_bulk(
 ) -> tuple[int, object, dict[str, str]]:
     """Create products in sequence and return per-item results."""
     values = payload if isinstance(payload, dict) else {}
-    status, body = _product_store().create_bulk(
-        values.get("items"), values.get("atomic", False)
+    store = _product_store()
+    status, body = _store_call(
+        "create_bulk",
+        store.create_bulk,
+        values.get("items"),
+        values.get("atomic", False),
     )
     if isinstance(body, dict):
         for result in body.get("results", []):
@@ -842,7 +906,8 @@ def list_products(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated products."""
     filters = validate_product_query(query)
-    result = _product_store().list(**filters)
+    store = _product_store()
+    result = _store_call("list", store.list, **filters)
     if filters["pagination"] == "cursor":
         items, total, next_cursor = result
         body = {
@@ -943,8 +1008,11 @@ def export_products_csv(
 ) -> tuple[int, str, dict[str, str]]:
     """Export filtered products as a bounded CSV representation."""
     filters = _csv_filters(query, "products")
+    store = _product_store()
     return _csv_response(
-        "products.csv", PRODUCT_COLUMNS, _product_store().export_rows(filters)
+        "products.csv",
+        PRODUCT_COLUMNS,
+        _store_call("export_rows", store.export_rows, filters),
     )
 
 
@@ -955,8 +1023,11 @@ def export_orders_csv(
 ) -> tuple[int, str, dict[str, str]]:
     """Export filtered orders as a bounded CSV representation."""
     filters = _csv_filters(query, "orders")
+    store = _order_store()
     return _csv_response(
-        "orders.csv", ORDER_COLUMNS, _order_store().export_rows(filters)
+        "orders.csv",
+        ORDER_COLUMNS,
+        _store_call("export_rows", store.export_rows, filters),
     )
 
 
@@ -1263,8 +1334,14 @@ def get_product(
 ) -> tuple[int, object, dict[str, str]]:
     """Return one product or the standard missing-product error."""
     product_id = _product_id(path_params)
+    store = _product_store()
     product = (
-        _product_store().get(product_id, include_version=True)
+        _store_call(
+            "read",
+            store.get,
+            product_id,
+            include_version=True,
+        )
         if product_id is not None
         else None
     )
@@ -1288,11 +1365,17 @@ def patch_product(
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    if _product_store().get(product_id) is None:
+    store = _product_store()
+    if _store_call("read", store.get, product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    product = _product_store().update(
-        product_id, changes, expected_version=expected_version, include_version=True
+    product = _store_call(
+        "update",
+        store.update,
+        product_id,
+        changes,
+        expected_version=expected_version,
+        include_version=True,
     )
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
@@ -1309,10 +1392,13 @@ def delete_product(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete a product and return an empty response body."""
     product_id = _product_id(path_params)
-    if product_id is None or _product_store().get(product_id) is None:
+    store = _product_store()
+    if product_id is None or _store_call("read", store.get, product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    if not _product_store().delete(product_id, expected_version=expected_version):
+    if not _store_call(
+        "delete", store.delete, product_id, expected_version=expected_version
+    ):
         raise ApiError(404, "product_not_found", "Product not found")
     _outbox_store().emit("product.deleted", {"id": product_id})
     return 204, None, {"Content-Length": "0"}
@@ -1329,10 +1415,13 @@ def adjust_product_stock(
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    if _product_store().get(product_id) is None:
+    store = _product_store()
+    if _store_call("read", store.get, product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    product = _product_store().adjust_stock(
+    product = _store_call(
+        "adjust_stock",
+        store.adjust_stock,
         product_id,
         values["delta"],
         expected_version=expected_version,
@@ -1351,7 +1440,8 @@ def categories(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return current aggregates for categories represented by products."""
-    items = _product_store().categories()
+    store = _product_store()
+    items = _store_call("categories", store.categories)
     return 200, {"items": items, "total": len(items)}, {}
 
 
@@ -1367,6 +1457,83 @@ def list_audit(
         requested_tenant = tenants.validate_name(requested_tenant)
     filters["tenant"] = requested_tenant
     return 200, AUDIT_LOG.query(**filters), {}
+
+
+def _trace_filters(query: list[tuple[str, str]]) -> dict[str, object]:
+    allowed = {"route", "status", "min_duration_ms", "limit"}
+    values: dict[str, str] = {}
+    if len(query) > len(allowed):
+        raise ApiError(400, "invalid_query", "Invalid trace query")
+    for key, value in query:
+        if key not in allowed or key in values or len(value) > 128:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        values[key] = value
+    filters: dict[str, object] = {"limit": 20}
+    if "route" in values:
+        route = values["route"]
+        if route != "unmatched" and not re.fullmatch(
+            r"/[A-Za-z0-9_./{}-]{0,127}", route
+        ):
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        filters["route"] = route
+    if "status" in values:
+        raw = values["status"]
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 3:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        status_code = int(raw)
+        if not 100 <= status_code <= 599:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        filters["status"] = status_code
+    if "min_duration_ms" in values:
+        raw = values["min_duration_ms"]
+        if len(raw) > 32 or not re.fullmatch(
+            r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", raw
+        ):
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        try:
+            minimum = float(raw)
+        except ValueError as error:
+            raise ApiError(400, "invalid_query", "Invalid trace query") from error
+        if not math.isfinite(minimum) or not 0 <= minimum <= 1_000_000_000:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        filters["min_duration_ms"] = minimum
+    if "limit" in values:
+        raw = values["limit"]
+        if not raw.isascii() or not raw.isdigit() or len(raw) > 3:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        limit = int(raw)
+        if not 1 <= limit <= 100:
+            raise ApiError(400, "invalid_query", "Invalid trace query")
+        filters["limit"] = limit
+    return filters
+
+
+def list_traces(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """List retained traces using bounded filters."""
+    from agent_qa.tracing import TRACE_BUFFER
+
+    return 200, TRACE_BUFFER.list(**_trace_filters(query)), {}
+
+
+def get_trace(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return one retained trace."""
+    from agent_qa.tracing import TRACE_BUFFER
+
+    trace_id = (path_params or {}).get("trace_id", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", trace_id):
+        raise ApiError(404, "trace_not_found", "Trace not found")
+    record = TRACE_BUFFER.get(trace_id)
+    if record is None:
+        raise ApiError(404, "trace_not_found", "Trace not found")
+    return 200, record, {}
 
 
 def get_audit_entry(
@@ -3975,6 +4142,74 @@ ROUTES = (
             "404": "The tenant does not exist (tenant_not_found).",
             "409": "The default tenant is protected (default_tenant_protected).",
         },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/traces",
+        "handler": list_traces,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "listTraces",
+        "summary": "List retained request traces",
+        "parameters": [
+            {
+                "name": "route",
+                "in": "query",
+                "required": False,
+                "description": "Route template or the value 'unmatched'.",
+                "schema": {"type": "string", "maxLength": 128},
+            },
+            {
+                "name": "status",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "integer", "minimum": 100, "maximum": 599},
+            },
+            {
+                "name": "min_duration_ms",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1_000_000_000,
+                },
+            },
+            {
+                "name": "limit",
+                "in": "query",
+                "required": False,
+                "schema": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+        ],
+        "responses": ["200", "400", "401", "403"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/TraceList"}},
+        "error_responses": {"400": "Invalid trace filter (invalid_query)."},
+    },
+    {
+        "method": "GET",
+        "path": "/admin/traces/{trace_id}",
+        "handler": get_trace,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "getTrace",
+        "summary": "Read one retained request trace",
+        "parameters": [
+            {
+                "name": "trace_id",
+                "in": "path",
+                "required": True,
+                "schema": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$",
+                },
+            }
+        ],
+        "responses": ["200", "401", "403", "404"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Trace"}},
+        "error_responses": {"404": "The trace is not retained (trace_not_found)."},
     },
     *_CSV_ROUTES,
 )

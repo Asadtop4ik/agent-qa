@@ -4,9 +4,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from email.message import Message
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from agent_qa.config import GIT_SHA
@@ -389,6 +391,12 @@ class RouteUnitTests(unittest.TestCase):
                 self.assertNotIn("Content-Length", header_names)
                 self.assertIn(("X-Request-Id", "conditional-test"), sent_headers)
                 self.assertIn(("ETag", '"o1.1"'), sent_headers)
+                self.assertTrue(
+                    any(name.lower() == "traceparent" for name, _ in sent_headers)
+                )
+                self.assertTrue(
+                    any(name.lower() == "server-timing" for name, _ in sent_headers)
+                )
                 self.assertEqual(handler.wfile.getvalue(), b"")
 
     def test_order_id_rejects_unbounded_numeric_path(self):
@@ -652,6 +660,137 @@ class RouteUnitTests(unittest.TestCase):
                 delete_rate_limit([], {"identity": "key:sample"})
             self.assertEqual(error.exception.status, 404)
             self.assertEqual(error.exception.code, "override_not_found")
+
+    def test_trace_filters_are_bounded_and_accept_unmatched(self):
+        from agent_qa.routes import get_trace, list_traces
+
+        route = next(route for route in ROUTES if route["path"] == "/admin/traces")
+        self.assertEqual(route["role"], "admin")
+        self.assertTrue(route["auth_required"])
+        with patch("agent_qa.tracing.TRACE_BUFFER") as trace_buffer:
+            trace_buffer.list.return_value = {
+                "items": [],
+                "total_matching": 0,
+                "capacity": 100,
+            }
+            response = list_traces(
+                [
+                    ("route", "unmatched"),
+                    ("status", "404"),
+                    ("min_duration_ms", "1.25"),
+                    ("limit", "3"),
+                ]
+            )
+            self.assertEqual(response[0], 200)
+            trace_buffer.list.assert_called_once_with(
+                route="unmatched", status=404, min_duration_ms=1.25, limit=3
+            )
+            trace_buffer.get.return_value = None
+            with self.assertRaises(ApiError) as error:
+                get_trace([], {"trace_id": "not-a-trace"})
+            self.assertEqual(error.exception.status, 404)
+            self.assertEqual(error.exception.code, "trace_not_found")
+            with self.assertRaises(ApiError) as error:
+                get_trace([], {"trace_id": "0" * 32})
+            self.assertEqual(error.exception.code, "trace_not_found")
+
+        for query in (
+            [("limit", "1"), ("limit", "2")],
+            [("unknown", "1")],
+            [("status", "9" * 5000)],
+            [("min_duration_ms", "9" * 40)],
+            [("min_duration_ms", "NaN")],
+            [("min_duration_ms", "1e999")],
+            [("limit", "9" * 5000)],
+        ):
+            with self.subTest(query=query), self.assertRaises(ApiError) as error:
+                list_traces(query)
+            self.assertEqual(error.exception.status, 400)
+            self.assertEqual(error.exception.code, "invalid_query")
+
+    def test_trace_buffer_save_precedes_send_and_excludes_admin_prefix(self):
+        from agent_qa.server import Handler
+
+        def make_response(path, events):
+            handler = object.__new__(Handler)
+            handler.path = path
+            handler.command = "GET"
+            handler.headers = Message()
+            handler.request_id = "trace-buffer-test"
+            handler._record_response = lambda status: None
+            handler.wfile = BytesIO()
+            handler.send_response = lambda status: events.append("send")
+            handler.send_header = lambda name, value: None
+            handler.end_headers = lambda: None
+            return handler
+
+        events = []
+        with patch("agent_qa.tracing.TRACE_BUFFER") as trace_buffer:
+            trace_buffer.append.side_effect = lambda record: events.append("buffer")
+            Handler._json(make_response("/health", events), 200, {"ok": True})
+            self.assertEqual(events, ["buffer", "send"])
+
+            events.clear()
+            trace_buffer.reset_mock()
+            for path in ("/admin/traces", "/admin/traces-invalid"):
+                Handler._json(make_response(path, events), 404, {"error": {}})
+            trace_buffer.append.assert_not_called()
+
+    def test_admin_trace_dispatch_requires_admin_role(self):
+        from agent_qa.server import Handler
+
+        handler = object.__new__(Handler)
+        handler.path = "/admin/traces"
+        handler.command = "GET"
+        handler.headers = Message()
+        handler.request_id = "trace-auth-test"
+        responses = []
+        handler._json = lambda *args: responses.append(args)
+        with patch("agent_qa.server.authenticate_api_key", return_value=None):
+            Handler._dispatch(handler)
+        self.assertEqual(responses[0][0], 401)
+        self.assertEqual(responses[0][1]["error"]["code"], "unauthorized")
+
+    def test_malformed_request_line_still_gets_http_tracing_headers(self):
+        from agent_qa.server import Handler
+
+        class KeepOpenBytesIO(BytesIO):
+            def close(self):
+                pass
+
+        class Connection:
+            def __init__(self):
+                self.request_stream = BytesIO(
+                    b"INVALID request line extra tokens\r\n\r\n"
+                )
+                self.response_stream = KeepOpenBytesIO()
+
+            def makefile(self, mode, buffering=None):
+                return self.request_stream if "r" in mode else self.response_stream
+
+            def sendall(self, data):
+                self.response_stream.write(data)
+
+            def close(self):
+                return None
+
+        connection = Connection()
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            Handler(
+                connection,
+                ("127.0.0.1", 12345),
+                SimpleNamespace(server_name="localhost", server_port=8080),
+            )
+        response = connection.response_stream.getvalue()
+        self.assertTrue(response.startswith(b"HTTP/1.0 400 Bad Request\r\n"))
+        self.assertIn(b"traceparent: 00-", response)
+        self.assertIn(b"Server-Timing: ", response)
+        self.assertRegex(
+            response.decode("latin-1"),
+            r"traceparent: 00-[0-9a-f]{32}-[0-9a-f]{16}-01\r\n",
+        )
+        self.assertIn('"trace_id"', stdout.getvalue())
 
     @staticmethod
     def make_dispatcher(path, body, method="POST", content_type="application/json"):

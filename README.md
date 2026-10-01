@@ -79,6 +79,17 @@ Audit records remain available after tenant data is purged. `/metrics` reports
 `agent_qa_tenant_orders{tenant="..."}`, `agent_qa_tenant_products{tenant="..."}`,
 and `agent_qa_tenants` gauges.
 
+## Request tracing
+
+Requests accept and return W3C `traceparent` values. Responses also include
+`Server-Timing` with bounded span durations. Completed request traces are held
+in memory (default capacity 100; `AGENT_QA_TRACE_CAPACITY` accepts 10–1000).
+Admins can list and filter retained traces at `GET /admin/traces` or read one
+with `GET /admin/traces/{trace_id}`. The list filters accept `route` (including
+`unmatched`), `status`, `min_duration_ms`, and `limit`. Invalid `traceparent`
+values start a new trace, and admin trace requests do not enter the buffer.
+Trace records omit request values, headers, and query strings.
+
 ## Configuration
 
 Admins can inspect settings through `GET /admin/config` and

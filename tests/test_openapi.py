@@ -24,6 +24,30 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_trace_routes_and_response_headers_match_route_metadata(self):
+        spec = build_openapi(ROUTES, "trace-drift")
+        routes = {(route["method"].lower(), route["path"]): route for route in ROUTES}
+        for method, path in (
+            ("get", "/admin/traces"),
+            ("get", "/admin/traces/{trace_id}"),
+        ):
+            with self.subTest(path=path):
+                route = routes[(method, path)]
+                operation = spec["paths"][path][method]
+                self.assertEqual(route["role"], "admin")
+                self.assertEqual(operation["x-required-role"], "admin")
+                self.assertEqual(operation["security"], [{"ApiKeyAuth": []}])
+                self.assertIn("403", operation["responses"])
+                for response in operation["responses"].values():
+                    self.assertIn("traceparent", response["headers"])
+                    self.assertIn("Server-Timing", response["headers"])
+        self.assertEqual(
+            spec["components"]["headers"]["Traceparent"]["schema"]["pattern"],
+            "^00-[0-9a-f]{32}-[0-9a-f]{16}-01$",
+        )
+        self.assertIn("Trace", SCHEMAS)
+        self.assertIn("TraceList", SCHEMAS)
+
     def test_version_metadata_and_v2_paths_match_openapi(self):
         spec = build_openapi(ROUTES, "version-drift")
         for path in ("/orders", "/orders/{id}", "/orders/bulk", "/orders/search"):
@@ -537,6 +561,8 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "Sunset",
                 "Link",
                 "X-Tenant",
+                "traceparent",
+                "Server-Timing",
             },
         )
         self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
@@ -702,6 +728,8 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 "Sunset",
                 "Link",
                 "X-Tenant",
+                "traceparent",
+                "Server-Timing",
             },
         )
 

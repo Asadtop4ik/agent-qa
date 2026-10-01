@@ -17,6 +17,9 @@ class RequestContext:
     resource_id: int | str | None = None
     changes: dict[str, object] | None = None
     tenant: str = "default"
+    # Kept untyped here so the HTTP-independent context module does not import
+    # tracing (which itself may be used without an HTTP request).
+    trace: object | None = None
 
 
 _LOCAL = threading.local()

@@ -746,6 +746,73 @@ SCHEMAS["OrderList"]["properties"]["items"]["items"] = SCHEMAS["Order"]
 SCHEMAS["ProductList"]["properties"]["items"]["items"] = SCHEMAS["Product"]
 SCHEMAS["CategoryList"]["properties"]["items"]["items"] = SCHEMAS["Category"]
 
+SCHEMAS.update(
+    {
+        "TraceSpan": {
+            "type": "object",
+            "required": ["name", "start_ms", "duration_ms", "parent", "attrs"],
+            "properties": {
+                "name": {"type": "string"},
+                "start_ms": {"type": "number", "minimum": 0},
+                "duration_ms": {"type": "number", "minimum": 0},
+                "parent": {"type": "integer", "minimum": 0, "nullable": True},
+                "attrs": {"type": "object", "additionalProperties": True},
+            },
+            "additionalProperties": False,
+        },
+        "Trace": {
+            "type": "object",
+            "required": [
+                "trace_id",
+                "span_id",
+                "parent_span_id",
+                "request_id",
+                "method",
+                "route",
+                "status",
+                "duration_ms",
+                "started_at",
+                "spans",
+            ],
+            "properties": {
+                "trace_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "span_id": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+                "parent_span_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{16}$",
+                    "nullable": True,
+                },
+                "request_id": {"type": "string"},
+                "method": {"type": "string", "maxLength": 16},
+                "route": {"type": "string", "maxLength": 256},
+                "status": {"type": "integer", "minimum": 100, "maximum": 599},
+                "duration_ms": {"type": "number", "minimum": 0},
+                "started_at": {"type": "string", "format": "date-time"},
+                "spans": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"$ref": "#/components/schemas/TraceSpan"},
+                },
+            },
+            "additionalProperties": False,
+        },
+        "TraceList": {
+            "type": "object",
+            "required": ["items", "total_matching", "capacity"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": 100,
+                    "items": {"$ref": "#/components/schemas/Trace"},
+                },
+                "total_matching": {"type": "integer", "minimum": 0},
+                "capacity": {"type": "integer", "minimum": 10, "maximum": 1000},
+            },
+            "additionalProperties": False,
+        },
+    }
+)
+
 _WEBHOOK_EVENT_TYPES = [
     f"{resource}.{action}"
     for resource in ("order", "product")

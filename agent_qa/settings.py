@@ -91,6 +91,14 @@ SETTINGS: dict[str, Setting] = {
         min=10,
         max=5000,
     ),
+    "AGENT_QA_TRACE_CAPACITY": Setting(
+        "AGENT_QA_TRACE_CAPACITY",
+        "int",
+        100,
+        "Maximum number of completed traces retained in memory.",
+        min=10,
+        max=1000,
+    ),
     "AGENT_QA_RATE_BURST": Setting(
         "AGENT_QA_RATE_BURST",
         "int",
