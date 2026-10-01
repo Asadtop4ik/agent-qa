@@ -461,22 +461,22 @@ class OrdersApiTests(unittest.TestCase):
         path = f"/orders/{order['id']}"
         status, headers, fetched = self.request("GET", path)
         self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], f'"o{order["id"]}.1"')
+        initial_etag = headers["ETag"]
         self.assertNotIn("version", fetched)
 
         status, headers, body = self.request(
-            "GET", path, headers={"If-None-Match": f'W/"o{order["id"]}.1"'}
+            "GET", path, headers={"If-None-Match": f"W/{initial_etag}"}
         )
         self.assertEqual(status, 304)
         self.assertIsNone(body)
-        self.assertEqual(headers["ETag"], f'"o{order["id"]}.1"')
+        self.assertEqual(headers["ETag"], initial_etag)
         self.assertNotIn("Content-Type", headers)
 
         stale = self.request(
             "PATCH", path, {"status": "paid"}, headers={"If-Match": '"o1.0"'}
         )
         self.assertEqual(stale[0], 412)
-        self.assertEqual(stale[1]["ETag"], f'"o{order["id"]}.1"')
+        self.assertEqual(stale[1]["ETag"], initial_etag)
         self.assertEqual(stale[2]["error"]["code"], "precondition_failed")
         invalid = self.request(
             "PATCH", path, {"status": "paid"}, headers={"If-Match": "o1.1"}
@@ -487,7 +487,7 @@ class OrdersApiTests(unittest.TestCase):
             "PATCH", path, {"status": "paid"}, headers={"If-Match": headers["ETag"]}
         )
         self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], f'"o{order["id"]}.2"')
+        self.assertEqual(headers["ETag"], initial_etag.rsplit(".", 1)[0] + '.2"')
         self.assertEqual(paid["status"], "paid")
 
     def test_conditional_lists_and_product_stock(self):
@@ -506,23 +506,23 @@ class OrdersApiTests(unittest.TestCase):
         path = f"/products/{product['id']}"
         status, headers, current = self.request("GET", path)
         self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+        initial_etag = headers["ETag"]
         self.assertNotIn("version", current)
         status, headers, changed = self.request(
             "POST",
             path + "/adjust-stock",
             {"delta": 1},
-            headers={"If-Match": f'"p{product["id"]}.1"'},
+            headers={"If-Match": initial_etag},
         )
         self.assertEqual(status, 200)
         self.assertEqual(changed["stock"], 5)
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.2"')
+        self.assertEqual(headers["ETag"], initial_etag.rsplit(".", 1)[0] + '.2"')
 
     def test_item_order_stock_changes_product_etag_and_replay_keeps_create_etag(self):
         product = self.create_product(stock=3)
         path = f"/products/{product['id']}"
         status, headers, _ = self.request("GET", path)
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+        initial_product_etag = headers["ETag"]
 
         order_payload = {
             "customer_id": self.customer_id(),
@@ -548,7 +548,10 @@ class OrdersApiTests(unittest.TestCase):
 
         status, product_headers, reserved = self.request("GET", path)
         self.assertEqual(reserved["stock"], 2)
-        self.assertEqual(product_headers["ETag"], f'"p{product["id"]}.2"')
+        self.assertEqual(
+            product_headers["ETag"], initial_product_etag.rsplit(".", 1)[0] + '.2"'
+        )
+        reserved_etag = product_headers["ETag"]
         changed = self.request(
             "PATCH", f"/orders/{order['id']}", {"status": "cancelled"}
         )
@@ -564,7 +567,10 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(replay[2], order)
         status, product_headers, released = self.request("GET", path)
         self.assertEqual(released["stock"], 3)
-        self.assertEqual(product_headers["ETag"], f'"p{product["id"]}.3"')
+        self.assertEqual(
+            product_headers["ETag"], reserved_etag.rsplit(".", 1)[0] + '.3"'
+        )
+        released_etag = product_headers["ETag"]
 
         second_payload = {
             "customer_id": self.customer_id(),
@@ -572,11 +578,14 @@ class OrdersApiTests(unittest.TestCase):
         }
         status, _, second_order = self.request("POST", "/orders", second_payload)
         self.assertEqual(status, 201)
-        self.assertEqual(self.request("GET", path)[1]["ETag"], f'"p{product["id"]}.4"')
+        fourth_etag = self.request("GET", path)[1]["ETag"]
+        self.assertEqual(fourth_etag, released_etag.rsplit(".", 1)[0] + '.4"')
         status, _, body = self.request("DELETE", f"/orders/{second_order['id']}")
         self.assertEqual(status, 204)
         self.assertIsNone(body)
-        self.assertEqual(self.request("GET", path)[1]["ETag"], f'"p{product["id"]}.5"')
+        self.assertEqual(
+            self.request("GET", path)[1]["ETag"], fourth_etag.rsplit(".", 1)[0] + '.5"'
+        )
 
     def test_conditional_header_missing_can_be_required_in_subprocess(self):
         with socket.socket() as listener:

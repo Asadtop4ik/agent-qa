@@ -518,13 +518,13 @@ class ProductApiTests(unittest.TestCase):
 
     def test_product_etags_and_if_match_dispatch(self):
         _, product, created_headers = self.create()
-        self.assertEqual(created_headers["ETag"], f'"p{product["id"]}.1"')
+        created_etag = created_headers["ETag"]
         self.assertNotIn("version", product)
         path = f"/products/{product['id']}"
 
         status, current, headers = self.dispatch("GET", path)
         self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+        self.assertEqual(headers["ETag"], created_etag)
         status, listing, headers = self.dispatch("GET", "/products")
         canonical = json.dumps(
             listing, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -549,17 +549,17 @@ class ProductApiTests(unittest.TestCase):
         self.assertIn("ETag", headers)
 
         status, error, headers = self.dispatch(
-            "PATCH", path, {"name": "Changed"}, extra_headers={"If-Match": '"p1.9"'}
+            "PATCH", path, {"name": "Changed"}, extra_headers={"If-Match": '"stale"'}
         )
         self.assertEqual(status, 412)
         self.assertEqual(error["error"]["code"], "precondition_failed")
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.1"')
+        self.assertEqual(headers["ETag"], created_etag)
         self.assertEqual(self.store.get(product["id"])["name"], "Widget")
         status, error, _ = self.dispatch(
             "PATCH",
             path,
             {"name": "Changed"},
-            extra_headers={"If-Match": f'W/"p{product["id"]}.1"'},
+            extra_headers={"If-Match": f"W/{created_etag}"},
         )
         self.assertEqual(status, 412)
         self.assertEqual(error["error"]["code"], "precondition_failed")
@@ -577,10 +577,10 @@ class ProductApiTests(unittest.TestCase):
             "PATCH",
             path,
             {"name": "Changed"},
-            extra_headers={"If-Match": f'"unrelated", "p{product["id"]}.1"'},
+            extra_headers={"If-Match": f'"unrelated", {created_etag}'},
         )
         self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], f'"p{product["id"]}.2"')
+        self.assertEqual(headers["ETag"], created_etag.rsplit(".", 1)[0] + '.2"')
 
     def test_stock_and_delete_preconditions_preserve_state_and_error_order(self):
         _, product, headers = self.create()
@@ -613,8 +613,8 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(error["error"]["code"], "precondition_required")
 
     def test_same_if_match_allows_exactly_one_concurrent_patch(self):
-        _, product, _ = self.create()
-        expected = f'"p{product["id"]}.1"'
+        _, product, created_headers = self.create()
+        expected = created_headers["ETag"]
 
         def update(index):
             from agent_qa.routes import patch_product

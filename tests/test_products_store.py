@@ -4,7 +4,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from agent_qa.conditional import PreconditionFailed
+from agent_qa.conditional import PreconditionFailed, etag_for
 from agent_qa.products import (
     MAX_PRODUCTS,
     ProductStore,
@@ -122,14 +122,17 @@ class ProductStoreTests(unittest.TestCase):
         self.assertNotIn("version", store.get(created["id"]))
         updated = store.update(created["id"], {"name": "Changed"}, include_version=True)
         self.assertEqual(updated["version"], 2)
+        expected_etag = etag_for("product", created["id"], 2)
         adjusted = store.adjust_stock(
-            created["id"], -1, expected_version=('"p1.2"',), include_version=True
+            created["id"], -1, expected_version=(expected_etag,), include_version=True
         )
         self.assertEqual(adjusted["version"], 3)
         before = store.get(created["id"])
         with self.assertRaises(PreconditionFailed) as error:
-            store.adjust_stock(created["id"], -1, expected_version=('"p1.2"',))
-        self.assertEqual(error.exception.current_etag, '"p1.3"')
+            store.adjust_stock(created["id"], -1, expected_version=(expected_etag,))
+        self.assertEqual(
+            error.exception.current_etag, etag_for("product", created["id"], 3)
+        )
         self.assertEqual(store.get(created["id"]), before)
 
     def test_ids_are_never_reused_and_sku_is_unique(self):

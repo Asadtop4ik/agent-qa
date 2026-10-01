@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
+from uuid import uuid4
+
 from agent_qa.errors import ApiError
 
 _MAX_HEADER_LENGTH = 8192
 _MAX_TAGS = 100
+_PROCESS_NONCE = uuid4().hex
 
 
 class PreconditionFailed(ApiError):
@@ -86,7 +90,7 @@ def weak_match(parsed: tuple[str, ...] | str, current_etag: str) -> bool:
 
 
 def etag_for(kind: str, resource_id: int, version: int) -> str:
-    """Build the stable order or product entity tag."""
+    """Build an order or product entity tag unique to this process lifetime."""
     prefixes = {"order": "o", "product": "p", "o": "o", "p": "p"}
     prefix = prefixes.get(kind)
     if (
@@ -99,7 +103,7 @@ def etag_for(kind: str, resource_id: int, version: int) -> str:
         or version < 1
     ):
         raise ValueError("kind, resource_id and version must identify a resource")
-    return f'"{prefix}{resource_id}.{version}"'
+    return f'"{prefix}{os.getpid():x}.{_PROCESS_NONCE}.{resource_id}.{version}"'
 
 
 def check_expected_version(

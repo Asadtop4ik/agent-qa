@@ -2,7 +2,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-from agent_qa.conditional import PreconditionFailed
+from agent_qa.conditional import PreconditionFailed, etag_for
 from agent_qa.orders import (
     MAX_ORDERS,
     OrderError,
@@ -67,7 +67,7 @@ class OrderStoreTests(unittest.TestCase):
         self.assertEqual(created["version"], 1)
         self.assertNotIn("version", store.get(created["id"]))
 
-        expected = ('"o1.1"',)
+        expected = (etag_for("order", created["id"], 1),)
         barrier = threading.Barrier(20)
 
         def patch(_):

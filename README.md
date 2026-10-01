@@ -32,10 +32,12 @@ uses `limit` and `offset`.
 
 ## Conditional requests
 
-Order and product item responses include version ETags such as `"o12.3"` and
-`"p4.2"`; versions begin at 1, increase after changes, and are not included in
-JSON. Stock reservations and releases also advance the product version. List
-responses use weak ETags derived from the canonical response body. Send
+Order and product item responses include opaque ETags tied to the service
+process lifetime and resource version. A tag stays stable while that version is
+current, changes after updates, and is regenerated after a service restart;
+versions begin at 1 and are not included in JSON. Stock reservations and
+releases also advance the product version. List responses use weak ETags derived
+from the canonical response body. Send
 `If-None-Match` on GET requests; it uses weak comparison, accepts a tag list or
 `*`, and returns a bodyless `304` on a match. Send `If-Match` on PATCH, DELETE,
 or stock adjustment to prevent a write based on an old version. It uses strong

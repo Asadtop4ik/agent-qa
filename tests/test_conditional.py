@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 import unittest
 
 from agent_qa.conditional import (
@@ -34,14 +37,54 @@ class ConditionalParserTests(unittest.TestCase):
             self.assertEqual(raised.exception.status, 400)
             self.assertEqual(raised.exception.code, "invalid_precondition")
 
+    def test_item_etags_do_not_repeat_after_a_process_restart(self):
+        old_etag = etag_for("product", 1, 1)
+        child_code = """
+import json
+import sys
+from agent_qa.conditional import (
+    PreconditionFailed,
+    check_expected_version,
+    etag_for,
+    parse_etag_list,
+    weak_match,
+)
+
+old_etag = sys.argv[1]
+current_etag = etag_for("product", 1, 1)
+try:
+    check_expected_version(parse_etag_list(old_etag), "product", 1, 1)
+except PreconditionFailed:
+    old_write_rejected = True
+else:
+    old_write_rejected = False
+print(json.dumps({
+    "etag": current_etag,
+    "old_read_matched": weak_match(parse_etag_list(old_etag), current_etag),
+    "old_write_rejected": old_write_rejected,
+}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", child_code, old_etag],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        after_restart = json.loads(result.stdout)
+
+        self.assertNotEqual(after_restart["etag"], old_etag)
+        self.assertFalse(after_restart["old_read_matched"])
+        self.assertTrue(after_restart["old_write_rejected"])
+
     def test_matching_and_generated_tags(self):
         current = etag_for("order", 7, 3)
-        self.assertEqual(current, '"o7.3"')
-        self.assertEqual(etag_for("product", 2, 1), '"p2.1"')
-        self.assertTrue(strong_match(('W/"o7.3"', current), current))
-        self.assertFalse(strong_match(('W/"o7.3"',), current))
-        self.assertTrue(weak_match(('W/"o7.3"',), current))
-        weak_current = 'W/"o7.3"'
+        self.assertEqual(current, etag_for("order", 7, 3))
+        changed = etag_for("order", 7, 4)
+        self.assertNotEqual(current, changed)
+        self.assertTrue(strong_match((f"W/{current}", current), current))
+        self.assertFalse(strong_match((f"W/{current}",), current))
+        self.assertTrue(weak_match((f"W/{current}",), current))
+        weak_current = f"W/{current}"
         self.assertTrue(weak_match((current,), weak_current))
         self.assertTrue(weak_match((weak_current,), weak_current))
         self.assertFalse(strong_match((current,), weak_current))

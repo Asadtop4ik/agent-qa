@@ -105,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(
                 "Content-Type", content_type or "application/json; charset=utf-8"
             )
-        self.send_header("Content-Length", str(len(encoded)))
+        if status != 304:
+            self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-Id", self.request_id)
         for name, value in response_headers.items():
