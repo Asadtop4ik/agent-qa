@@ -215,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         return trace
 
     def _span(self, name: str, **attrs: object):
-        return self._ensure_trace().span(name, **attrs)
+        return Handler._ensure_trace(self).span(name, **attrs)
 
     def _use_header_request_id(self) -> None:
         headers = getattr(self, "headers", None)
@@ -285,7 +285,7 @@ class Handler(BaseHTTPRequestHandler):
         elif content_type and isinstance(body, str):
             encoded = body.encode("utf-8")
         else:
-            with self._span("serialize"):
+            with Handler._span(self, "serialize"):
                 encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
         is_ready = instance == "/ready"
         if encoded and not is_ready:
@@ -304,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
                     if etag and not etag.startswith("W/"):
                         response_headers[etag_key] = f"W/{etag}"
         self._audit_response_body = body
-        trace = self._ensure_trace()
+        trace = Handler._ensure_trace(self)
         route = str(route_match[0]["path"]) if route_match[0] else "unmatched"
         trace.finish(
             request_id=getattr(self, "request_id", ""),
@@ -542,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(
                 400, "invalid_request_target", "Request target is invalid"
             ) from error
-        with self._span("route_match"):
+        with Handler._span(self, "route_match"):
             matches = _path_routes(parsed.path)
         if not matches:
             self._not_found()
@@ -649,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             or route.get("rate_limited", True)
         )
         if needs_authentication:
-            with self._span("auth"):
+            with Handler._span(self, "auth"):
                 identity = authenticate_api_key(self.headers)
         if context is not None and identity is not None:
             context.actor = identity.get("key_id", "anonymous")
@@ -668,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     rate_ip = "unknown"
                 rate_kind, rate_identity = "ip", f"ip:{rate_ip}"
-            with self._span("rate_limit"):
+            with Handler._span(self, "rate_limit"):
                 rate_decision = RATE_LIMITER.consume(rate_identity, rate_kind)
             self._rate_headers = {
                 "RateLimit-Limit": str(rate_decision.limit),
@@ -744,7 +744,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         if route.get("body"):
-            with self._span("parse_body"):
+            with Handler._span(self, "parse_body"):
                 payload = self._read_request_body(
                     consumes=route.get("consumes", ["application/json"]),
                     require_object=route.get("json_object_only", True),
@@ -779,7 +779,7 @@ class Handler(BaseHTTPRequestHandler):
                 parsed.path,
                 idempotency_key,
             )
-            with self._span("idempotency"):
+            with Handler._span(self, "idempotency"):
                 decision = _idempotency_store().begin(
                     idempotency_scope, payload_fingerprint
                 )
@@ -814,7 +814,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             schema = route.get("request_schema")
             if schema is not None:
-                with self._span("validate"):
+                with Handler._span(self, "validate"):
                     errors = validate(schema, payload)
                 if errors:
                     if route.get("sanitize_validation_errors"):
@@ -823,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
                         400, "validation_error", "Request validation failed", errors
                     )
             conditional_headers = route.get("conditional_headers")
-            with self._span("handler", route=str(route["path"])):
+            with Handler._span(self, "handler", route=str(route["path"])):
                 if conditional_headers:
                     request_headers = {}
                     for name in conditional_headers:
