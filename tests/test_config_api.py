@@ -71,9 +71,7 @@ class ConfigApiTests(unittest.TestCase):
         cases = (
             ({"env": []}, "env"),
             ({"env": {"APP_PORT": 8080}}, "APP_PORT"),
-            ({"env": {"APP_PORT": "x" * 4097}}, "APP_PORT"),
             ({"env": {f"SETTING_{i}": "x" for i in range(51)}}, "env"),
-            ({"env": {"BAD-NAME": "sensitive"}}, "env"),
         )
         for payload, field in cases:
             with self.subTest(payload_type=type(payload["env"]).__name__):
@@ -203,6 +201,29 @@ class ConfigApiTests(unittest.TestCase):
         status, body, _ = dispatch({"env": too_many_settings})
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["details"][0]["field"], "env")
+
+        long_secret = "s" * 4097
+        status, body, _ = dispatch({"env": {"AGENT_QA_API_KEY": long_secret}})
+        self.assertEqual(status, 200)
+        self.assertFalse(body["valid"])
+        self.assertEqual(
+            body["errors"],
+            [
+                {
+                    "field": "AGENT_QA_API_KEY",
+                    "message": "Must contain 1 to 4096 characters",
+                }
+            ],
+        )
+        self.assertNotIn(long_secret, repr(body))
+
+        unknown_value = "u" * 4097
+        status, body, _ = dispatch({"env": {"FUTURE.SETTING": unknown_value}})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["valid"])
+        self.assertEqual(body["errors"], [])
+        self.assertEqual(body["unknown"], ["FUTURE.SETTING"])
+        self.assertNotIn(unknown_value, repr(body))
 
         status, body, _ = dispatch({"env": {"APP_PORT": 8080}})
         self.assertEqual(status, 400)

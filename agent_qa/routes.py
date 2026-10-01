@@ -1054,8 +1054,6 @@ def get_config_setting(
     return 200, {"name": name, **settings.describe(loaded, name)}, {}
 
 
-_SETTING_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-_MAX_CONFIG_VALUE_LENGTH = 4096
 _CONFIG_SCALAR_SCHEMA = {
     "oneOf": [
         {"type": "string"},
@@ -1125,17 +1123,12 @@ def validate_config(
             [{"field": "env", "message": "Must contain at most 50 settings"}],
         )
     for name, value in env.items():
-        if not isinstance(name, str) or not _SETTING_NAME_PATTERN.fullmatch(name):
+        if not isinstance(name, str):
             raise ApiError(
                 400,
                 "validation_error",
                 "Request validation failed",
-                [
-                    {
-                        "field": "env",
-                        "message": "Setting names must be valid identifiers",
-                    }
-                ],
+                [{"field": "env", "message": "Setting names must be strings"}],
             )
         if not isinstance(value, str):
             raise ApiError(
@@ -1153,13 +1146,6 @@ def validate_config(
                 "Request validation failed",
                 [{"field": name, "message": "Must be valid UTF-8 text"}],
             ) from error
-        if len(value) > _MAX_CONFIG_VALUE_LENGTH:
-            raise ApiError(
-                400,
-                "validation_error",
-                "Request validation failed",
-                [{"field": name, "message": "Must contain at most 4096 characters"}],
-            )
 
     loaded = settings.load(env)
     return (
@@ -2570,15 +2556,9 @@ ROUTES = (
             "properties": {
                 "env": {
                     "type": "object",
-                    "description": (
-                        "Mapping of setting names (up to 128 characters) to string "
-                        "values. Names must be environment variable identifiers."
-                    ),
+                    "description": "Mapping of setting names to string values.",
                     "maxProperties": 50,
-                    "additionalProperties": {
-                        "type": "string",
-                        "maxLength": _MAX_CONFIG_VALUE_LENGTH,
-                    },
+                    "additionalProperties": {"type": "string"},
                 }
             },
             "additionalProperties": False,
