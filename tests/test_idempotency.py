@@ -15,6 +15,9 @@ from agent_qa.products import ProductStore
 from agent_qa.server import Handler
 
 
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+
+
 class IdempotencyStoreTests(unittest.TestCase):
     def setUp(self):
         self.now = 100.0
@@ -145,7 +148,9 @@ class IdempotencyApiTests(unittest.TestCase):
         self.products_patch = patch("agent_qa.routes.PRODUCT_STORE", self.products)
         self.orders_patch.start()
         self.products_patch.start()
-        self.auth_patch = patch("agent_qa.server.is_valid_api_key", return_value=True)
+        self.auth_patch = patch(
+            "agent_qa.server.authenticate_api_key", return_value=AUTH_IDENTITY
+        )
         self.auth_patch.start()
 
     def tearDown(self):
@@ -322,7 +327,7 @@ class IdempotencyApiTests(unittest.TestCase):
         missing = self.dispatch("POST", "/orders", payload, key=None)
         self.assertEqual(missing[0], 201)
 
-        with patch("agent_qa.server.is_valid_api_key", return_value=False):
+        with patch("agent_qa.server.authenticate_api_key", return_value=None):
             unauthorized = self.dispatch("POST", "/orders", payload, key="bad key")
         self.assertEqual(unauthorized[0], 401)
         self.assertEqual(unauthorized[1]["error"]["code"], "unauthorized")

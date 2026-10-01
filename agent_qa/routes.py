@@ -6,6 +6,7 @@ import os
 import platform
 from urllib.parse import quote, urlencode
 
+from agent_qa import auth
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
 from agent_qa.errors import ApiError
@@ -159,6 +160,79 @@ def metrics(
         REGISTRY.render(order_count, GIT_SHA, products=product_count),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
+
+
+def whoami(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+    *,
+    identity: dict[str, str] | None = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the authenticated key's public identity fields."""
+    if identity is None:
+        raise ApiError(401, "unauthorized", "A valid API key is required")
+    return 200, {name: identity[name] for name in ("key_id", "role", "label")}, {}
+
+
+def _key_payload(payload: object, allowed: set[str]) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) - allowed:
+        raise ApiError(400, "validation_error", "Invalid request body")
+    return payload
+
+
+def _key_id(path_params: dict[str, str] | None) -> str:
+    key_id = (path_params or {}).get("key_id", "")
+    if not key_id or len(key_id) > 32:
+        raise ApiError(404, "key_not_found", "Key not found")
+    return key_id
+
+
+def create_api_key(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    body = _key_payload(payload, {"role", "label"})
+    role, label = body.get("role"), body.get("label")
+    if not isinstance(role, str) or role not in {"read", "write", "admin"}:
+        raise ApiError(400, "invalid_role", "Role must be read, write, or admin")
+    if not isinstance(label, str) or not label.strip() or len(label) > 40:
+        raise ApiError(
+            400, "validation_error", "Label must be 1 to 40 non-blank characters"
+        )
+    return 201, auth.KEY_STORE.create(role, label), {}
+
+
+def list_api_keys(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, auth.KEY_STORE.list_keys(), {}
+
+
+def rotate_api_key(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    body = _key_payload(payload, {"grace_seconds"})
+    grace = body.get("grace_seconds", 0)
+    if type(grace) is not int or not 0 <= grace <= 300:
+        raise ApiError(
+            400, "validation_error", "grace_seconds must be an integer from 0 to 300"
+        )
+    return 200, auth.KEY_STORE.rotate(_key_id(path_params), grace), {}
+
+
+def revoke_api_key(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    auth.KEY_STORE.revoke(_key_id(path_params))
+    return 204, None, {"Content-Length": "0"}
 
 
 def fixture(
@@ -761,16 +835,72 @@ _FIXTURE_RESPONSE_SCHEMA = {
     },
     "additionalProperties": False,
 }
+_KEY_CREATION_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["key_id", "role", "label", "key", "created_at"],
+    "properties": {
+        "key_id": {"type": "string"},
+        "role": {"type": "string", "enum": ["read", "write", "admin"]},
+        "label": {"type": "string"},
+        "key": {"type": "string"},
+        "created_at": {"type": "string", "format": "date-time"},
+    },
+    "additionalProperties": False,
+}
+_KEY_LIST_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["items", "total"],
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": [
+                    "key_id",
+                    "role",
+                    "label",
+                    "created_at",
+                    "last_used_at",
+                    "fingerprint",
+                    "status",
+                ],
+                "properties": {
+                    "key_id": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "enum": ["read", "write", "admin"],
+                    },
+                    "label": {"type": "string"},
+                    "created_at": {"type": "string", "format": "date-time"},
+                    "last_used_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": True,
+                    },
+                    "fingerprint": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}$",
+                    },
+                    "status": {"type": "string", "enum": ["active", "grace"]},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "total": {"type": "integer", "minimum": 1, "maximum": 21},
+    },
+    "additionalProperties": False,
+}
 
 ROUTES = (
     {
         "method": "GET",
         "path": "/health",
         "handler": health,
+        "role": None,
         "auth_required": False,
         "operation_id": "getHealth",
         "summary": "Check service health",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -784,10 +914,11 @@ ROUTES = (
         "method": "GET",
         "path": "/about",
         "handler": about,
+        "role": None,
         "auth_required": False,
         "operation_id": "getAbout",
         "summary": "Read service name and build SHA",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -805,10 +936,11 @@ ROUTES = (
         "method": "GET",
         "path": "/status",
         "handler": status,
+        "role": None,
         "auth_required": False,
         "operation_id": "getStatus",
         "summary": "Check service and fixture status",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -831,10 +963,11 @@ ROUTES = (
         "method": "GET",
         "path": "/ready",
         "handler": ready,
+        "role": None,
         "auth_required": False,
         "operation_id": "getReady",
         "summary": "Check service readiness",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -851,10 +984,11 @@ ROUTES = (
         "method": "GET",
         "path": "/ping",
         "handler": ping,
+        "role": None,
         "auth_required": False,
         "operation_id": "getPing",
         "summary": "Check service liveness",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -868,15 +1002,17 @@ ROUTES = (
         "method": "GET",
         "path": "/metrics",
         "handler": metrics,
+        "role": None,
         "auth_required": False,
         "operation_id": "getMetrics",
         "summary": "Read service metrics",
-        "responses": ["200"],
+        "responses": ["200", "403"],
     },
     {
         "method": "GET",
         "path": "/fixture",
         "handler": fixture,
+        "role": None,
         "auth_required": False,
         "operation_id": "getFixture",
         "summary": "Read the synthetic fixture",
@@ -889,17 +1025,18 @@ ROUTES = (
                 "schema": {"type": "string"},
             }
         ],
-        "responses": ["200", "400"],
+        "responses": ["200", "400", "403"],
         "response_schemas": {"200": _FIXTURE_RESPONSE_SCHEMA},
     },
     {
         "method": "GET",
         "path": "/version",
         "handler": version,
+        "role": None,
         "auth_required": False,
         "operation_id": "getVersion",
         "summary": "Read service version details",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -917,20 +1054,22 @@ ROUTES = (
         "method": "GET",
         "path": "/openapi.json",
         "handler": openapi,
+        "role": None,
         "auth_required": False,
         "operation_id": "getOpenapi",
         "summary": "Read the OpenAPI document",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {"200": _OPENAPI_RESPONSE_SCHEMA},
     },
     {
         "method": "GET",
         "path": "/schemas",
         "handler": list_schemas,
+        "role": None,
         "auth_required": False,
         "operation_id": "listSchemas",
         "summary": "List registered JSON schemas",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -944,6 +1083,7 @@ ROUTES = (
         "method": "GET",
         "path": "/schemas/{name}",
         "handler": get_schema,
+        "role": None,
         "auth_required": False,
         "operation_id": "getSchema",
         "summary": "Read a named JSON schema",
@@ -955,7 +1095,7 @@ ROUTES = (
                 "schema": {"type": "string"},
             }
         ],
-        "responses": ["200", "404"],
+        "responses": ["200", "404", "403"],
         "response_schemas": {"200": {"type": "object"}},
     },
     {
@@ -965,6 +1105,7 @@ ROUTES = (
         "body": True,
         "json_object_only": False,
         "request_schema": {},
+        "role": None,
         "auth_required": False,
         "operation_id": "validateNamedSchema",
         "summary": "Validate a JSON value against a named schema",
@@ -976,7 +1117,7 @@ ROUTES = (
                 "schema": {"type": "string"},
             }
         ],
-        "responses": ["200", "400", "404", "411", "413", "415"],
+        "responses": ["200", "400", "404", "411", "413", "415", "403"],
         "response_schemas": {
             "200": {
                 "type": "object",
@@ -1002,6 +1143,7 @@ ROUTES = (
         "method": "GET",
         "path": "/orders",
         "handler": list_orders,
+        "role": None,
         "auth_required": False,
         "operation_id": "listOrders",
         "summary": "List orders",
@@ -1075,7 +1217,7 @@ ROUTES = (
                 },
             },
         ],
-        "responses": ["200", "304", "400"],
+        "responses": ["200", "304", "400", "403"],
         "response_schemas": {"200": _ORDER_LIST_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
         "error_responses": {
@@ -1100,13 +1242,14 @@ ROUTES = (
         "path": "/orders",
         "handler": create_order,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "createOrder",
         "summary": "Create an order",
         "idempotent": True,
         "etag_response": True,
         "request_schema": _CREATE_ORDER_SCHEMA,
-        "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
+        "responses": ["201", "400", "401", "409", "411", "413", "415", "422", "403"],
         "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
     },
     {
@@ -1114,6 +1257,7 @@ ROUTES = (
         "path": "/orders/bulk",
         "handler": create_orders_bulk,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "createOrdersBulk",
         "summary": "Create orders in bulk",
@@ -1131,6 +1275,7 @@ ROUTES = (
             "413",
             "415",
             "422",
+            "403",
         ],
         "response_schemas": {
             "201": {"$ref": "#/components/schemas/BulkCreateResponse"},
@@ -1142,22 +1287,24 @@ ROUTES = (
         "method": "DELETE",
         "path": "/orders/{id}",
         "handler": delete_order,
+        "role": "write",
         "auth_required": True,
         "operation_id": "deleteOrder",
         "summary": "Delete an order",
         "parameters": [_ORDER_ID, _IF_MATCH],
-        "responses": ["204", "400", "401", "404", "412", "428"],
+        "responses": ["204", "400", "401", "404", "412", "428", "403"],
         "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
         "path": "/orders/{id}",
         "handler": get_order,
+        "role": None,
         "auth_required": False,
         "operation_id": "getOrder",
         "summary": "Read an order",
         "parameters": [_ORDER_ID, _IF_NONE_MATCH],
-        "responses": ["200", "304", "400", "404"],
+        "responses": ["200", "304", "400", "404", "403"],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
     },
@@ -1166,12 +1313,24 @@ ROUTES = (
         "path": "/orders/{id}",
         "handler": patch_order,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "updateOrder",
         "summary": "Update an order",
         "parameters": [_ORDER_ID, _IF_MATCH],
         "request_schema": _UPDATE_ORDER_SCHEMA,
-        "responses": ["200", "400", "401", "404", "409", "412", "413", "415", "428"],
+        "responses": [
+            "200",
+            "400",
+            "401",
+            "404",
+            "409",
+            "412",
+            "413",
+            "415",
+            "428",
+            "403",
+        ],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
         "conditional_headers": ["If-Match"],
     },
@@ -1180,13 +1339,14 @@ ROUTES = (
         "path": "/products",
         "handler": create_product,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "createProduct",
         "summary": "Create a product",
         "idempotent": True,
         "etag_response": True,
         "request_schema": _CREATE_PRODUCT_SCHEMA,
-        "responses": ["201", "400", "401", "409", "411", "413", "415", "422"],
+        "responses": ["201", "400", "401", "409", "411", "413", "415", "422", "403"],
         "response_schemas": {"201": _PRODUCT_RESPONSE_SCHEMA},
     },
     {
@@ -1194,6 +1354,7 @@ ROUTES = (
         "path": "/products/bulk",
         "handler": create_products_bulk,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "createProductsBulk",
         "summary": "Create products in bulk",
@@ -1211,6 +1372,7 @@ ROUTES = (
             "413",
             "415",
             "422",
+            "403",
         ],
         "response_schemas": {
             "201": {"$ref": "#/components/schemas/BulkCreateResponse"},
@@ -1222,11 +1384,12 @@ ROUTES = (
         "method": "GET",
         "path": "/products",
         "handler": list_products,
+        "role": None,
         "auth_required": False,
         "operation_id": "listProducts",
         "summary": "Search and list products",
         "parameters": [*_PRODUCT_QUERY_PARAMETERS, _IF_NONE_MATCH],
-        "responses": ["200", "304", "400"],
+        "responses": ["200", "304", "400", "403"],
         "response_schemas": {"200": _PRODUCT_LIST_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
         "error_responses": {
@@ -1250,22 +1413,24 @@ ROUTES = (
         "method": "DELETE",
         "path": "/products/{id}",
         "handler": delete_product,
+        "role": "write",
         "auth_required": True,
         "operation_id": "deleteProduct",
         "summary": "Delete a product",
         "parameters": [_PRODUCT_ID, _IF_MATCH],
-        "responses": ["204", "400", "401", "404", "412", "428"],
+        "responses": ["204", "400", "401", "404", "412", "428", "403"],
         "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
         "path": "/products/{id}",
         "handler": get_product,
+        "role": None,
         "auth_required": False,
         "operation_id": "getProduct",
         "summary": "Read a product",
         "parameters": [_PRODUCT_ID, _IF_NONE_MATCH],
-        "responses": ["200", "304", "400", "404"],
+        "responses": ["200", "304", "400", "404", "403"],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
         "conditional_headers": ["If-None-Match"],
     },
@@ -1274,6 +1439,7 @@ ROUTES = (
         "path": "/products/{id}",
         "handler": patch_product,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "updateProduct",
         "summary": "Update a product",
@@ -1290,6 +1456,7 @@ ROUTES = (
             "413",
             "415",
             "428",
+            "403",
         ],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
         "conditional_headers": ["If-Match"],
@@ -1299,6 +1466,7 @@ ROUTES = (
         "path": "/products/{id}/adjust-stock",
         "handler": adjust_product_stock,
         "body": True,
+        "role": "write",
         "auth_required": True,
         "operation_id": "adjustProductStock",
         "summary": "Adjust product stock atomically",
@@ -1315,18 +1483,142 @@ ROUTES = (
             "413",
             "415",
             "428",
+            "403",
         ],
         "response_schemas": {"200": _PRODUCT_RESPONSE_SCHEMA},
         "conditional_headers": ["If-Match"],
     },
     {
         "method": "GET",
+        "path": "/whoami",
+        "handler": whoami,
+        "role": "read",
+        "auth_required": True,
+        "pass_identity": True,
+        "operation_id": "getWhoami",
+        "summary": "Read the authenticated API key identity",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["key_id", "role", "label"],
+                "properties": {
+                    "key_id": {"type": "string"},
+                    "role": {"type": "string", "enum": ["read", "write", "admin"]},
+                    "label": {"type": "string"},
+                },
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/admin/keys",
+        "handler": create_api_key,
+        "body": True,
+        "sanitize_validation_errors": True,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "createApiKey",
+        "summary": "Create an API key",
+        "request_schema": {
+            "type": "object",
+            "required": ["role", "label"],
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ["read", "write", "admin"],
+                },
+                "label": {"type": "string", "minLength": 1, "maxLength": 40},
+            },
+            "additionalProperties": False,
+        },
+        "responses": ["201", "400", "401", "403", "409", "411", "413", "415"],
+        "response_schemas": {"201": _KEY_CREATION_RESPONSE_SCHEMA},
+        "error_responses": {
+            "400": "Invalid role or label (validation_error or invalid_label).",
+            "409": "The active key limit has been reached (key_limit).",
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/admin/keys",
+        "handler": list_api_keys,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "listApiKeys",
+        "summary": "List API keys without exposing secrets",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {"200": _KEY_LIST_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "POST",
+        "path": "/admin/keys/{key_id}/rotate",
+        "handler": rotate_api_key,
+        "body": True,
+        "sanitize_validation_errors": True,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "rotateApiKey",
+        "summary": "Rotate an API key, optionally allowing a grace period",
+        "parameters": [
+            {
+                "name": "key_id",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string", "maxLength": 32},
+            }
+        ],
+        "request_schema": {
+            "type": "object",
+            "properties": {
+                "grace_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 300,
+                }
+            },
+            "additionalProperties": False,
+        },
+        "responses": ["200", "400", "401", "403", "404", "409", "411", "413", "415"],
+        "response_schemas": {"200": _KEY_CREATION_RESPONSE_SCHEMA},
+        "error_responses": {
+            "400": "Invalid grace_seconds (validation_error).",
+            "404": "The key does not exist (key_not_found).",
+            "409": "The bootstrap key is immutable (bootstrap_key_immutable).",
+        },
+    },
+    {
+        "method": "DELETE",
+        "path": "/admin/keys/{key_id}",
+        "handler": revoke_api_key,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "revokeApiKey",
+        "summary": "Revoke an API key",
+        "parameters": [
+            {
+                "name": "key_id",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string", "maxLength": 32},
+            }
+        ],
+        "responses": ["204", "401", "403", "404", "409"],
+        "error_responses": {
+            "404": "The key does not exist (key_not_found).",
+            "409": "The bootstrap key is immutable (bootstrap_key_immutable).",
+        },
+    },
+    {
+        "method": "GET",
         "path": "/categories",
         "handler": categories,
+        "role": None,
         "auth_required": False,
         "operation_id": "listCategories",
         "summary": "Read product category aggregates",
-        "responses": ["200"],
+        "responses": ["200", "403"],
         "response_schemas": {"200": _CATEGORY_LIST_RESPONSE_SCHEMA},
     },
 )

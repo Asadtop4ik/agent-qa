@@ -16,6 +16,9 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
+            "x-required-role": route.get(
+                "role", "write" if route["auth_required"] else None
+            ),
             "responses": {
                 status: {
                     "description": f"HTTP {status} response",
@@ -32,6 +35,12 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     ),
                 }
                 for status in route["responses"]
+            },
+        }
+        operation["responses"]["403"] = {
+            "description": "The API key role is insufficient (forbidden).",
+            "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
             },
         }
         if route.get("conditional_headers"):
@@ -199,7 +208,7 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 operation["responses"][status].setdefault("headers", {}).update(
                     deepcopy(headers)
                 )
-        if route["auth_required"]:
+        if route.get("role", route["auth_required"]):
             operation["security"] = [{"ApiKeyAuth": []}]
         paths.setdefault(path, {})[method] = operation
 
