@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime, timezone
 import threading
@@ -13,6 +13,7 @@ from agent_qa.context import RequestContext, get_context
 
 _MIN_CAPACITY = 10
 _MAX_CAPACITY = 5000
+_MAX_DROPPED_TENANTS = 10
 _MAX_TEXT = 256
 _MAX_ACTOR = 128
 _TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
@@ -122,6 +123,7 @@ class AuditLog:
         self._lock = threading.Lock()
         self._last_seq = 0
         self._dropped = 0
+        self._tenant_dropped: OrderedDict[str, int] = OrderedDict()
 
     @property
     def dropped(self) -> int:
@@ -142,6 +144,7 @@ class AuditLog:
         status: int,
         *,
         replay: bool = False,
+        rejected: bool = False,
     ) -> dict[str, object]:
         """Append one completed write request without retaining request data."""
         method = str(method).upper()
@@ -158,7 +161,7 @@ class AuditLog:
         outcome = "success" if 200 <= status < 300 else "error"
         if status in {401, 403, 429}:
             outcome = "denied"
-        elif 400 <= status < 500:
+        elif 400 <= status < 500 or (status == 503 and rejected):
             outcome = "rejected"
         actor = context.actor if isinstance(context.actor, str) else "anonymous"
         tenant = (
@@ -192,6 +195,13 @@ class AuditLog:
         with self._lock:
             if len(self._entries) == self.capacity:
                 self._dropped += 1
+                evicted_tenant = str(self._entries[0]["tenant"])
+                self._tenant_dropped[evicted_tenant] = (
+                    self._tenant_dropped.get(evicted_tenant, 0) + 1
+                )
+                self._tenant_dropped.move_to_end(evicted_tenant)
+                if len(self._tenant_dropped) > _MAX_DROPPED_TENANTS:
+                    self._tenant_dropped.popitem(last=False)
             self._last_seq += 1
             entry: dict[str, object] = {
                 "seq": self._last_seq,
@@ -315,6 +325,19 @@ class AuditLog:
         """Return retained-entry and dropped-entry counts from one lock snapshot."""
         with self._lock:
             return len(self._entries), self._dropped
+
+    def snapshot(self, tenant: str | None = None) -> dict[str, int]:
+        """Return tenant-scoped retained and dropped counts under one lock."""
+        tenant_filter = _tenant_filter(tenant)
+        with self._lock:
+            if tenant_filter == "*":
+                return {"entries": len(self._entries), "dropped": self._dropped}
+            return {
+                "entries": sum(
+                    entry["tenant"] == tenant_filter for entry in self._entries
+                ),
+                "dropped": self._tenant_dropped.get(tenant_filter, 0),
+            }
 
 
 AUDIT_LOG = AuditLog()

@@ -352,6 +352,14 @@ class JobRunner:
                 for status in JOB_STATUSES
             }
 
+    def snapshot(self) -> dict[str, int]:
+        """Return a consistent count of all retained job statuses."""
+        with self._condition:
+            return {
+                status: sum(job["status"] == status for job in self._jobs.values())
+                for status in JOB_STATUSES
+            }
+
     def _prune_locked(self) -> None:
         terminal_count = sum(
             job["status"] in TERMINAL_STATUSES for job in self._jobs.values()

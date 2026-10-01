@@ -1,10 +1,12 @@
 """Pure route handlers for the agent QA HTTP service."""
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import json
 import platform
 import re
+import time
 from urllib.parse import quote, urlencode
 
 from agent_qa import auth, settings
@@ -16,6 +18,7 @@ from agent_qa.context import get_context
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
+from agent_qa.maintenance import MAINTENANCE
 from agent_qa.outbox import OUTBOX
 from agent_qa.openapi import build_openapi
 from agent_qa.pagination import MAX_CURSOR_LENGTH
@@ -65,11 +68,15 @@ from agent_qa.products import (
 )
 from agent_qa.ratelimit import RATE_LIMITER
 from agent_qa import tenants
+from agent_qa import stats
 
 
 ORDER_STORE = tenants.get("default").orders
 PRODUCT_STORE = tenants.get("default").products
 JOB_RUNNER = tenants.get("default").jobs
+_PROCESS_STARTED = time.monotonic()
+_STAT_SECTION_ORDER = ("orders", "products", "requests", "jobs", "outbox", "audit")
+_STAT_SECTIONS = frozenset(_STAT_SECTION_ORDER)
 
 
 def _tenant_name() -> str:
@@ -240,6 +247,7 @@ def metrics(
             tenant_orders=tenant_orders,
             tenant_products=tenant_products,
             tenant_count=len(tenant_items),
+            maintenance_enabled=MAINTENANCE.snapshot()["enabled"],
         ),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
@@ -1503,6 +1511,335 @@ def delete_rate_limit(
     if not RATE_LIMITER.delete_override(identity):
         raise ApiError(404, "override_not_found", "Rate limit override not found")
     return 204, None, {}
+
+
+def _query_single(query: list[tuple[str, str]], name: str) -> str | None:
+    values = [value for key, value in query if key == name]
+    if len(values) > 1:
+        raise ApiError(
+            400,
+            "invalid_query",
+            "Query parameter must appear once",
+            [{"field": name, "message": "Must not be repeated"}],
+        )
+    return values[0] if values else None
+
+
+def admin_stats(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return bounded operational aggregates for the selected tenant."""
+    if any(key not in {"top", "sections"} for key, _ in query):
+        raise ApiError(400, "invalid_query", "Unknown query parameter")
+    top_raw = _query_single(query, "top")
+    if top_raw is None:
+        top = 5
+    elif len(top_raw) > 2 or not top_raw.isascii() or not top_raw.isdecimal():
+        raise ApiError(
+            400,
+            "invalid_query",
+            "Invalid top parameter",
+            [{"field": "top", "message": "Must be an integer from 1 to 20"}],
+        )
+    else:
+        top = int(top_raw)
+        if not 1 <= top <= 20:
+            raise ApiError(
+                400,
+                "invalid_query",
+                "Invalid top parameter",
+                [{"field": "top", "message": "Must be an integer from 1 to 20"}],
+            )
+    section_raw = _query_single(query, "sections")
+    if section_raw is None:
+        sections = _STAT_SECTIONS
+    else:
+        if len(section_raw) > 128:
+            section_values: list[str] = []
+        else:
+            section_values = [part.strip() for part in section_raw.split(",")]
+        if (
+            not section_values
+            or any(not section for section in section_values)
+            or any(section not in _STAT_SECTIONS for section in section_values)
+        ):
+            raise ApiError(
+                400,
+                "validation_error",
+                "Invalid statistics sections",
+                [
+                    {
+                        "field": "sections",
+                        "message": "Must be a comma-separated list of supported sections",
+                    }
+                ],
+            )
+        sections = frozenset(section_values)
+
+    tenant_name = _tenant_name()
+    bundle = tenants.get(tenant_name)
+    snapshots = stats.build_stats(
+        bundle.orders.snapshot(),
+        bundle.products.snapshot(),
+        REGISTRY.snapshot(),
+        bundle.jobs.snapshot(),
+        bundle.outbox.snapshot(),
+        AUDIT_LOG.snapshot(tenant=tenant_name),
+        top=top,
+    )
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    body: dict[str, object] = {
+        "generated_at": generated_at,
+        "tenant": tenant_name,
+        "uptime_seconds": int(max(0, time.monotonic() - _PROCESS_STARTED)),
+    }
+    body.update(
+        {name: snapshots[name] for name in _STAT_SECTION_ORDER if name in sections}
+    )
+    return 200, body, {}
+
+
+_MAINTENANCE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["enabled", "message", "retry_after_seconds", "since"],
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "message": {"type": "string", "nullable": True, "maxLength": 200},
+        "retry_after_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "since": {"type": "string", "format": "date-time", "nullable": True},
+    },
+    "additionalProperties": False,
+}
+_MAINTENANCE_REQUEST_SCHEMA = {
+    "type": "object",
+    "required": ["enabled"],
+    "properties": {
+        "enabled": {"type": "boolean"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 200},
+        "retry_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600,
+        },
+    },
+    "additionalProperties": False,
+}
+_ADMIN_STATS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "required": ["generated_at", "tenant", "uptime_seconds"],
+    "properties": {
+        "generated_at": {"type": "string", "format": "date-time"},
+        "tenant": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,23}$",
+        },
+        "uptime_seconds": {"type": "integer", "minimum": 0},
+        "orders": {
+            "type": "object",
+            "required": [
+                "total",
+                "by_status",
+                "revenue_cents",
+                "average_total_cents",
+                "itemized",
+                "top_customers",
+            ],
+            "properties": {
+                "total": {"type": "integer", "minimum": 0},
+                "by_status": {
+                    "type": "object",
+                    "required": ["new", "paid", "shipped", "cancelled"],
+                    "properties": {
+                        status: {"type": "integer", "minimum": 0}
+                        for status in ("new", "paid", "shipped", "cancelled")
+                    },
+                    "additionalProperties": False,
+                },
+                "revenue_cents": {"type": "integer", "minimum": 0},
+                "average_total_cents": {"type": "integer", "minimum": 0},
+                "itemized": {"type": "integer", "minimum": 0},
+                "top_customers": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["customer_id", "orders", "spent_cents"],
+                        "properties": {
+                            "customer_id": {"type": "string"},
+                            "orders": {"type": "integer", "minimum": 0},
+                            "spent_cents": {"type": "integer", "minimum": 0},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+        "products": {
+            "type": "object",
+            "required": [
+                "total",
+                "active",
+                "out_of_stock",
+                "low_stock",
+                "inventory_value_cents",
+                "by_category",
+                "top_products",
+            ],
+            "properties": {
+                "total": {"type": "integer", "minimum": 0},
+                "active": {"type": "integer", "minimum": 0},
+                "out_of_stock": {"type": "integer", "minimum": 0},
+                "low_stock": {"type": "integer", "minimum": 0},
+                "inventory_value_cents": {"type": "integer", "minimum": 0},
+                "by_category": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "category",
+                            "products",
+                            "inventory_value_cents",
+                        ],
+                        "properties": {
+                            "category": {"type": "string"},
+                            "products": {"type": "integer", "minimum": 0},
+                            "inventory_value_cents": {
+                                "type": "integer",
+                                "minimum": 0,
+                            },
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                "top_products": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": [
+                            "product_id",
+                            "sku",
+                            "units_sold",
+                            "revenue_cents",
+                        ],
+                        "properties": {
+                            "product_id": {"type": "integer", "minimum": 1},
+                            "sku": {"type": "string"},
+                            "units_sold": {"type": "integer", "minimum": 0},
+                            "revenue_cents": {"type": "integer", "minimum": 0},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+        "requests": {
+            "type": "object",
+            "required": ["total", "errors_4xx", "errors_5xx", "by_route"],
+            "properties": {
+                "total": {"type": "integer", "minimum": 0},
+                "errors_4xx": {"type": "integer", "minimum": 0},
+                "errors_5xx": {"type": "integer", "minimum": 0},
+                "by_route": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["route", "count", "avg_ms"],
+                        "properties": {
+                            "route": {"type": "string"},
+                            "count": {"type": "integer", "minimum": 0},
+                            "avg_ms": {"type": "number", "minimum": 0},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "additionalProperties": False,
+        },
+        "jobs": {
+            "type": "object",
+            "required": [
+                "queued",
+                "running",
+                "cancelling",
+                "succeeded",
+                "failed",
+                "cancelled",
+            ],
+            "properties": {
+                status: {"type": "integer", "minimum": 0}
+                for status in (
+                    "queued",
+                    "running",
+                    "cancelling",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                )
+            },
+            "additionalProperties": False,
+        },
+        "outbox": {
+            "type": "object",
+            "required": ["pending", "retrying", "delivered", "failed"],
+            "properties": {
+                status: {"type": "integer", "minimum": 0}
+                for status in ("pending", "retrying", "delivered", "failed")
+            },
+            "additionalProperties": False,
+        },
+        "audit": {
+            "type": "object",
+            "required": ["entries", "dropped"],
+            "properties": {
+                "entries": {"type": "integer", "minimum": 0},
+                "dropped": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def get_maintenance(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return current process maintenance state."""
+    return 200, MAINTENANCE.snapshot(), {}
+
+
+def put_maintenance(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Update process maintenance state after validating the request body."""
+    errors = validate(_MAINTENANCE_REQUEST_SCHEMA, payload)
+    if errors:
+        raise ApiError(400, "validation_error", "Request validation failed", errors)
+    assert isinstance(payload, dict)
+    enabled = payload["enabled"]
+    if not isinstance(enabled, bool):
+        raise ApiError(
+            400,
+            "validation_error",
+            "Request validation failed",
+            [{"field": "enabled", "message": "Must be a boolean"}],
+        )
+    return (
+        200,
+        MAINTENANCE.update(
+            enabled,
+            payload.get("message"),
+            payload.get("retry_after_seconds"),
+        ),
+        {},
+    )
 
 
 def list_config(
@@ -3337,6 +3674,69 @@ ROUTES = (
     },
     {
         "method": "GET",
+        "path": "/admin/stats",
+        "handler": admin_stats,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "tenant_scoped": True,
+        "operation_id": "getAdminStats",
+        "summary": "Read tenant-scoped operational statistics",
+        "parameters": [
+            {
+                "name": "top",
+                "in": "query",
+                "required": False,
+                "schema": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 5,
+                },
+            },
+            {
+                "name": "sections",
+                "in": "query",
+                "required": False,
+                "description": (
+                    "Comma-separated sections: orders, products, requests, jobs, "
+                    "outbox, audit. Requests are global; other sections use the "
+                    "selected tenant."
+                ),
+                "schema": {"type": "string", "maxLength": 128},
+            },
+        ],
+        "responses": ["200", "400", "401", "403"],
+        "response_schemas": {"200": _ADMIN_STATS_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
+        "path": "/admin/maintenance",
+        "handler": get_maintenance,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "getMaintenance",
+        "summary": "Read maintenance mode",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {"200": _MAINTENANCE_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "PUT",
+        "path": "/admin/maintenance",
+        "handler": put_maintenance,
+        "body": True,
+        "request_schema": _MAINTENANCE_REQUEST_SCHEMA,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "putMaintenance",
+        "summary": "Enable or disable maintenance mode",
+        "responses": ["200", "400", "401", "403"],
+        "response_schemas": {"200": _MAINTENANCE_RESPONSE_SCHEMA},
+    },
+    {
+        "method": "GET",
         "path": "/admin/config",
         "handler": list_config,
         "role": "admin",
@@ -3991,6 +4391,7 @@ _TENANT_SCOPED_PREFIXES = (
     "/imports",
     "/search",
     "/v2/orders",
+    "/admin/stats",
 )
 ROUTES = tuple(
     {

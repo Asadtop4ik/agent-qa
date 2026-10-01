@@ -105,6 +105,22 @@ ignoring case.
 | `AGENT_QA_RATE_REFILL_PER_SECOND` | float | `60.0` | 0.001–10000.0 | Token bucket refill rate per second. |
 | `AGENT_QA_JOB_WORKERS` | int | `2` | 1–3 | Number of lazily started background job workers. |
 | `AGENT_QA_JOB_RETENTION` | int | `100` | 10–1000 | Maximum number of terminal jobs retained in memory. |
+| `AGENT_QA_SHUTDOWN_TIMEOUT_SECONDS` | int | `10` | 1–60 | Time to drain in-flight HTTP requests after SIGTERM or SIGINT. |
+
+## Operations
+
+Admins can inspect tenant-scoped aggregates with `GET /admin/stats`; `top` is
+limited to 1–20 (default 5), and `sections` can select a comma-separated subset
+of orders, products, requests, jobs, outbox, and audit statistics. Request
+statistics are global; the other sections use the selected tenant. Use
+`GET /admin/maintenance` to inspect maintenance state and
+`PUT /admin/maintenance` with `{"enabled":true}` to stop non-admin writes.
+Maintenance rejections of ordinary write routes return `503 maintenance` with
+`Retry-After`, including requests authenticated with an admin key; `/admin/*`
+routes remain available. GETs and probes remain available. Set `enabled` to
+`false` to resume writes. SIGTERM and SIGINT stop accepting requests, drain
+active handlers for up to `AGENT_QA_SHUTDOWN_TIMEOUT_SECONDS`, then stop job and
+outbox workers.
 
 ## Rate limits
 

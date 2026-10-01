@@ -102,6 +102,16 @@ class AuditLogTests(unittest.TestCase):
         self.assertEqual(log.query(outcome="success")["total_matching"], 2)
         self.assertEqual(log.query(status=409)["items"][0]["seq"], 2)
 
+    def test_maintenance_503_can_be_audited_as_rejected(self):
+        log = AuditLog(10)
+        context = RequestContext("maintenance", tenant="acme")
+        ordinary = log.append(context, "POST", "/orders", "/orders", 503)
+        maintenance = log.append(
+            context, "POST", "/orders", "/orders", 503, rejected=True
+        )
+        self.assertEqual(ordinary["outcome"], "error")
+        self.assertEqual(maintenance["outcome"], "rejected")
+
     def test_changes_are_detached_bounded_and_sensitive_fields_omitted(self):
         log = AuditLog(10)
         tags_before = ["old"]

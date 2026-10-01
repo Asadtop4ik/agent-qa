@@ -7,7 +7,10 @@ import json
 import logging
 import math
 import re
+import signal
 import sys
+import threading
+import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -20,6 +23,7 @@ from agent_qa.auth import api_key_from_headers, authenticate_api_key
 from agent_qa.errors import ApiError, envelope, problem
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
 from agent_qa.metrics import REGISTRY
+from agent_qa.maintenance import MAINTENANCE
 from agent_qa.context import (
     RequestContext,
     clear_context,
@@ -47,6 +51,43 @@ IDEMPOTENCY_STORE = tenants.get("default").idempotency
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_SHUTDOWN_REQUESTED = threading.Event()
+
+
+class _RequestTracker:
+    """Count executing HTTP requests without counting idle keep-alive sockets."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.active = 0
+
+    def begin(self) -> None:
+        with self.condition:
+            self.active += 1
+
+    def finish(self) -> None:
+        with self.condition:
+            self.active -= 1
+            self.condition.notify_all()
+
+    def wait(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.condition.wait(remaining)
+            return True
+
+
+_REQUESTS = _RequestTracker()
+
+
+def _reset_shutdown_tracking() -> None:
+    _SHUTDOWN_REQUESTED.clear()
+    with _REQUESTS.condition:
+        _REQUESTS.active = 0
 
 
 def _idempotency_store() -> IdempotencyStore:
@@ -183,16 +224,25 @@ class Handler(BaseHTTPRequestHandler):
         self._rate_headers = {}
         self._tenant_scoped = False
         self._tenant_value = None
+        self._tracked_request = False
+        self._audit_rejected = False
+        self._maintenance_retry_after = None
         if hasattr(self, "_rate_retry_after"):
             del self._rate_retry_after
         try:
             super().handle_one_request()
         finally:
+            if self._tracked_request:
+                self._tracked_request = False
+                _REQUESTS.finish()
             clear_context()
 
     def parse_request(self) -> bool:
         parsed = super().parse_request()
         self._use_header_request_id()
+        if parsed and not self._tracked_request:
+            _REQUESTS.begin()
+            self._tracked_request = True
         return parsed
 
     def _use_header_request_id(self) -> None:
@@ -348,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
                 path,
                 status,
                 replay=getattr(self, "_audit_replay", False),
+                rejected=getattr(self, "_audit_rejected", False),
             )
         if hasattr(self, "_audit_response_body"):
             del self._audit_response_body
@@ -677,6 +728,20 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     ],
                 )
+        if (
+            self.command in {"POST", "PUT", "PATCH", "DELETE"}
+            and route.get("path")
+            and not str(route["path"]).startswith("/admin/")
+        ):
+            maintenance = MAINTENANCE.snapshot()
+            if maintenance["enabled"]:
+                self._audit_rejected = True
+                self._maintenance_retry_after = maintenance["retry_after_seconds"]
+                raise ApiError(
+                    503,
+                    "maintenance",
+                    str(maintenance["message"]),
+                )
         content_encodings = self.headers.get_all("Content-Encoding", [])
         if _has_unsupported_content_encoding(content_encodings):
             raise ApiError(
@@ -827,12 +892,17 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch()
 
     def _handle(self, dispatch: Callable[[], None] | None = None) -> None:
+        if not getattr(self, "_tracked_request", False):
+            _REQUESTS.begin()
+            self._tracked_request = True
         try:
             (dispatch or self._dispatch)()
         except ApiError as error:
             response_headers = {}
             if error.code == "queue_full":
                 response_headers["Retry-After"] = "1"
+            elif error.code == "maintenance":
+                response_headers["Retry-After"] = str(self._maintenance_retry_after)
             current_etag = getattr(error, "current_etag", None)
             if current_etag is not None:
                 response_headers["ETag"] = current_etag
@@ -866,6 +936,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             LOGGER.exception("Unhandled request exception")
             self._internal_error()
+        finally:
+            if self._tracked_request:
+                self._tracked_request = False
+                _REQUESTS.finish()
+            if _SHUTDOWN_REQUESTED.is_set():
+                self.close_connection = True
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         self._handle(self._handle_get)
@@ -912,8 +988,52 @@ def main() -> None:
             print(f"config error: {error.field}: {error.message}", file=sys.stderr)
         raise SystemExit(2)
     server = ThreadingHTTPServer(("0.0.0.0", loaded.values["APP_PORT"]), Handler)
+    _reset_shutdown_tracking()
+    previous_handlers = {
+        sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    shutdown_requested_at: float | None = None
+
+    def stop_accepting(signum: int, frame: object) -> None:
+        nonlocal shutdown_requested_at
+        if _SHUTDOWN_REQUESTED.is_set():
+            return
+        shutdown_requested_at = time.monotonic()
+        _SHUTDOWN_REQUESTED.set()
+
+        def shutdown_server() -> None:
+            try:
+                server.shutdown()
+            except Exception:
+                LOGGER.exception("HTTP server shutdown request failed")
+
+        threading.Thread(
+            target=shutdown_server, name="http-shutdown", daemon=True
+        ).start()
+
     try:
+        signal.signal(signal.SIGTERM, stop_accepting)
+        signal.signal(signal.SIGINT, stop_accepting)
         server.serve_forever()
     finally:
-        tenants.TENANTS.shutdown(timeout=5)
-        server.server_close()
+        if _SHUTDOWN_REQUESTED.is_set():
+            timeout = int(loaded.values["AGENT_QA_SHUTDOWN_TIMEOUT_SECONDS"])
+            deadline = (shutdown_requested_at or time.monotonic()) + timeout
+            remaining = max(0.0, deadline - time.monotonic())
+            drained = _REQUESTS.wait(remaining)
+            if not drained:
+                print(
+                    "forced shutdown after in-flight request timeout",
+                    file=sys.stderr,
+                )
+            worker_timeout = min(5.0, max(0.0, deadline - time.monotonic()))
+        else:
+            worker_timeout = 5.0
+        try:
+            tenants.TENANTS.shutdown(timeout=worker_timeout)
+        finally:
+            try:
+                server.server_close()
+            finally:
+                for sig, previous in previous_handlers.items():
+                    signal.signal(sig, previous)

@@ -123,6 +123,14 @@ SETTINGS: dict[str, Setting] = {
         min=10,
         max=1000,
     ),
+    "AGENT_QA_SHUTDOWN_TIMEOUT_SECONDS": Setting(
+        "AGENT_QA_SHUTDOWN_TIMEOUT_SECONDS",
+        "int",
+        10,
+        "Maximum time to wait for in-flight requests during shutdown.",
+        min=1,
+        max=60,
+    ),
 }
 
 _BOOLS = {

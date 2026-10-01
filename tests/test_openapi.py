@@ -346,6 +346,7 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 expected_responses.add("429")
             if route.get("deprecated"):
                 expected_responses.add("410")
+            expected_responses.add("503")
             self.assertEqual(set(operation["responses"]), expected_responses)
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
@@ -362,8 +363,9 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         )
         self.assertEqual(
             create["responses"]["503"]["headers"]["Retry-After"]["schema"],
-            {"type": "string", "enum": ["1"]},
+            {"type": "string"},
         )
+        self.assertIn("maintenance", create["responses"]["503"]["description"])
         self.assertIn("Job", spec["components"]["schemas"])
         self.assertIn("JobList", spec["components"]["schemas"])
         create_schema = create["requestBody"]["content"]["application/json"]["schema"]
