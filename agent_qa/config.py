@@ -1,57 +1,35 @@
-"""Configuration shared by the agent QA service.
+"""Compatibility accessors for validated application settings."""
 
-The API key default is synthetic and intended only for QA environments.
-"""
-
-import os
 from pathlib import Path
+
+from agent_qa import settings
 
 
 APP_DIR = Path(__file__).resolve().parent.parent
 FIXTURE_PATH = APP_DIR / "data" / "synthetic-customer.json"
-GIT_SHA = os.environ.get("AGENT_QA_GIT_SHA", "unknown")
-API_KEY = os.environ.get("AGENT_QA_API_KEY") or "qa-synthetic-key"
+
+# Preserve the established import-time constants while making malformed values
+# harmless during import. ``server.main`` performs strict validation before bind.
+_IMPORT_SETTINGS = settings.current()
+GIT_SHA = _IMPORT_SETTINGS.values["AGENT_QA_GIT_SHA"]
+API_KEY = _IMPORT_SETTINGS.values["AGENT_QA_API_KEY"]
 
 
 def idempotency_ttl_seconds() -> int:
-    """Return the bounded idempotency response lifetime in seconds."""
-    raw_value = os.environ.get("AGENT_QA_IDEMPOTENCY_TTL_SECONDS", "600")
-    try:
-        value = int(raw_value)
-    except ValueError as error:
-        raise ValueError(
-            "AGENT_QA_IDEMPOTENCY_TTL_SECONDS must be between 1 and 86400"
-        ) from error
-    if not 1 <= value <= 86400:
-        raise ValueError("AGENT_QA_IDEMPOTENCY_TTL_SECONDS must be between 1 and 86400")
-    return value
-
-
-def _bounded_setting(name: str, default: int, minimum: int, maximum: int) -> int:
-    raw_value = os.environ.get(name, str(default))
-    try:
-        # Bound the representation before int() to avoid spending resources on
-        # arbitrarily large attacker-controlled environment values.
-        if len(raw_value) > 10:
-            raise ValueError
-        value = int(raw_value)
-    except (TypeError, ValueError) as error:
-        raise ValueError(f"{name} must be between {minimum} and {maximum}") from error
-    if not minimum <= value <= maximum:
-        raise ValueError(f"{name} must be between {minimum} and {maximum}")
-    return value
+    """Return the configured lifetime, using its default if invalid."""
+    return settings.current().values["AGENT_QA_IDEMPOTENCY_TTL_SECONDS"]
 
 
 def job_workers() -> int:
-    """Return the bounded number of lazily started job workers."""
-    return _bounded_setting("AGENT_QA_JOB_WORKERS", 2, 1, 3)
+    """Return the configured number of lazily started job workers."""
+    return settings.current().values["AGENT_QA_JOB_WORKERS"]
 
 
 def job_retention() -> int:
-    """Return the bounded number of terminal jobs kept in memory."""
-    return _bounded_setting("AGENT_QA_JOB_RETENTION", 100, 10, 1000)
+    """Return the configured number of terminal jobs kept in memory."""
+    return settings.current().values["AGENT_QA_JOB_RETENTION"]
 
 
 def port() -> int:
-    """Return the configured HTTP port."""
-    return int(os.environ.get("APP_PORT", "8080"))
+    """Return the configured HTTP port, falling back on malformed input."""
+    return settings.current().values["APP_PORT"]

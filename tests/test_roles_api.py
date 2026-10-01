@@ -111,7 +111,12 @@ class RoleApiTests(unittest.TestCase):
                 for part in ("{id}", "{name}", "{key_id}", "{seq}"):
                     path = path.replace(part, "sample")
                 if route["path"].startswith(
-                    ("/admin/keys", "/admin/rate-limits", "/audit")
+                    (
+                        "/admin/keys",
+                        "/admin/rate-limits",
+                        "/admin/config",
+                        "/audit",
+                    )
                 ):
                     required_role = "admin"
                 elif route["path"] == "/whoami":

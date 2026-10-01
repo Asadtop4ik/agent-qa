@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import sys
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -13,7 +14,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
 from agent_qa.audit import AUDIT_LOG
-from agent_qa import config
+from agent_qa import config, settings
 from agent_qa.auth import api_key_from_headers, authenticate_api_key
 from agent_qa.errors import ApiError, envelope
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
@@ -605,7 +606,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("0.0.0.0", config.port()), Handler)
+    loaded = settings.current()
+    if loaded.errors:
+        for error in loaded.errors:
+            print(f"config error: {error.field}: {error.message}", file=sys.stderr)
+        raise SystemExit(2)
+    server = ThreadingHTTPServer(("0.0.0.0", loaded.values["APP_PORT"]), Handler)
     try:
         server.serve_forever()
     finally:

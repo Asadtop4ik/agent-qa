@@ -3,51 +3,22 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
 
+from agent_qa import settings
 from agent_qa.errors import ApiError
 
 _IDENTITY = re.compile(r"^(key|client|ip):[A-Za-z0-9._:-]{1,64}$")
 _KINDS = frozenset({"key", "client", "ip"})
 
 
-def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        if len(value) > 16:
-            return default
-        parsed = int(value)
-    except (ValueError, OverflowError):
-        return default
-    return parsed if minimum <= parsed <= maximum else default
-
-
-def _bounded_env_float(
-    name: str, default: float, minimum: float, maximum: float
-) -> float:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        if len(value) > 64:
-            return default
-        parsed = float(value)
-    except (ValueError, OverflowError):
-        return default
-    return parsed if math.isfinite(parsed) and minimum <= parsed <= maximum else default
-
-
-DEFAULT_BURST = _bounded_env_int("AGENT_QA_RATE_BURST", 120, 1, 100000)
-DEFAULT_REFILL_PER_SECOND = _bounded_env_float(
-    "AGENT_QA_RATE_REFILL_PER_SECOND", 60.0, 0.001, 10000.0
-)
+_IMPORT_SETTINGS = settings.current()
+DEFAULT_BURST = _IMPORT_SETTINGS.values["AGENT_QA_RATE_BURST"]
+DEFAULT_REFILL_PER_SECOND = _IMPORT_SETTINGS.values["AGENT_QA_RATE_REFILL_PER_SECOND"]
 
 
 @dataclass(frozen=True)

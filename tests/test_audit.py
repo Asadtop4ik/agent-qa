@@ -10,8 +10,8 @@ from agent_qa.context import RequestContext
 
 
 class AuditLogTests(unittest.TestCase):
-    def test_capacity_configuration_is_clamped_and_invalid_values_default(self):
-        for value, expected in (("1", 10), ("5000", 5000), ("9000", 5000)):
+    def test_capacity_configuration_uses_registry_defaults_for_invalid_values(self):
+        for value, expected in (("10", 10), ("5000", 5000), ("5001", 500)):
             with self.subTest(value=value), patch.dict(
                 os.environ, {"AGENT_QA_AUDIT_CAPACITY": value}
             ):
@@ -22,9 +22,7 @@ class AuditLogTests(unittest.TestCase):
             ):
                 self.assertEqual(AuditLog().capacity, 500)
         with patch.dict(os.environ, {"AGENT_QA_AUDIT_CAPACITY": "0"}):
-            self.assertEqual(AuditLog().capacity, 10)
-        with patch.dict(os.environ, {"AGENT_QA_AUDIT_CAPACITY": "-1"}):
-            self.assertEqual(AuditLog().capacity, 10)
+            self.assertEqual(AuditLog().capacity, 500)
 
     def test_ring_buffer_drops_oldest_and_never_reuses_sequence(self):
         log = AuditLog(10)

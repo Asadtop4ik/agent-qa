@@ -11,7 +11,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from agent_qa import orders, products, schemas
+from agent_qa import orders, products, schemas, settings
 from agent_qa.openapi import build_openapi
 from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.routes import ROUTES
@@ -24,6 +24,47 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_admin_config_routes_document_roles_and_schemas(self):
+        spec = build_openapi(ROUTES, "config-drift")
+        expected = {
+            ("get", "/admin/config"),
+            ("get", "/admin/config/{name}"),
+            ("post", "/admin/config/validate"),
+        }
+        routes = {(route["method"].lower(), route["path"]): route for route in ROUTES}
+        for method, path in expected:
+            route = routes[(method, path)]
+            operation = spec["paths"][path][method]
+            self.assertEqual(route["role"], "admin")
+            self.assertEqual(operation["x-required-role"], "admin")
+            self.assertEqual(operation["security"], [{"ApiKeyAuth": []}])
+            self.assertIn("403", operation["responses"])
+
+        listing = spec["paths"]["/admin/config"]["get"]["responses"]["200"]
+        listing_schema = listing["content"]["application/json"]["schema"]
+        setting_schema = listing_schema["properties"]["settings"][
+            "additionalProperties"
+        ]
+        self.assertEqual(setting_schema["type"], "object")
+        self.assertIn("secret", setting_schema["required"])
+        self.assertEqual(
+            setting_schema["properties"]["value"]["oneOf"],
+            [{"type": "string"}, {"type": "number"}, {"type": "boolean"}],
+        )
+        validate_operation = spec["paths"]["/admin/config/validate"]["post"]
+        env_schema = validate_operation["requestBody"]["content"]["application/json"][
+            "schema"
+        ]["properties"]["env"]
+        self.assertEqual(env_schema["maxProperties"], 50)
+        self.assertEqual(validate_operation["x-max-body-bytes"], 262144)
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+
+    def test_readme_settings_table_covers_registry(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for name in settings.SETTINGS:
+            with self.subTest(name=name):
+                self.assertIn(f"`{name}`", readme)
+
     def test_search_routes_document_metadata_responses_and_ready_contract(self):
         spec = build_openapi(ROUTES, "search-drift")
         paths = spec["paths"]

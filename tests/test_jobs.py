@@ -325,8 +325,8 @@ class JobRunnerTests(unittest.TestCase):
                     self.assertGreaterEqual(function(), 1)
             for value in invalid:
                 with patch.dict("os.environ", {name: value}):
-                    with self.assertRaises(ValueError):
-                        function()
+                    expected_default = 2 if name.endswith("WORKERS") else 100
+                    self.assertEqual(function(), expected_default)
 
     def test_builtin_summary_counts_revenue_stock_order_and_defaults(self):
         orders = OrderStore()

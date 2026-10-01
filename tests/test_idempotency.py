@@ -38,8 +38,7 @@ class IdempotencyStoreTests(unittest.TestCase):
                 with patch.dict(
                     "os.environ", {"AGENT_QA_IDEMPOTENCY_TTL_SECONDS": value}
                 ):
-                    with self.assertRaises(ValueError):
-                        config.idempotency_ttl_seconds()
+                    self.assertEqual(config.idempotency_ttl_seconds(), 600)
 
     def test_ttl_expires_saved_responses(self):
         scope = ("fingerprint", "POST", "/orders", "key")
