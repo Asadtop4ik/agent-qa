@@ -169,7 +169,15 @@ class RouteUnitTests(unittest.TestCase):
             for route in ROUTES
             if route.get("idempotent")
         }
-        self.assertEqual(flagged, {("POST", "/orders"), ("POST", "/products")})
+        self.assertEqual(
+            flagged,
+            {
+                ("POST", "/orders"),
+                ("POST", "/products"),
+                ("POST", "/orders/bulk"),
+                ("POST", "/products/bulk"),
+            },
+        )
 
     def test_health_handler_and_route(self):
         code, body, headers = health([])
@@ -350,6 +358,44 @@ class RouteUnitTests(unittest.TestCase):
                     route["method"] for route in ROUTES if route["path"] == path
                 )
                 self.assertEqual(allowed_methods(path), ", ".join(sorted(methods)))
+
+    def test_literal_bulk_route_precedes_order_id_template(self):
+        from agent_qa.server import Handler, _path_routes, allowed_methods
+
+        self.assertEqual(
+            [(route["path"], params) for route, params in _path_routes("/orders/bulk")],
+            [("/orders/bulk", {})],
+        )
+        self.assertEqual(allowed_methods("/orders/bulk"), "POST")
+        for method in ("GET", "PUT", "DELETE"):
+            handler, responses = self.make_dispatcher("/orders/bulk", b"", method)
+            Handler._dispatch(handler)
+            self.assertEqual(responses[0][0], 405)
+            self.assertEqual(responses[0][2]["Allow"], "POST")
+
+        handler, _ = self.make_dispatcher("/orders/1", b"", "GET")
+        with self.assertRaises(ApiError) as error:
+            Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 404)
+        self.assertEqual(error.exception.code, "order_not_found")
+
+    def test_dispatch_uses_route_specific_json_body_limit(self):
+        from agent_qa.server import Handler
+
+        body = b'{"items":[]}' + b" " * 5000
+        handler, _ = self.make_dispatcher("/orders/bulk", body)
+        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+            with self.assertRaises(ApiError) as error:
+                Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 400)
+        self.assertEqual(error.exception.code, "validation_error")
+
+        handler, _ = self.make_dispatcher("/orders/bulk", b" " * 65537)
+        with patch("agent_qa.server.is_valid_api_key", return_value=True):
+            with self.assertRaises(ApiError) as error:
+                Handler._dispatch(handler)
+        self.assertEqual(error.exception.status, 413)
+        self.assertEqual(error.exception.code, "payload_too_large")
 
     def test_order_request_schema_identity(self):
         create = next(

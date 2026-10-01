@@ -127,13 +127,29 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 ),
                 **deepcopy(error_content),
             }
-            operation["responses"]["422"] = {
-                "description": (
-                    "This Idempotency-Key was already used with a different "
-                    "request body (idempotency_key_reused)."
-                ),
-                **deepcopy(error_content),
-            }
+            if "422" in route.get("response_schemas", {}) and 422 in route.get(
+                "idempotency_replay_statuses", ()
+            ):
+                operation["responses"]["422"]["description"] = (
+                    "The bulk result contains no successful items, or the "
+                    "Idempotency-Key was reused with a different request body."
+                )
+                operation["responses"]["422"]["content"]["application/json"][
+                    "schema"
+                ] = {
+                    "oneOf": [
+                        deepcopy(route["response_schemas"]["422"]),
+                        {"$ref": "#/components/schemas/Error"},
+                    ]
+                }
+            else:
+                operation["responses"]["422"] = {
+                    "description": (
+                        "This Idempotency-Key was already used with a different "
+                        "request body (idempotency_key_reused)."
+                    ),
+                    **deepcopy(error_content),
+                }
             replay_headers = {
                 "Idempotency-Key": {
                     "description": "The Idempotency-Key echoed from the request.",
@@ -151,7 +167,9 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 },
             }
             for status, response in operation["responses"].items():
-                if 200 <= int(status) < 300:
+                if 200 <= int(status) < 300 or int(status) in route.get(
+                    "idempotency_replay_statuses", ()
+                ):
                     response.setdefault("headers", {}).update(deepcopy(replay_headers))
         elif route.get("parameters"):
             operation["parameters"] = deepcopy(route["parameters"])
@@ -162,6 +180,8 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     "application/json": {"schema": deepcopy(route["request_schema"])}
                 },
             }
+        if route.get("body"):
+            operation["x-max-body-bytes"] = route.get("max_body_bytes", 4096)
         for status, description in route.get("error_responses", {}).items():
             if status in operation["responses"]:
                 operation["responses"][status].update(

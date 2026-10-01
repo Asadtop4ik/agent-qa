@@ -23,6 +23,62 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_bulk_route_metadata_matches_openapi(self):
+        spec = build_openapi(ROUTES, "bulk-drift")
+        route_pairs = {(route["method"].lower(), route["path"]) for route in ROUTES}
+        spec_pairs = {
+            (method, path)
+            for path, path_item in spec["paths"].items()
+            for method in path_item
+        }
+        self.assertEqual(spec_pairs, route_pairs)
+        for route in ROUTES:
+            if route["path"] not in ("/orders/bulk", "/products/bulk"):
+                continue
+            operation = spec["paths"][route["path"]]["post"]
+            self.assertEqual(set(operation["responses"]), set(route["responses"]))
+            self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
+            self.assertEqual(
+                operation["requestBody"]["content"]["application/json"]["schema"],
+                route["request_schema"],
+            )
+
+    def test_bulk_routes_document_body_limits_and_result_statuses(self):
+        spec = build_openapi(ROUTES, "bulk-test")
+        for path in ("/orders/bulk", "/products/bulk"):
+            with self.subTest(path=path):
+                operation = spec["paths"][path]["post"]
+                self.assertEqual(operation["x-max-body-bytes"], 65536)
+                request = operation["requestBody"]["content"]["application/json"]
+                self.assertEqual(
+                    request["schema"]["properties"]["items"]["minItems"], 1
+                )
+                self.assertEqual(
+                    request["schema"]["properties"]["items"]["maxItems"], 50
+                )
+                self.assertIn("atomic", request["schema"]["properties"])
+                for status in ("201", "207", "422"):
+                    self.assertIn(status, operation["responses"])
+                self.assertIn("Idempotency-Key", json.dumps(operation["parameters"]))
+                self.assertIn("BulkCreateResponse", json.dumps(operation["responses"]))
+        self.assertEqual(
+            spec["paths"]["/orders/bulk"]["post"]["responses"]["422"]["headers"].keys(),
+            {"Idempotency-Key", "Idempotent-Replay", "X-Request-Id"},
+        )
+        self.assertEqual(spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 4096)
+
+        create_order_route = next(
+            route
+            for route in ROUTES
+            if route["path"] == "/orders" and route["method"] == "POST"
+        )
+        custom_route = copy.deepcopy(create_order_route)
+        custom_route["max_body_bytes"] = 8192
+        custom_spec = build_openapi([custom_route], "bulk-test")
+        self.assertEqual(
+            custom_spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 8192
+        )
+
     def test_cursor_pagination_parameters_responses_and_errors_are_documented(self):
         spec = build_openapi(ROUTES, "cursor-pagination-test")
         for path in ("/orders", "/products"):

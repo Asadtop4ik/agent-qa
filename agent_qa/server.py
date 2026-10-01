@@ -50,6 +50,23 @@ def _path_routes(path: str) -> list[tuple[dict[str, object], dict[str, str]]]:
         params = _match_path(str(route["path"]), path)
         if params is not None:
             matches.append((route, params))
+    if matches:
+        literal_count = max(
+            sum(
+                not (part.startswith("{") and part.endswith("}"))
+                for part in str(route["path"]).split("/")
+            )
+            for route, _ in matches
+        )
+        matches = [
+            (route, params)
+            for route, params in matches
+            if sum(
+                not (part.startswith("{") and part.endswith("}"))
+                for part in str(route["path"]).split("/")
+            )
+            == literal_count
+        ]
     return matches
 
 
@@ -156,7 +173,9 @@ class Handler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _read_json_body(self, require_object: bool = True) -> object:
+    def _read_json_body(
+        self, require_object: bool = True, max_body_bytes: int = 4096
+    ) -> object:
         length_header = self.headers.get("Content-Length")
         if length_header is None:
             raise ApiError(411, "length_required", "Content-Length is required")
@@ -168,7 +187,13 @@ class Handler(BaseHTTPRequestHandler):
             ) from error
         if length < 0:
             raise ApiError(400, "invalid_json", "Request body must be valid JSON")
-        if length > 4096:
+        if (
+            isinstance(max_body_bytes, bool)
+            or not isinstance(max_body_bytes, int)
+            or max_body_bytes < 1
+        ):
+            raise RuntimeError("Invalid route max_body_bytes configuration")
+        if length > max_body_bytes:
             raise ApiError(413, "payload_too_large", "Request body is too large")
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -239,7 +264,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = (
-            self._read_json_body(require_object=route.get("json_object_only", True))
+            self._read_json_body(
+                require_object=route.get("json_object_only", True),
+                max_body_bytes=route.get("max_body_bytes", 4096),
+            )
             if route.get("body")
             else None
         )
@@ -311,9 +339,12 @@ class Handler(BaseHTTPRequestHandler):
                 IDEMPOTENCY_STORE.abort(idempotency_scope)
             raise
         if idempotency_scope is not None:
-            if 200 <= status < 300:
+            replay_statuses = route.get("idempotency_replay_statuses", ())
+            if 200 <= status < 300 or status in replay_statuses:
                 IDEMPOTENCY_STORE.complete(
-                    idempotency_scope, StoredResponse(status, body, headers)
+                    idempotency_scope,
+                    StoredResponse(status, body, headers),
+                    allowed_statuses=tuple(replay_statuses),
                 )
                 REGISTRY.record_idempotency("stored")
                 headers = dict(headers)

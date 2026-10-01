@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import re
 import threading
 from typing import Any
 
 from agent_qa.conditional import check_expected_version
+from agent_qa.bulk import run_bulk, validate_bulk_input
 from agent_qa.errors import ApiError
 from agent_qa.pagination import (
     decode_cursor,
@@ -361,6 +363,26 @@ class ProductStore:
             }
             self._products[product_id] = product
             return _copy_product(product, include_version)
+
+    def create_bulk(
+        self, items: list[Any], atomic: bool = False
+    ) -> tuple[int, dict[str, Any]]:
+        """Create products sequentially, optionally restoring the whole batch."""
+        validate_bulk_input(items, atomic)
+
+        def apply_one(item: Any) -> dict[str, Any]:
+            return self.create(**validate_create(item))
+
+        with self._lock:
+            products_snapshot = deepcopy(self._products)
+            next_id_snapshot = self._next_id
+
+            def rollback() -> None:
+                self._products.clear()
+                self._products.update(deepcopy(products_snapshot))
+                self._next_id = next_id_snapshot
+
+            return run_bulk(items, apply_one, rollback, atomic)
 
     def get(
         self, product_id: int, *, include_version: bool = False

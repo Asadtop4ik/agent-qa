@@ -101,10 +101,28 @@ class IdempotencyStore:
             self._entries[scope] = _Entry(fingerprint, Event())
             return BeginDecision("new")
 
-    def complete(self, scope: tuple[str, ...], response: StoredResponse) -> None:
-        """Save a successful response and release its in-flight reservation."""
-        if not 200 <= response.status < 300:
-            raise ValueError("only 2xx responses can be stored")
+    def complete(
+        self,
+        scope: tuple[str, ...],
+        response: StoredResponse,
+        *,
+        allowed_statuses: tuple[int, ...] = (),
+    ) -> None:
+        """Save a successful or explicitly allowed response and release reservation."""
+        if any(
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 400 <= status <= 599
+            for status in allowed_statuses
+        ):
+            raise ValueError("allowed_statuses must contain HTTP error statuses")
+        if (
+            isinstance(response.status, bool)
+            or not isinstance(response.status, int)
+            or not 200 <= response.status < 300
+            and response.status not in allowed_statuses
+        ):
+            raise ValueError("response status is not allowed to be stored")
         with self._lock:
             entry = self._entries.get(scope)
             if entry is None or entry.response is not None:

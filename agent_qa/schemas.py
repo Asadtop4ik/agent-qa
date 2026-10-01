@@ -150,6 +150,94 @@ _PRODUCT = {
 }
 
 SCHEMAS = {
+    "CreateOrdersBulk": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+            # Item validation belongs to the normal per-item create path.
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {},
+            },
+            "atomic": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "CreateProductsBulk": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 50,
+                "items": {},
+            },
+            "atomic": {"type": "boolean", "default": False},
+        },
+        "additionalProperties": False,
+    },
+    "BulkCreateResponse": {
+        "type": "object",
+        "required": ["results", "summary"],
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["index", "status", "data"],
+                            "properties": {
+                                "index": {"type": "integer", "minimum": 0},
+                                "status": {"type": "integer", "enum": [201]},
+                                "data": {"type": "object"},
+                            },
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "required": ["index", "status", "error"],
+                            "properties": {
+                                "index": {"type": "integer", "minimum": 0},
+                                "status": {
+                                    "type": "integer",
+                                    "enum": [400, 404, 409, 424],
+                                },
+                                "error": {
+                                    "type": "object",
+                                    "required": ["code", "message"],
+                                    "properties": {
+                                        "code": {"type": "string"},
+                                        "message": {"type": "string"},
+                                        "details": {},
+                                    },
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["total", "succeeded", "failed"],
+                "properties": {
+                    "total": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "succeeded": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 50,
+                    },
+                    "failed": {"type": "integer", "minimum": 0, "maximum": 50},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    },
     "CreateOrder": {
         "type": "object",
         "required": ["customer_id"],
