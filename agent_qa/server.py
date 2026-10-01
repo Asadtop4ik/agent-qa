@@ -1,5 +1,6 @@
 """HTTP server adapter for the route handlers."""
 
+import gzip
 import hashlib
 import json
 import logging
@@ -14,15 +15,16 @@ from agent_qa.accesslog import write_access_log
 from agent_qa.audit import AUDIT_LOG
 from agent_qa import config
 from agent_qa.auth import api_key_from_headers, authenticate_api_key
-from agent_qa.errors import ApiError, envelope
-from agent_qa.idempotency import IdempotencyStore, StoredResponse
-from agent_qa.metrics import REGISTRY
 from agent_qa.context import (
     RequestContext,
     clear_context,
     get_context,
     set_context,
 )
+from agent_qa.errors import ApiError, envelope, problem
+from agent_qa.idempotency import IdempotencyStore, StoredResponse
+from agent_qa.metrics import REGISTRY
+from agent_qa.negotiation import best_match, gzip_acceptable, prefers_problem
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
@@ -31,6 +33,7 @@ from agent_qa.validation import validate
 LOGGER = logging.getLogger(__name__)
 IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+MIN_GZIP_BYTES = 256
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -122,7 +125,17 @@ class Handler(BaseHTTPRequestHandler):
         self, status: int, body: object, headers: dict[str, str] | None = None
     ) -> None:
         is_empty = status in {204, 304}
-        response_headers = headers or {}
+        response_headers = dict(headers or {})
+        audit_body = body
+        if status >= 400:
+            body, is_problem = self._error_representation(status, body)
+            if is_problem:
+                response_headers["Content-Type"] = (
+                    "application/problem+json; charset=utf-8"
+                )
+            response_headers["Vary"] = self._merge_vary(
+                response_headers.get("Vary"), "Accept"
+            )
         content_type = response_headers.get("Content-Type")
         if is_empty:
             encoded = b""
@@ -130,7 +143,26 @@ class Handler(BaseHTTPRequestHandler):
             encoded = body.encode("utf-8")
         else:
             encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        self._audit_response_body = body
+        if not is_empty and encoded:
+            response_headers["Vary"] = self._merge_vary(
+                response_headers.get("Vary"), "Accept-Encoding"
+            )
+            try:
+                path = urlsplit(getattr(self, "path", "") or "").path
+            except ValueError:
+                path = ""
+            encodings = self._header_values("Accept-Encoding")
+            if (
+                len(encoded) >= MIN_GZIP_BYTES
+                and path not in {"/ready", "/ping"}
+                and gzip_acceptable(",".join(encodings) if encodings else None)
+            ):
+                encoded = gzip.compress(encoded, mtime=0)
+                response_headers["Content-Encoding"] = "gzip"
+                etag = response_headers.get("ETag")
+                if etag and not etag.startswith("W/"):
+                    response_headers["ETag"] = f"W/{etag}"
+        self._audit_response_body = audit_body
         self._record_response(status)
         self.send_response(status)
         if not is_empty:
@@ -151,6 +183,55 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD" and encoded:
             self.wfile.write(encoded)
+
+    @staticmethod
+    def _merge_vary(current: str | None, value: str) -> str:
+        tokens = [item.strip() for item in (current or "").split(",") if item.strip()]
+        if "*" in tokens:
+            return "*"
+        if not any(item.lower() == value.lower() for item in tokens):
+            tokens.append(value)
+        return ", ".join(tokens)
+
+    def _header_values(self, name: str) -> list[str]:
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return []
+        try:
+            return headers.get_all(name, []) or []
+        except (AttributeError, TypeError):
+            value = headers.get(name)
+            return [value] if value is not None else []
+
+    def _error_representation(self, status: int, body: object) -> tuple[object, bool]:
+        accept_values = self._header_values("Accept")
+        if not accept_values:
+            return body, False
+        if not prefers_problem(",".join(accept_values)):
+            return body, False
+        legacy_error = body.get("error") if isinstance(body, dict) else None
+        if not isinstance(legacy_error, dict):
+            return body, False
+        code = str(legacy_error.get("code", "http_error"))
+        message = str(legacy_error.get("message", "Request failed"))
+        details = legacy_error.get("details")
+        if not isinstance(details, list):
+            details = None
+        request_id_value = legacy_error.get(
+            "request_id", getattr(self, "request_id", None)
+        )
+        request_id_text = (
+            request_id_value if isinstance(request_id_value, str) else None
+        )
+        response = problem(
+            status,
+            code,
+            message,
+            details,
+            request_id=request_id_text,
+            instance=getattr(self, "path", "") or "",
+        )
+        return response, True
 
     def _record_response(self, status: int) -> None:
         if self._response_recorded:
@@ -291,6 +372,14 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        accept_values = self._header_values("Accept")
+        if accept_values:
+            offered = list(route.get("produces", ["application/json"]))
+            if "application/json" in offered:
+                offered.append("application/problem+json")
+            accept = ",".join(accept_values)
+            if best_match(accept, offered) is None:
+                raise ApiError(406, "not_acceptable", "No acceptable response type")
         context = get_context()
         if context is not None:
             segments = str(route["path"]).strip("/").split("/")
@@ -362,6 +451,17 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        content_encodings = self._header_values("Content-Encoding")
+        if any(
+            coding.strip().lower() != "identity"
+            for value in content_encodings
+            for coding in value.split(",")
+        ):
+            raise ApiError(
+                415,
+                "unsupported_content_encoding",
+                "Request Content-Encoding is not supported",
+            )
         idempotency_key: str | None = None
         idempotency_scope: tuple[str, ...] | None = None
         if self.command == "POST" and route.get("idempotent"):

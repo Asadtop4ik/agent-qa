@@ -80,7 +80,9 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
             self.assertIn("403", operation["responses"])
             if route["path"] not in ("/orders/bulk", "/products/bulk"):
                 continue
-            self.assertEqual(set(operation["responses"]), set(route["responses"]))
+            self.assertEqual(
+                set(operation["responses"]), set(route["responses"]) | {"406"}
+            )
             self.assertEqual(operation["x-max-body-bytes"], route["max_body_bytes"])
             self.assertEqual(
                 operation["requestBody"]["content"]["application/json"]["schema"],
@@ -160,6 +162,36 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         custom_spec = build_openapi([custom_route], "bulk-test")
         self.assertEqual(
             custom_spec["paths"]["/orders"]["post"]["x-max-body-bytes"], 8192
+        )
+
+    def test_every_operation_documents_negotiation_and_problem_errors(self):
+        spec = build_openapi(ROUTES, "negotiation-test")
+        operations = [
+            operation
+            for path_item in spec["paths"].values()
+            for operation in path_item.values()
+        ]
+        for operation in operations:
+            with self.subTest(operation=operation["operationId"]):
+                self.assertIn("406", operation["responses"])
+                self.assertIn("Accept negotiates", operation["description"])
+                self.assertIn(
+                    "application/problem+json",
+                    operation["responses"]["406"]["content"],
+                )
+                for status, response in operation["responses"].items():
+                    if int(status) >= 400:
+                        self.assertIn(
+                            "application/problem+json", response.get("content", {})
+                        )
+
+        metrics = spec["paths"]["/metrics"]["get"]["responses"]["200"]
+        self.assertIn("text/plain", metrics["content"])
+        self.assertNotIn("application/json", metrics["content"])
+        problem = spec["components"]["schemas"]["Problem"]
+        self.assertTrue(
+            {"type", "title", "status", "detail", "instance", "code", "request_id"}
+            <= set(problem["required"])
         )
 
     def test_cursor_pagination_parameters_responses_and_errors_are_documented(self):
@@ -242,7 +274,16 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
 
     def test_order_schemas_export_item_and_exactly_one_limits(self):
         spec = build_openapi(ROUTES, "order-schema-test")
-        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        schemas_exported = spec["components"]["schemas"]
+        self.assertEqual(
+            {
+                name: schema
+                for name, schema in schemas_exported.items()
+                if name != "Problem"
+            },
+            SCHEMAS,
+        )
+        self.assertIn("Problem", schemas_exported)
         create = spec["paths"]["/orders"]["post"]["requestBody"]["content"][
             "application/json"
         ]["schema"]

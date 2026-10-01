@@ -1180,6 +1180,7 @@ ROUTES = (
         "auth_required": False,
         "operation_id": "getMetrics",
         "summary": "Read service metrics",
+        "produces": ["text/plain"],
         "responses": ["200", "403"],
     },
     {

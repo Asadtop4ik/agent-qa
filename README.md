@@ -104,6 +104,18 @@ maximum of 500 saved keys.
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.
 
+## Content negotiation
+
+Send `Accept: application/problem+json` to receive RFC 9457 error responses when
+its quality value is at least as high as the matching JSON alternatives. With no
+`Accept` header, or only `*/*`, errors keep the standard `{"error":...}` envelope.
+Routes return `406 not_acceptable` before running a handler when none of their
+response types are acceptable, so rejected write requests have no side effects.
+`Accept-Encoding: gzip` enables deterministic gzip for response bodies of at
+least 256 bytes. `/ready` and `/ping` stay uncompressed. Requests may use only
+`Content-Encoding: identity`; another encoding returns `415` after
+authentication and before the body is read.
+
 ## Audit log
 
 `GET /audit` and `GET /audit/{seq}` are admin-only views of the in-memory audit

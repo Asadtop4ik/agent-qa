@@ -13,9 +13,17 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         method = route["method"].lower()
         path = route["path"]
         response_schemas = route.get("response_schemas", {})
+        produces = route.get("produces", ["application/json"])
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
+            "description": (
+                "Accept negotiates the successful response media type. "
+                "application/problem+json errors are available when its quality "
+                "is at least the JSON alternatives; an unacceptable response "
+                "type returns 406. Accept-Encoding may request gzip for response "
+                "bodies of at least 256 bytes."
+            ),
             "x-required-role": route.get(
                 "role", "write" if route["auth_required"] else None
             ),
@@ -25,9 +33,10 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                     **(
                         {
                             "content": {
-                                "application/json": {
+                                media_type: {
                                     "schema": deepcopy(response_schemas[status])
                                 }
+                                for media_type in produces
                             }
                         }
                         if status in response_schemas
@@ -208,10 +217,58 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 operation["responses"][status].setdefault("headers", {}).update(
                     deepcopy(headers)
                 )
+        operation["responses"].setdefault(
+            "406",
+            {
+                "description": "No acceptable response representation is available.",
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/Error"}
+                    },
+                    "application/problem+json": {
+                        "schema": {"$ref": "#/components/schemas/Problem"}
+                    },
+                },
+            },
+        )
+        for status, response in operation["responses"].items():
+            if 200 <= int(status) < 300 and int(status) not in (204, 205):
+                response.setdefault(
+                    "content", {media_type: {} for media_type in produces}
+                )
+            if 400 <= int(status) < 600:
+                response.setdefault("content", {}).setdefault(
+                    "application/problem+json",
+                    {"schema": {"$ref": "#/components/schemas/Problem"}},
+                )
         if route.get("role", route["auth_required"]):
             operation["security"] = [{"ApiKeyAuth": []}]
         paths.setdefault(path, {})[method] = operation
 
+    schemas = deepcopy(SCHEMAS)
+    schemas["Problem"] = {
+        "type": "object",
+        "required": [
+            "type",
+            "title",
+            "status",
+            "detail",
+            "instance",
+            "code",
+            "request_id",
+        ],
+        "properties": {
+            "type": {"type": "string", "format": "uri"},
+            "title": {"type": "string"},
+            "status": {"type": "integer", "minimum": 400, "maximum": 599},
+            "detail": {"type": "string"},
+            "instance": {"type": "string"},
+            "code": {"type": "string"},
+            "request_id": {"type": "string"},
+            "errors": {"type": "array", "items": {"type": "object"}},
+        },
+        "additionalProperties": False,
+    }
     return {
         "openapi": "3.0.3",
         "info": {"title": "agent-qa", "version": "1.0.0", "x-git-sha": git_sha},
@@ -220,6 +277,6 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
             "securitySchemes": {
                 "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
             },
-            "schemas": deepcopy(SCHEMAS),
+            "schemas": schemas,
         },
     }

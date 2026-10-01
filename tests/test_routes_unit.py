@@ -192,6 +192,12 @@ class RouteUnitTests(unittest.TestCase):
         self.assertEqual(route["method"], "GET")
         self.assertIs(route["handler"], health)
         self.assertEqual(route["responses"], ["200", "403"])
+        self.assertEqual(
+            route.get("produces", ["application/json"]), ["application/json"]
+        )
+
+        metrics_route = next(route for route in ROUTES if route["path"] == "/metrics")
+        self.assertEqual(metrics_route["produces"], ["text/plain"])
 
     def test_ping_handler(self):
         status, body, headers = ping([])
