@@ -100,6 +100,18 @@ responses, while bulk routes replay the complete result for `201`, `207`, or
 seconds by default (`AGENT_QA_IDEMPOTENCY_TTL_SECONDS`, range 1–86400), with a
 maximum of 500 saved keys.
 
+## Background jobs
+
+`POST /jobs` queues a `sleep`, `orders_summary`, `stock_report`, or `fail` job
+and returns `202` with a `Location` header. `GET /jobs` lists jobs by ascending
+ID and accepts `status`, `type`, `limit`, and `offset` filters. `GET /jobs/{id}`
+returns current progress and accepts `wait_ms` (0–5000) to wait for a terminal
+status. `POST /jobs/{id}/cancel` cancels queued work immediately and requests
+cooperative cancellation for running work. Creating and cancelling jobs require
+a write API key; job reads are public. Configure workers with
+`AGENT_QA_JOB_WORKERS` (1–3, default 2) and completed-job retention with
+`AGENT_QA_JOB_RETENTION` (10–1000, default 100).
+
 ## JSON schemas
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.

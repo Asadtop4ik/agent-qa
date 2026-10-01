@@ -319,6 +319,21 @@ class OrderStore:
                 total,
             )
 
+    def summary_snapshot(self) -> dict[str, Any]:
+        """Return aggregate values from one consistent order-store snapshot."""
+        with self._lock:
+            by_status = {status: 0 for status in ORDER_STATUSES}
+            revenue_cents = 0
+            for order in self._orders.values():
+                by_status[order["status"]] += 1
+                if order["status"] in {"paid", "shipped"}:
+                    revenue_cents += order["total_cents"]
+            return {
+                "orders": len(self._orders),
+                "by_status": by_status,
+                "revenue_cents": revenue_cents,
+            }
+
     def get(
         self, order_id: int, *, include_version: bool = False
     ) -> dict[str, Any] | None:

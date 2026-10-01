@@ -13,6 +13,15 @@ _BUILD_NAME = "agent_qa_build_info"
 _IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
 _AUDIT_ENTRIES_NAME = "agent_qa_audit_entries"
 _AUDIT_DROPPED_NAME = "agent_qa_audit_dropped_total"
+_JOBS_NAME = "agent_qa_jobs"
+_JOB_STATUSES = (
+    "queued",
+    "running",
+    "cancelling",
+    "succeeded",
+    "failed",
+    "cancelled",
+)
 _IDEMPOTENCY_RESULTS = frozenset({"stored", "replayed", "mismatch", "in_progress"})
 _HTTP_METHODS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
@@ -78,6 +87,7 @@ class MetricsRegistry:
         *,
         audit_entries: int | None = None,
         audit_dropped: int | None = None,
+        job_statuses: dict[str, int] | None = None,
     ) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
@@ -131,6 +141,19 @@ class MetricsRegistry:
                 "Current number of orders.",
                 "gauge",
                 [(_ORDERS_NAME, (), str(orders))],
+            ),
+            (
+                _JOBS_NAME,
+                "Current number of jobs by status.",
+                "gauge",
+                [
+                    (
+                        _JOBS_NAME,
+                        (("status", status),),
+                        str(max(0, int((job_statuses or {}).get(status, 0)))),
+                    )
+                    for status in _JOB_STATUSES
+                ],
             ),
         ]
         if products is not None:

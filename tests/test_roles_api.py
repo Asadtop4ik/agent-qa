@@ -116,7 +116,7 @@ class RoleApiTests(unittest.TestCase):
                     required_role = "read"
                 elif route["method"] in {"POST", "PATCH", "DELETE"} and route[
                     "path"
-                ].startswith(("/orders", "/products")):
+                ].startswith(("/orders", "/products", "/jobs")):
                     required_role = "write"
                 else:
                     required_role = None

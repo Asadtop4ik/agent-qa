@@ -28,6 +28,15 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
         listing = spec["paths"]["/audit"]["get"]
         self.assertEqual(listing["x-required-role"], "admin")
         self.assertEqual(listing["security"], [{"ApiKeyAuth": []}])
+        resource_parameter = next(
+            parameter
+            for parameter in listing["parameters"]
+            if parameter["name"] == "resource"
+        )
+        self.assertEqual(
+            resource_parameter["schema"]["enum"],
+            ["orders", "products", "keys", "jobs"],
+        )
         self.assertEqual(
             {parameter["name"] for parameter in listing["parameters"]},
             {
@@ -86,6 +95,61 @@ class OpenApiSchemaUnitTests(unittest.TestCase):
                 operation["requestBody"]["content"]["application/json"]["schema"],
                 route["request_schema"],
             )
+
+    def test_jobs_routes_and_schemas_match_openapi(self):
+        spec = build_openapi(ROUTES, "jobs-drift")
+        create = spec["paths"]["/jobs"]["post"]
+        self.assertEqual(
+            create["responses"]["202"]["headers"]["Location"]["schema"],
+            {"type": "string"},
+        )
+        self.assertEqual(
+            create["responses"]["503"]["headers"]["Retry-After"]["schema"],
+            {"type": "string", "enum": ["1"]},
+        )
+        self.assertIn("Job", spec["components"]["schemas"])
+        self.assertIn("JobList", spec["components"]["schemas"])
+        create_schema = create["requestBody"]["content"]["application/json"]["schema"]
+        self.assertEqual(len(create_schema["oneOf"]), 4)
+        self.assertEqual(
+            {
+                branch["properties"]["type"]["enum"][0]: branch["properties"]["params"][
+                    "$ref"
+                ]
+                for branch in create_schema["oneOf"]
+            },
+            {
+                "sleep": "#/components/schemas/SleepJobParams",
+                "orders_summary": "#/components/schemas/OrdersSummaryJobParams",
+                "stock_report": "#/components/schemas/StockReportJobParams",
+                "fail": "#/components/schemas/FailJobParams",
+            },
+        )
+        job_schema = spec["components"]["schemas"]["Job"]
+        self.assertEqual(
+            job_schema["properties"]["result"]["oneOf"],
+            [
+                {"type": "object", "nullable": True, "enum": [None]},
+                {"$ref": "#/components/schemas/SleepJobResult"},
+                {"$ref": "#/components/schemas/OrdersSummaryJobResult"},
+                {"$ref": "#/components/schemas/StockReportJobResult"},
+            ],
+        )
+        self.assertEqual(
+            job_schema["properties"]["error"]["$ref"],
+            "#/components/schemas/JobError",
+        )
+        self.assertTrue(spec["components"]["schemas"]["JobError"]["nullable"])
+        self.assertEqual(
+            spec["paths"]["/jobs/{id}"]["get"]["parameters"][-1]["name"],
+            "wait_ms",
+        )
+        self.assertEqual(
+            spec["paths"]["/jobs/{id}/cancel"]["post"]["responses"]["409"][
+                "description"
+            ],
+            "The job is already terminal (job_not_cancellable).",
+        )
 
     def test_key_management_routes_are_documented_with_roles_and_forbidden(self):
         spec = build_openapi(ROUTES, "keys-test")

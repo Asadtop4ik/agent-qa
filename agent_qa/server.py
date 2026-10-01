@@ -25,7 +25,7 @@ from agent_qa.context import (
 )
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
-from agent_qa.routes import ROUTES
+from agent_qa.routes import JOB_RUNNER, ROUTES
 from agent_qa.validation import validate
 
 LOGGER = logging.getLogger(__name__)
@@ -298,7 +298,7 @@ class Handler(BaseHTTPRequestHandler):
                 (
                     segment
                     for segment in segments
-                    if segment in {"orders", "products", "keys"}
+                    if segment in {"orders", "products", "keys", "jobs"}
                 ),
                 None,
             )
@@ -495,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
             (dispatch or self._dispatch)()
         except ApiError as error:
             response_headers = {}
+            if error.code == "queue_full":
+                response_headers["Retry-After"] = "1"
             current_etag = getattr(error, "current_etag", None)
             if current_etag is not None:
                 response_headers["ETag"] = current_etag
@@ -568,4 +570,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    ThreadingHTTPServer(("0.0.0.0", config.port()), Handler).serve_forever()
+    server = ThreadingHTTPServer(("0.0.0.0", config.port()), Handler)
+    try:
+        server.serve_forever()
+    finally:
+        JOB_RUNNER.stop(timeout=5)
+        server.server_close()

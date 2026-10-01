@@ -51,6 +51,16 @@ class AuditRouteTests(unittest.TestCase):
             self.assertEqual(error.exception.status, 400)
             self.assertEqual(error.exception.code, "invalid_query")
 
+    def test_list_accepts_jobs_resource_filter(self):
+        with patch(
+            "agent_qa.routes.AUDIT_LOG.query", return_value={"items": []}
+        ) as query:
+            status, body, headers = list_audit([("resource", "jobs")])
+        self.assertEqual((status, body, headers), (200, {"items": []}, {}))
+        query.assert_called_once_with(
+            resource="jobs", since_seq=0, limit=50, order="desc"
+        )
+
     def test_get_entry_returns_retained_entry_and_rejects_invalid_or_missing_seq(self):
         entry = {"seq": 7}
         with patch("agent_qa.routes.AUDIT_LOG.get", return_value=entry) as get:
