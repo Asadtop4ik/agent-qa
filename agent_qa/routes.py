@@ -14,6 +14,7 @@ from agent_qa.context import get_context
 from agent_qa.errors import ApiError
 from agent_qa.fulfillment import FulfillmentService
 from agent_qa.metrics import REGISTRY
+from agent_qa.outbox import OUTBOX
 from agent_qa.openapi import build_openapi
 from agent_qa.pagination import MAX_CURSOR_LENGTH
 from agent_qa.schemas import (
@@ -169,6 +170,7 @@ def metrics(
     order_count = ORDER_STORE.list(limit=1)[1]
     product_count = PRODUCT_STORE.list(limit=1)[1]
     audit_entries, audit_dropped = AUDIT_LOG.metrics_snapshot()
+    outbox_statuses, outbox_dropped = OUTBOX.metrics_snapshot()
     job_statuses = JOB_RUNNER.status_counts()
     return (
         200,
@@ -178,6 +180,8 @@ def metrics(
             products=product_count,
             audit_entries=audit_entries,
             audit_dropped=audit_dropped,
+            outbox_statuses=outbox_statuses,
+            outbox_dropped=outbox_dropped,
             job_statuses=job_statuses,
         ),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
@@ -374,6 +378,7 @@ def create_order(
         **values, include_version=True
     )
     version = order.pop("version")
+    OUTBOX.emit("order.created", dict(order))
     return (
         201,
         order,
@@ -394,6 +399,10 @@ def create_orders_bulk(
     status, body = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create_bulk(
         values.get("items"), values.get("atomic", False)
     )
+    if isinstance(body, dict):
+        for result in body.get("results", []):
+            if result.get("status") == 201 and isinstance(result.get("data"), dict):
+                OUTBOX.emit("order.created", dict(result["data"]))
     context = get_context()
     if context is not None and isinstance(body, dict):
         context.resource = "orders"
@@ -488,6 +497,7 @@ def patch_order(
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
+    OUTBOX.emit("order.updated", dict(order))
     return 200, order, {"ETag": etag_for("order", order_id, version)}
 
 
@@ -506,6 +516,7 @@ def delete_order(
         order_id, expected_version=expected_version
     ):
         raise ApiError(404, "order_not_found", "Order not found")
+    OUTBOX.emit("order.deleted", {"id": order_id})
     return 204, None, {"Content-Length": "0"}
 
 
@@ -519,6 +530,7 @@ def create_product(
         **validate_product_create(payload), include_version=True
     )
     version = product.pop("version")
+    OUTBOX.emit("product.created", dict(product))
     return (
         201,
         product,
@@ -539,6 +551,10 @@ def create_products_bulk(
     status, body = PRODUCT_STORE.create_bulk(
         values.get("items"), values.get("atomic", False)
     )
+    if isinstance(body, dict):
+        for result in body.get("results", []):
+            if result.get("status") == 201 and isinstance(result.get("data"), dict):
+                OUTBOX.emit("product.created", dict(result["data"]))
     context = get_context()
     if context is not None and isinstance(body, dict):
         context.resource = "products"
@@ -633,6 +649,7 @@ def patch_product(
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
     version = product.pop("version")
+    OUTBOX.emit("product.updated", dict(product))
     return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
@@ -649,6 +666,7 @@ def delete_product(
     expected_version = _expected_version(request_headers)
     if not PRODUCT_STORE.delete(product_id, expected_version=expected_version):
         raise ApiError(404, "product_not_found", "Product not found")
+    OUTBOX.emit("product.deleted", {"id": product_id})
     return 204, None, {"Content-Length": "0"}
 
 
@@ -675,6 +693,7 @@ def adjust_product_stock(
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
     version = product.pop("version")
+    OUTBOX.emit("product.updated", dict(product))
     return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
@@ -716,6 +735,105 @@ def get_audit_entry(
     if entry is None:
         raise ApiError(404, "audit_entry_not_found", "Audit entry not found")
     return 200, entry, {}
+
+
+def create_webhook(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 201, OUTBOX.create_webhook(payload), {}
+
+
+def list_webhooks(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.list_webhooks(), {}
+
+
+def get_webhook(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.get_webhook((path_params or {}).get("id", "")), {}
+
+
+def patch_webhook(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.patch_webhook((path_params or {}).get("id", ""), payload), {}
+
+
+def delete_webhook(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    OUTBOX.delete_webhook((path_params or {}).get("id", ""))
+    return 204, None, {"Content-Length": "0"}
+
+
+def list_outbox(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    filters = validate_query_params(_OUTBOX_QUERY_PARAMETERS, query)
+    normalized = [(name, str(value)) for name, value in filters.items()]
+    return 200, OUTBOX.list_outbox(normalized), {}
+
+
+def get_outbox(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.get_outbox((path_params or {}).get("id", "")), {}
+
+
+def process_outbox(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    values = payload if isinstance(payload, dict) else {}
+    return (
+        200,
+        OUTBOX.process_due(
+            ignore_schedule=values.get("ignore_schedule", False),
+            max_items=values.get("max", 50),
+        ),
+        {},
+    )
+
+
+def requeue_outbox(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.requeue((path_params or {}).get("id", "")), {}
+
+
+def get_dispatcher(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.get_dispatcher(), {}
+
+
+def put_dispatcher(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    return 200, OUTBOX.configure_dispatcher(payload), {}
 
 
 def create_job(
@@ -824,6 +942,57 @@ _JOB_WAIT_QUERY_PARAMETERS = [
             "default": 0,
         },
     }
+]
+_OUTBOX_ID = {
+    "name": "id",
+    "in": "path",
+    "required": True,
+    "schema": {"type": "integer", "minimum": 1, "maximum": (1 << 31) - 1},
+}
+_OUTBOX_QUERY_PARAMETERS = [
+    {
+        "name": "status",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": ["pending", "retrying", "delivered", "failed"],
+        },
+    },
+    {
+        "name": "webhook_id",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": (1 << 31) - 1},
+    },
+    {
+        "name": "event_type",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "enum": [
+                "order.created",
+                "order.updated",
+                "order.deleted",
+                "product.created",
+                "product.updated",
+                "product.deleted",
+            ],
+        },
+    },
+    {
+        "name": "limit",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+    },
+    {
+        "name": "offset",
+        "in": "query",
+        "schema": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": (1 << 31) - 1,
+            "default": 0,
+        },
+    },
 ]
 
 
@@ -2010,6 +2179,152 @@ ROUTES = (
             "404": "The job does not exist (job_not_found).",
             "409": "The job is already terminal (job_not_cancellable).",
         },
+    },
+    {
+        "method": "POST",
+        "path": "/webhooks",
+        "handler": create_webhook,
+        "body": True,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "createWebhook",
+        "summary": "Register a simulated webhook destination",
+        "request_schema": SCHEMAS["CreateWebhook"],
+        "responses": ["201", "400", "401", "409", "413", "415", "403"],
+        "response_schemas": {"201": {"$ref": "#/components/schemas/Webhook"}},
+        "error_responses": {
+            "409": "The webhook limit has been reached (webhook_limit)."
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/webhooks",
+        "handler": list_webhooks,
+        "role": "read",
+        "auth_required": True,
+        "operation_id": "listWebhooks",
+        "summary": "List configured webhooks",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/WebhookList"}},
+    },
+    {
+        "method": "GET",
+        "path": "/webhooks/{id}",
+        "handler": get_webhook,
+        "role": "read",
+        "auth_required": True,
+        "operation_id": "getWebhook",
+        "summary": "Read one webhook",
+        "parameters": [_OUTBOX_ID],
+        "responses": ["200", "400", "401", "403", "404"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Webhook"}},
+        "error_responses": {"404": "The webhook does not exist (webhook_not_found)."},
+    },
+    {
+        "method": "PATCH",
+        "path": "/webhooks/{id}",
+        "handler": patch_webhook,
+        "body": True,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "updateWebhook",
+        "summary": "Update webhook activation or events",
+        "parameters": [_OUTBOX_ID],
+        "request_schema": SCHEMAS["PatchWebhook"],
+        "responses": ["200", "400", "401", "403", "404", "413", "415"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Webhook"}},
+        "error_responses": {"404": "The webhook does not exist (webhook_not_found)."},
+    },
+    {
+        "method": "DELETE",
+        "path": "/webhooks/{id}",
+        "handler": delete_webhook,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "deleteWebhook",
+        "summary": "Delete a webhook",
+        "parameters": [_OUTBOX_ID],
+        "responses": ["204", "400", "401", "403", "404"],
+        "error_responses": {"404": "The webhook does not exist (webhook_not_found)."},
+    },
+    {
+        "method": "GET",
+        "path": "/outbox",
+        "handler": list_outbox,
+        "role": "read",
+        "auth_required": True,
+        "operation_id": "listOutbox",
+        "summary": "List webhook delivery records",
+        "parameters": _OUTBOX_QUERY_PARAMETERS,
+        "responses": ["200", "400", "401", "403"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/OutboxList"}},
+    },
+    {
+        "method": "GET",
+        "path": "/outbox/{id}",
+        "handler": get_outbox,
+        "role": "read",
+        "auth_required": True,
+        "operation_id": "getOutboxEntry",
+        "summary": "Read one webhook delivery record",
+        "parameters": [_OUTBOX_ID],
+        "responses": ["200", "400", "401", "403", "404"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/OutboxEntry"}},
+        "error_responses": {"404": "The record does not exist (outbox_not_found)."},
+    },
+    {
+        "method": "POST",
+        "path": "/outbox/process",
+        "handler": process_outbox,
+        "body": True,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "processOutbox",
+        "summary": "Synchronously process due webhook deliveries",
+        "request_schema": SCHEMAS["ProcessOutbox"],
+        "responses": ["200", "400", "401", "403", "413", "415"],
+        "response_schemas": {
+            "200": {"$ref": "#/components/schemas/ProcessOutboxResult"}
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/outbox/{id}/requeue",
+        "handler": requeue_outbox,
+        "role": "write",
+        "auth_required": True,
+        "operation_id": "requeueOutboxEntry",
+        "summary": "Requeue a failed webhook delivery",
+        "parameters": [_OUTBOX_ID],
+        "responses": ["200", "400", "401", "403", "404", "409"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/OutboxEntry"}},
+        "error_responses": {
+            "409": "Only failed entries can be requeued (not_requeueable)."
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/outbox/dispatcher",
+        "handler": get_dispatcher,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "getOutboxDispatcher",
+        "summary": "Read the webhook dispatcher configuration",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Dispatcher"}},
+    },
+    {
+        "method": "PUT",
+        "path": "/outbox/dispatcher",
+        "handler": put_dispatcher,
+        "body": True,
+        "role": "admin",
+        "auth_required": True,
+        "operation_id": "configureOutboxDispatcher",
+        "summary": "Configure the webhook dispatcher",
+        "request_schema": SCHEMAS["UpdateDispatcher"],
+        "responses": ["200", "400", "401", "403", "413", "415"],
+        "response_schemas": {"200": {"$ref": "#/components/schemas/Dispatcher"}},
     },
     {
         "method": "GET",

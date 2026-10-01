@@ -636,3 +636,210 @@ SCHEMAS = {
 SCHEMAS["OrderList"]["properties"]["items"]["items"] = SCHEMAS["Order"]
 SCHEMAS["ProductList"]["properties"]["items"]["items"] = SCHEMAS["Product"]
 SCHEMAS["CategoryList"]["properties"]["items"]["items"] = SCHEMAS["Category"]
+
+_WEBHOOK_EVENT_TYPES = [
+    f"{resource}.{action}"
+    for resource in ("order", "product")
+    for action in ("created", "updated", "deleted")
+]
+SCHEMAS.update(
+    {
+        "CreateWebhook": {
+            "type": "object",
+            "required": ["url", "events", "secret"],
+            "properties": {
+                "url": {"type": "string", "minLength": 1, "maxLength": 200},
+                "events": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 9,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "enum": _WEBHOOK_EVENT_TYPES + ["order.*", "product.*", "*"],
+                    },
+                },
+                "secret": {"type": "string", "minLength": 8, "maxLength": 64},
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 5,
+                },
+                "backoff_base_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 60000,
+                    "default": 1000,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "PatchWebhook": {
+            "type": "object",
+            "properties": {
+                "active": {"type": "boolean"},
+                "events": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 9,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "enum": _WEBHOOK_EVENT_TYPES + ["order.*", "product.*", "*"],
+                    },
+                },
+            },
+            "additionalProperties": False,
+            "minProperties": 1,
+        },
+        "Webhook": {
+            "type": "object",
+            "required": [
+                "id",
+                "url",
+                "events",
+                "active",
+                "max_attempts",
+                "backoff_base_ms",
+                "secret_set",
+                "created_at",
+            ],
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "url": {"type": "string"},
+                "events": {"type": "array", "items": {"type": "string"}},
+                "active": {"type": "boolean"},
+                "max_attempts": {"type": "integer", "minimum": 1, "maximum": 8},
+                "backoff_base_ms": {"type": "integer", "minimum": 0, "maximum": 60000},
+                "secret_set": {"type": "boolean", "enum": [True]},
+                "created_at": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "WebhookList": {
+            "type": "object",
+            "required": ["items", "total"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/Webhook"},
+                },
+                "total": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        "ProcessOutbox": {
+            "type": "object",
+            "properties": {
+                "ignore_schedule": {"type": "boolean", "default": False},
+                "max": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            },
+            "additionalProperties": False,
+        },
+        "Dispatcher": {
+            "type": "object",
+            "required": ["enabled", "interval_ms"],
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "interval_ms": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 60000,
+                },
+            },
+            "additionalProperties": False,
+        },
+        "UpdateDispatcher": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "default": True},
+                "interval_ms": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 60000,
+                    "default": 1000,
+                },
+            },
+            "additionalProperties": False,
+            "minProperties": 1,
+        },
+        "OutboxAttempt": {
+            "type": "object",
+            "required": [
+                "n",
+                "at",
+                "outcome",
+                "http_status",
+                "timestamp",
+                "signature",
+            ],
+            "properties": {
+                "n": {"type": "integer", "minimum": 1},
+                "at": {"type": "string"},
+                "outcome": {"type": "string"},
+                "http_status": {"type": "integer", "nullable": True},
+                "timestamp": {"type": "integer", "minimum": 0},
+                "signature": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "OutboxEntry": {
+            "type": "object",
+            "required": [
+                "id",
+                "webhook_id",
+                "event_id",
+                "event_type",
+                "status",
+                "attempts",
+                "next_attempt_at",
+                "created_at",
+                "payload",
+            ],
+            "properties": {
+                "id": {"type": "integer", "minimum": 1},
+                "webhook_id": {"type": "integer", "minimum": 1},
+                "event_id": {"type": "string"},
+                "event_type": {"type": "string", "enum": _WEBHOOK_EVENT_TYPES},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "retrying", "delivered", "failed"],
+                },
+                "attempts": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/OutboxAttempt"},
+                },
+                "next_attempt_at": {"type": "string", "nullable": True},
+                "created_at": {"type": "string"},
+                "payload": {"type": "object"},
+            },
+            "additionalProperties": False,
+        },
+        "OutboxList": {
+            "type": "object",
+            "required": ["items", "total", "limit", "offset"],
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/OutboxEntry"},
+                },
+                "total": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+        "ProcessOutboxResult": {
+            "type": "object",
+            "required": ["processed", "delivered", "retrying", "failed"],
+            "properties": {
+                "processed": {"type": "integer", "minimum": 0},
+                "delivered": {"type": "integer", "minimum": 0},
+                "retrying": {"type": "integer", "minimum": 0},
+                "failed": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": False,
+        },
+    }
+)

@@ -23,6 +23,56 @@ HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
 
 class OpenApiSchemaUnitTests(unittest.TestCase):
+    def test_outbox_routes_roles_schemas_and_error_responses_match_openapi(self):
+        spec = build_openapi(ROUTES, "outbox-drift")
+        expected_roles = {
+            ("post", "/webhooks"): "write",
+            ("get", "/webhooks"): "read",
+            ("get", "/webhooks/{id}"): "read",
+            ("patch", "/webhooks/{id}"): "write",
+            ("delete", "/webhooks/{id}"): "write",
+            ("get", "/outbox"): "read",
+            ("get", "/outbox/{id}"): "read",
+            ("post", "/outbox/process"): "admin",
+            ("post", "/outbox/{id}/requeue"): "write",
+            ("get", "/outbox/dispatcher"): "admin",
+            ("put", "/outbox/dispatcher"): "admin",
+        }
+        for (method, path), role in expected_roles.items():
+            with self.subTest(method=method, path=path):
+                operation = spec["paths"][path][method]
+                self.assertEqual(operation["x-required-role"], role)
+                self.assertEqual(operation["security"], [{"ApiKeyAuth": []}])
+                self.assertIn("403", operation["responses"])
+
+        for method, path in (
+            ("get", "/webhooks/{id}"),
+            ("patch", "/webhooks/{id}"),
+            ("delete", "/webhooks/{id}"),
+            ("get", "/outbox/{id}"),
+            ("post", "/outbox/{id}/requeue"),
+        ):
+            self.assertIn("400", spec["paths"][path][method]["responses"])
+        patch_webhook = spec["paths"]["/webhooks/{id}"]["patch"]
+        self.assertIn("413", patch_webhook["responses"])
+        self.assertIn("415", patch_webhook["responses"])
+        dispatcher = spec["paths"]["/outbox/dispatcher"]["put"]
+        dispatcher_schema = dispatcher["requestBody"]["content"]["application/json"][
+            "schema"
+        ]
+        dispatcher_response = spec["paths"]["/outbox/dispatcher"]["get"]["responses"][
+            "200"
+        ]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            dispatcher_response, {"$ref": "#/components/schemas/Dispatcher"}
+        )
+        self.assertEqual(dispatcher_schema["properties"]["enabled"]["default"], True)
+        self.assertEqual(
+            dispatcher_schema["properties"]["interval_ms"]["default"], 1000
+        )
+        self.assertNotIn("required", dispatcher_schema)
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+
     def test_audit_routes_document_admin_role_filters_and_schemas(self):
         spec = build_openapi(ROUTES, "audit-drift")
         listing = spec["paths"]["/audit"]["get"]

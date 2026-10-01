@@ -14,6 +14,8 @@ _IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
 _AUDIT_ENTRIES_NAME = "agent_qa_audit_entries"
 _AUDIT_DROPPED_NAME = "agent_qa_audit_dropped_total"
 _JOBS_NAME = "agent_qa_jobs"
+_OUTBOX_NAME = "agent_qa_outbox"
+_OUTBOX_DROPPED_NAME = "agent_qa_outbox_dropped_total"
 _JOB_STATUSES = (
     "queued",
     "running",
@@ -88,6 +90,8 @@ class MetricsRegistry:
         audit_entries: int | None = None,
         audit_dropped: int | None = None,
         job_statuses: dict[str, int] | None = None,
+        outbox_statuses: dict[str, int] | None = None,
+        outbox_dropped: int | None = None,
     ) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
@@ -193,6 +197,37 @@ class MetricsRegistry:
                     "Total audit entries dropped from the ring buffer.",
                     "counter",
                     [(_AUDIT_DROPPED_NAME, (), str(max(0, int(audit_dropped))))],
+                )
+            )
+        if outbox_statuses is not None:
+            families.append(
+                (
+                    _OUTBOX_NAME,
+                    "Current number of outbox entries by status.",
+                    "gauge",
+                    [
+                        (
+                            _OUTBOX_NAME,
+                            (("status", status),),
+                            str(max(0, int(outbox_statuses.get(status, 0)))),
+                        )
+                        for status in ("pending", "retrying", "delivered", "failed")
+                    ],
+                )
+            )
+        if outbox_dropped is not None:
+            families.append(
+                (
+                    _OUTBOX_DROPPED_NAME,
+                    "Total outbox entries dropped at capacity.",
+                    "counter",
+                    [
+                        (
+                            _OUTBOX_DROPPED_NAME,
+                            (),
+                            str(max(0, int(outbox_dropped))),
+                        )
+                    ],
                 )
             )
 

@@ -112,6 +112,16 @@ a write API key; job reads are public. Configure workers with
 `AGENT_QA_JOB_WORKERS` (1–3, default 2) and completed-job retention with
 `AGENT_QA_JOB_RETENTION` (10–1000, default 100).
 
+## Webhook outbox
+
+`POST /webhooks` registers a simulated destination on an `.invalid` host;
+`GET`, `PATCH`, and `DELETE /webhooks/{id}` manage subscriptions without
+returning the signing secret. Committed order and product changes create
+in-memory delivery records in `/outbox`. Admins can process due records with
+`POST /outbox/process` and configure the background dispatcher at
+`/outbox/dispatcher`; failed records can be requeued with
+`POST /outbox/{id}/requeue`.
+
 ## JSON schemas
 
 `GET /schemas` lists the registered schemas, `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks any JSON value and returns `{"valid":true,"errors":[]}` or its validation errors. The same named schemas appear under `components.schemas` in `GET /openapi.json`.

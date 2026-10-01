@@ -155,6 +155,23 @@ class MetricsRegistryTests(unittest.TestCase):
             rendered,
         )
 
+    def test_outbox_metrics_render_bounded_statuses_and_dropped_total(self):
+        registry = MetricsRegistry()
+        self.assertNotIn("agent_qa_outbox", registry.render(0, "test"))
+
+        rendered = registry.render(
+            0,
+            "test",
+            outbox_statuses={"pending": 2, "retrying": 1, "delivered": 5},
+            outbox_dropped=3,
+        )
+        self.assertIn('agent_qa_outbox{status="pending"} 2', rendered)
+        self.assertIn('agent_qa_outbox{status="retrying"} 1', rendered)
+        self.assertIn('agent_qa_outbox{status="delivered"} 5', rendered)
+        self.assertIn('agent_qa_outbox{status="failed"} 0', rendered)
+        self.assertEqual(rendered.count("agent_qa_outbox{status="), 4)
+        self.assertIn("agent_qa_outbox_dropped_total 3", rendered)
+
     def test_concurrent_recording_is_thread_safe(self):
         registry = MetricsRegistry()
         thread_count = 8
