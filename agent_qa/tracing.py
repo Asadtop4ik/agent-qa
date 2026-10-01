@@ -174,7 +174,7 @@ class TraceBuffer:
             not isinstance(route, str) or len(route) > 128 or "?" in route
         ):
             raise ValueError("invalid route filter")
-        if status is not None and (type(status) is not int or not 100 <= status <= 599):
+        if status is not None and type(status) is not int:
             raise ValueError("invalid status filter")
         if min_duration_ms is not None and (
             isinstance(min_duration_ms, bool)
