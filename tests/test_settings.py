@@ -93,6 +93,13 @@ class SettingsTests(unittest.TestCase):
             True,
         )
 
+    def test_trace_capacity_defaults_and_is_bounded(self):
+        self.assertEqual(settings.load({}).values["AGENT_QA_TRACE_CAPACITY"], 100)
+        for value in ("10", "1000"):
+            self.assertTrue(settings.load({"AGENT_QA_TRACE_CAPACITY": value}).valid)
+        for value in ("9", "1001", "9" * 100):
+            self.assertFalse(settings.load({"AGENT_QA_TRACE_CAPACITY": value}).valid)
+
     def test_boolean_spellings_are_case_insensitive(self):
         for value in ("true", "TRUE", "1", "yes", "Yes"):
             with self.subTest(value=value):

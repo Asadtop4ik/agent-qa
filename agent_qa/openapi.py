@@ -386,6 +386,10 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                         }
                     },
                 )
+        for response in operation["responses"].values():
+            headers = response.setdefault("headers", {})
+            headers["traceparent"] = {"$ref": "#/components/headers/Traceparent"}
+            headers["Server-Timing"] = {"$ref": "#/components/headers/ServerTiming"}
         paths.setdefault(path, {})[method] = operation
 
     return {
@@ -402,11 +406,26 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                 "Responses with bodies may be compressed with gzip when accepted "
                 "by Accept-Encoding and the body is at least 256 bytes. "
                 "Request Content-Encoding values other than identity are rejected "
-                "with 415 unsupported_content_encoding."
+                "with 415 unsupported_content_encoding. Every HTTP response "
+                "includes traceparent for W3C trace propagation and Server-Timing "
+                "for bounded server span durations."
             ),
         },
         "paths": paths,
         "components": {
+            "headers": {
+                "Traceparent": {
+                    "description": "W3C trace context for this request.",
+                    "schema": {
+                        "type": "string",
+                        "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-01$",
+                    },
+                },
+                "ServerTiming": {
+                    "description": "Server span durations in milliseconds.",
+                    "schema": {"type": "string"},
+                },
+            },
             "securitySchemes": {
                 "ApiKeyAuth": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
             },

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 
 
@@ -15,6 +16,7 @@ _TENANTS_NAME = "agent_qa_tenants"
 _BUILD_NAME = "agent_qa_build_info"
 _IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
 _RATE_LIMITED_NAME = "agent_qa_rate_limited_total"
+_SPAN_DURATION_NAME = "agent_qa_span_duration_seconds"
 _AUDIT_ENTRIES_NAME = "agent_qa_audit_entries"
 _AUDIT_DROPPED_NAME = "agent_qa_audit_dropped_total"
 _JOBS_NAME = "agent_qa_jobs"
@@ -60,6 +62,31 @@ class MetricsRegistry:
         self._durations: dict[tuple[str, str], tuple[float, int]] = {}
         self._idempotency: dict[str, int] = {}
         self._rate_limited: dict[str, int] = {}
+        self._span_durations: dict[str, tuple[float, int]] = {}
+
+    def record_span(self, name: str, duration_seconds: float) -> None:
+        """Record a span duration with a fixed, bounded name label."""
+        allowed = {
+            "http.request",
+            "route_match",
+            "rate_limit",
+            "auth",
+            "parse_body",
+            "validate",
+            "idempotency",
+            "handler",
+            "store",
+            "serialize",
+            "other",
+        }
+        if name not in allowed:
+            name = "other"
+        duration = float(duration_seconds)
+        if not math.isfinite(duration) or duration < 0:
+            raise ValueError("span duration must be finite and non-negative")
+        with self._lock:
+            duration_sum, duration_count = self._span_durations.get(name, (0.0, 0))
+            self._span_durations[name] = (duration_sum + duration, duration_count + 1)
 
     def record(
         self, method: str, route: str, status: int, duration_seconds: float
@@ -115,6 +142,7 @@ class MetricsRegistry:
             durations = self._durations.copy()
             idempotency = self._idempotency.copy()
             rate_limited = self._rate_limited.copy()
+            span_durations = self._span_durations.copy()
 
         families: list[tuple[str, str, str, list[MetricSample]]] = [
             (
@@ -184,6 +212,29 @@ class MetricsRegistry:
                     "Current number of products.",
                     "gauge",
                     [(_PRODUCTS_NAME, (), str(products))],
+                )
+            )
+        if span_durations:
+            families.append(
+                (
+                    _SPAN_DURATION_NAME,
+                    "Duration of completed request spans in seconds.",
+                    "summary",
+                    [
+                        (
+                            f"{_SPAN_DURATION_NAME}_{suffix}",
+                            (("span", name),),
+                            str(value),
+                        )
+                        for name, (
+                            duration_sum,
+                            duration_count,
+                        ) in span_durations.items()
+                        for suffix, value in (
+                            ("count", duration_count),
+                            ("sum", duration_sum),
+                        )
+                    ],
                 )
             )
         if tenant_orders is not None:

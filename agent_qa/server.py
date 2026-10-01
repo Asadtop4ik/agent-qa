@@ -41,6 +41,7 @@ from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
 from agent_qa.versioning import response_headers as version_headers
 from agent_qa.versioning import map_v2_error_body, sunset_reached
+from agent_qa.tracing import Trace
 
 LOGGER = logging.getLogger(__name__)
 IDEMPOTENCY_STORE = tenants.get("default").idempotency
@@ -175,8 +176,15 @@ def _problem_body(
 
 
 class Handler(BaseHTTPRequestHandler):
+    default_request_version = "HTTP/1.0"
+
     def handle_one_request(self) -> None:
         self.request_id = request_id(None)
+        self._trace = None
+        self.command = None
+        self.path = ""
+        self.request_version = self.default_request_version
+        self.headers = None
         set_context(RequestContext(request_id=self.request_id))
         self._request_started = perf_counter()
         self._response_recorded = False
@@ -193,7 +201,21 @@ class Handler(BaseHTTPRequestHandler):
     def parse_request(self) -> bool:
         parsed = super().parse_request()
         self._use_header_request_id()
+        self._ensure_trace()
         return parsed
+
+    def _ensure_trace(self) -> Trace:
+        context = get_context()
+        trace = getattr(context, "trace", None) or getattr(self, "_trace", None)
+        if trace is None:
+            trace = Trace(_joined_header(getattr(self, "headers", None), "traceparent"))
+        self._trace = trace
+        if context is not None:
+            context.trace = trace
+        return trace
+
+    def _span(self, name: str, **attrs: object):
+        return Handler._ensure_trace(self).span(name, **attrs)
 
     def _use_header_request_id(self) -> None:
         headers = getattr(self, "headers", None)
@@ -263,7 +285,8 @@ class Handler(BaseHTTPRequestHandler):
         elif content_type and isinstance(body, str):
             encoded = body.encode("utf-8")
         else:
-            encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            with Handler._span(self, "serialize"):
+                encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
         is_ready = instance == "/ready"
         if encoded and not is_ready:
             _merge_vary(response_headers, "Accept-Encoding")
@@ -281,6 +304,17 @@ class Handler(BaseHTTPRequestHandler):
                     if etag and not etag.startswith("W/"):
                         response_headers[etag_key] = f"W/{etag}"
         self._audit_response_body = body
+        trace = Handler._ensure_trace(self)
+        route = str(route_match[0]["path"]) if route_match[0] else "unmatched"
+        trace.finish(
+            request_id=getattr(self, "request_id", ""),
+            method=getattr(self, "command", "") or "",
+            route=route,
+            status=status,
+            record=not instance.startswith("/admin/traces"),
+        )
+        response_headers["traceparent"] = trace.traceparent
+        response_headers["Server-Timing"] = trace.server_timing()
         self._record_response(status)
         self.send_response(status)
         if not is_empty:
@@ -291,11 +325,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-Id", self.request_id)
+        self.send_header("traceparent", response_headers["traceparent"])
+        self.send_header("Server-Timing", response_headers["Server-Timing"])
         for name, value in response_headers.items():
             if name.lower() not in {
                 "content-length",
                 "content-type",
                 "x-request-id",
+                "traceparent",
+                "server-timing",
             }:
                 self.send_header(name, value)
         self.end_headers()
@@ -355,6 +393,8 @@ class Handler(BaseHTTPRequestHandler):
             del self._audit_replay
         duration = perf_counter() - self._request_started
         REGISTRY.record(method, route, status, duration)
+        context = get_context()
+        trace = getattr(context, "trace", None) or getattr(self, "_trace", None)
         write_access_log(
             method,
             path,
@@ -362,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
             status,
             duration,
             getattr(self, "request_id", ""),
+            getattr(trace, "trace_id", ""),
         )
 
     def _not_found(self) -> None:
@@ -501,7 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(
                 400, "invalid_request_target", "Request target is invalid"
             ) from error
-        matches = _path_routes(parsed.path)
+        with Handler._span(self, "route_match"):
+            matches = _path_routes(parsed.path)
         if not matches:
             self._not_found()
             return
@@ -607,7 +649,8 @@ class Handler(BaseHTTPRequestHandler):
             or route.get("rate_limited", True)
         )
         if needs_authentication:
-            identity = authenticate_api_key(self.headers)
+            with Handler._span(self, "auth"):
+                identity = authenticate_api_key(self.headers)
         if context is not None and identity is not None:
             context.actor = identity.get("key_id", "anonymous")
             context.role = identity.get("role")
@@ -625,7 +668,8 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     rate_ip = "unknown"
                 rate_kind, rate_identity = "ip", f"ip:{rate_ip}"
-            rate_decision = RATE_LIMITER.consume(rate_identity, rate_kind)
+            with Handler._span(self, "rate_limit"):
+                rate_decision = RATE_LIMITER.consume(rate_identity, rate_kind)
             self._rate_headers = {
                 "RateLimit-Limit": str(rate_decision.limit),
                 "RateLimit-Remaining": str(rate_decision.remaining),
@@ -699,15 +743,15 @@ class Handler(BaseHTTPRequestHandler):
                     "Idempotency-Key must be 1-64 permitted characters",
                 )
         query = parse_qsl(parsed.query, keep_blank_values=True)
-        payload = (
-            self._read_request_body(
-                consumes=route.get("consumes", ["application/json"]),
-                require_object=route.get("json_object_only", True),
-                max_body_bytes=route.get("max_body_bytes", 4096),
-            )
-            if route.get("body")
-            else None
-        )
+        if route.get("body"):
+            with Handler._span(self, "parse_body"):
+                payload = self._read_request_body(
+                    consumes=route.get("consumes", ["application/json"]),
+                    require_object=route.get("json_object_only", True),
+                    max_body_bytes=route.get("max_body_bytes", 4096),
+                )
+        else:
+            payload = None
         if route.get("tenant_scoped") and self.command in {
             "POST",
             "PUT",
@@ -735,9 +779,10 @@ class Handler(BaseHTTPRequestHandler):
                 parsed.path,
                 idempotency_key,
             )
-            decision = _idempotency_store().begin(
-                idempotency_scope, payload_fingerprint
-            )
+            with Handler._span(self, "idempotency"):
+                decision = _idempotency_store().begin(
+                    idempotency_scope, payload_fingerprint
+                )
             if decision.kind == "replay":
                 REGISTRY.record_idempotency("replayed")
                 assert decision.response is not None
@@ -769,7 +814,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             schema = route.get("request_schema")
             if schema is not None:
-                errors = validate(schema, payload)
+                with Handler._span(self, "validate"):
+                    errors = validate(schema, payload)
                 if errors:
                     if route.get("sanitize_validation_errors"):
                         errors = [{"field": "body", "message": "Invalid request body"}]
@@ -777,21 +823,24 @@ class Handler(BaseHTTPRequestHandler):
                         400, "validation_error", "Request validation failed", errors
                     )
             conditional_headers = route.get("conditional_headers")
-            if conditional_headers:
-                request_headers = {}
-                for name in conditional_headers:
-                    values = self.headers.get_all(name, [])
-                    if values:
-                        request_headers[name] = ", ".join(values)
-                status, body, headers = route["handler"](
-                    query, path_params, payload, request_headers=request_headers
-                )
-            elif route.get("pass_identity"):
-                status, body, headers = route["handler"](
-                    query, path_params, payload, identity=identity
-                )
-            else:
-                status, body, headers = route["handler"](query, path_params, payload)
+            with Handler._span(self, "handler", route=str(route["path"])):
+                if conditional_headers:
+                    request_headers = {}
+                    for name in conditional_headers:
+                        values = self.headers.get_all(name, [])
+                        if values:
+                            request_headers[name] = ", ".join(values)
+                    status, body, headers = route["handler"](
+                        query, path_params, payload, request_headers=request_headers
+                    )
+                elif route.get("pass_identity"):
+                    status, body, headers = route["handler"](
+                        query, path_params, payload, identity=identity
+                    )
+                else:
+                    status, body, headers = route["handler"](
+                        query, path_params, payload
+                    )
         except Exception:
             if idempotency_scope is not None:
                 _idempotency_store().abort(idempotency_scope)

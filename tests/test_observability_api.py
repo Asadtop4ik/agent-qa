@@ -144,6 +144,7 @@ class ObservabilityApiTests(unittest.TestCase):
             "status",
             "duration_ms",
             "request_id",
+            "trace_id",
         }
         for entry in logs:
             self.assertEqual(set(entry), expected_keys)
@@ -151,6 +152,7 @@ class ObservabilityApiTests(unittest.TestCase):
             self.assertIsInstance(entry["status"], int)
             self.assertIsInstance(entry["duration_ms"], float)
             self.assertTrue(entry["request_id"])
+            self.assertRegex(entry["trace_id"], r"^[0-9a-f]{32}$")
         self.assertTrue(any(entry["path"] == "/ready" for entry in logs))
         self.assertTrue(
             any(

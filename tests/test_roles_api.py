@@ -126,6 +126,7 @@ class RoleApiTests(unittest.TestCase):
                         "/admin/tenants",
                         "/admin/rate-limits",
                         "/admin/config",
+                        "/admin/traces",
                         "/audit",
                     )
                 ):

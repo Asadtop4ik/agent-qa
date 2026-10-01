@@ -139,6 +139,23 @@ class MetricsRegistryTests(unittest.TestCase):
         self.assertIn("# TYPE agent_qa_products gauge\n", rendered)
         self.assertIn("agent_qa_products 0\n", rendered)
 
+    def test_span_duration_metric_is_lazy_and_uses_bounded_name_labels(self):
+        registry = MetricsRegistry()
+        self.assertNotIn("agent_qa_span_duration_seconds", registry.render(0, "test"))
+        registry.record_span("handler", 0.25)
+        registry.record_span("unbounded-client-name", 0.5)
+        rendered = registry.render(0, "test")
+        self.assertIn(
+            "# HELP agent_qa_span_duration_seconds Duration of completed request "
+            "spans in seconds.\n"
+            "# TYPE agent_qa_span_duration_seconds summary\n"
+            'agent_qa_span_duration_seconds_count{span="handler"} 1\n'
+            'agent_qa_span_duration_seconds_count{span="other"} 1\n'
+            'agent_qa_span_duration_seconds_sum{span="handler"} 0.25\n'
+            'agent_qa_span_duration_seconds_sum{span="other"} 0.5\n',
+            rendered,
+        )
+
     def test_tenant_gauges_and_total_order_gauge_render_bounded_labels(self):
         rendered = MetricsRegistry().render(
             4,
