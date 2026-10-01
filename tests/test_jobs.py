@@ -179,6 +179,55 @@ class JobRunnerTests(unittest.TestCase):
         self.assertTrue(all(thread.daemon for thread in runner._threads))
         runner.stop(1)
 
+    def test_timed_out_stop_recovers_after_all_workers_finish(self):
+        for recovery in ("submit", "start"):
+            with self.subTest(recovery=recovery):
+                started = [threading.Event(), threading.Event()]
+                release = [threading.Event(), threading.Event()]
+                worker_threads = {}
+
+                def handler(params, _progress, _cancel):
+                    worker = params["duration_ms"]
+                    if worker == 2:
+                        return {"recovered": True}
+                    worker_threads[worker] = threading.current_thread()
+                    started[worker].set()
+                    release[worker].wait(2)
+                    return None
+
+                runner = self.make_runner({"sleep": handler}, workers=2)
+                for event in release:
+                    self.addCleanup(event.set)
+                for worker in range(2):
+                    runner.submit("sleep", {"duration_ms": worker})
+                for event in started:
+                    self.assertTrue(event.wait(1))
+
+                runner.stop(0)
+                with self.assertRaises(ApiError) as error:
+                    runner.submit("sleep", {"duration_ms": 2})
+                self.assertEqual(error.exception.status, 503)
+
+                release[0].set()
+                worker_threads[0].join(1)
+                self.assertFalse(worker_threads[0].is_alive())
+                self.assertTrue(worker_threads[1].is_alive())
+                with self.assertRaises(ApiError) as error:
+                    runner.submit("sleep", {"duration_ms": 2})
+                self.assertEqual(error.exception.status, 503)
+
+                release[1].set()
+                worker_threads[1].join(1)
+                self.assertFalse(worker_threads[1].is_alive())
+
+                if recovery == "start":
+                    runner.start()
+                recovered = runner.submit("sleep", {"duration_ms": 2})
+                self.assertEqual(
+                    runner.get(recovered["id"], 1000)["result"],
+                    {"recovered": True},
+                )
+
     def test_progress_result_isolated_and_sleep_zero_succeeds(self):
         started = threading.Event()
         release = threading.Event()

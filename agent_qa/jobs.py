@@ -365,6 +365,11 @@ class JobRunner:
                 while not self._queue and not self._stopping:
                     self._condition.wait()
                 if self._stopping:
+                    self._threads.remove(threading.current_thread())
+                    if not self._threads:
+                        self._started = False
+                        self._stopping = False
+                    self._condition.notify_all()
                     return
                 job_id = self._queue.popleft()
                 job = self._jobs.get(job_id)
