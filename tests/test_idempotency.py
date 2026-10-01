@@ -403,6 +403,7 @@ class IdempotencyApiTests(unittest.TestCase):
             "handler": sometimes_fails,
             "body": True,
             "auth_required": True,
+            "rate_limited": False,
             "idempotent": True,
         }
         with patch("agent_qa.server.ROUTES", (route,)):
@@ -463,6 +464,7 @@ class IdempotencyApiTests(unittest.TestCase):
             "handler": create,
             "body": True,
             "auth_required": True,
+            "rate_limited": False,
             "idempotent": True,
         }
         with patch("agent_qa.server.ROUTES", (route,)):
@@ -516,6 +518,7 @@ class IdempotencyApiTests(unittest.TestCase):
             "handler": raises_before_success,
             "body": True,
             "auth_required": True,
+            "rate_limited": False,
             "idempotent": True,
         }
         with patch("agent_qa.server.ROUTES", (route,)):
@@ -552,6 +555,7 @@ class IdempotencyApiTests(unittest.TestCase):
             "handler": blocking_create,
             "body": True,
             "auth_required": True,
+            "rate_limited": False,
             "idempotent": True,
         }
         first_response = []

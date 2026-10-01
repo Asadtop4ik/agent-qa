@@ -550,6 +550,64 @@ class RouteUnitTests(unittest.TestCase):
             False,
         )
 
+    def test_rate_limit_admin_routes_read_set_delete_and_validate_identity(self):
+        from agent_qa.routes import delete_rate_limit, list_rate_limits, put_rate_limit
+
+        rate_route = next(
+            route for route in ROUTES if route["path"] == "/admin/rate-limits"
+        )
+        self.assertEqual(rate_route["role"], "admin")
+        self.assertFalse(rate_route["rate_limited"])
+        snapshot = {
+            "default": {"burst": 120, "refill_per_second": 60.0},
+            "overrides": {},
+            "buckets": 0,
+        }
+        with patch("agent_qa.routes.RATE_LIMITER") as limiter:
+            limiter.snapshot.return_value = snapshot
+            self.assertEqual(list_rate_limits([]), (200, snapshot, {}))
+            self.assertEqual(
+                put_rate_limit(
+                    [],
+                    {"identity": "client:worker-1"},
+                    {"burst": 3, "refill_per_second": 0.5},
+                ),
+                (
+                    200,
+                    {
+                        "identity": "client:worker-1",
+                        "burst": 3,
+                        "refill_per_second": 0.5,
+                    },
+                    {},
+                ),
+            )
+            limiter.set_override.assert_called_once_with("client:worker-1", 3, 0.5)
+            limiter.delete_override.return_value = True
+            self.assertEqual(
+                delete_rate_limit([], {"identity": "client:worker-1"}),
+                (204, None, {}),
+            )
+
+            for identity in ("", "client:", "user:someone", "client:" + "x" * 65):
+                with (
+                    self.subTest(identity=identity),
+                    self.assertRaises(ApiError) as error,
+                ):
+                    put_rate_limit(
+                        [],
+                        {"identity": identity},
+                        {"burst": 1, "refill_per_second": 1},
+                    )
+                self.assertEqual(error.exception.status, 400)
+                self.assertEqual(error.exception.details[0]["field"], "identity")
+
+            limiter.delete_override.return_value = False
+            with self.assertRaises(ApiError) as error:
+                delete_rate_limit([], {"identity": "key:sample"})
+            self.assertEqual(error.exception.status, 404)
+            self.assertEqual(error.exception.code, "override_not_found")
+
     @staticmethod
     def make_dispatcher(path, body, method="POST", content_type="application/json"):
         from agent_qa.server import Handler

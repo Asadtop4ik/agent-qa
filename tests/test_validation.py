@@ -94,6 +94,35 @@ class SchemaValidationTests(unittest.TestCase):
             ],
         )
 
+    def test_number_validation_rejects_nonfinite_and_huge_bounded_values(self):
+        import math
+
+        schema = {"type": "number", "minimum": 0.001, "maximum": 10000}
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    validate(schema, value),
+                    [{"field": "body", "message": "Must be a number"}],
+                )
+        self.assertEqual(
+            validate(schema, 10**1000),
+            [{"field": "body", "message": "Must be between 0.001 and 10000"}],
+        )
+
+    def test_rate_limit_override_schema_bounds_burst_and_refill(self):
+        from agent_qa.schemas import SCHEMAS
+
+        schema = SCHEMAS["RateLimitOverrideRequest"]
+        for payload, field in (
+            ({"burst": True, "refill_per_second": 1}, "burst"),
+            ({"burst": 10**1000, "refill_per_second": 1}, "burst"),
+            ({"burst": 1, "refill_per_second": False}, "refill_per_second"),
+            ({"burst": 1, "refill_per_second": 10**1000}, "refill_per_second"),
+        ):
+            with self.subTest(field=field, payload=payload):
+                errors = validate(schema, payload)
+                self.assertEqual([error["field"] for error in errors], [field])
+
     def test_nullable_type_accepts_null_and_non_nullable_type_rejects_it(self):
         schema = {
             "type": "object",
