@@ -1478,11 +1478,12 @@ def _trace_filters(query: list[tuple[str, str]]) -> dict[str, object]:
         filters["route"] = route
     if "status" in values:
         raw = values["status"]
-        if not raw.isascii() or not raw.isdigit() or len(raw) > 3:
+        if not raw.isascii() or not re.fullmatch(r"[+-]?[0-9]+", raw):
             raise ApiError(400, "invalid_query", "Invalid trace query")
-        status_code = int(raw)
-        if not 100 <= status_code <= 599:
-            raise ApiError(400, "invalid_query", "Invalid trace query")
+        try:
+            status_code = int(raw)
+        except ValueError as error:
+            raise ApiError(400, "invalid_query", "Invalid trace query") from error
         filters["status"] = status_code
     if "min_duration_ms" in values:
         raw = values["min_duration_ms"]
@@ -1494,7 +1495,7 @@ def _trace_filters(query: list[tuple[str, str]]) -> dict[str, object]:
             minimum = float(raw)
         except ValueError as error:
             raise ApiError(400, "invalid_query", "Invalid trace query") from error
-        if not math.isfinite(minimum) or not 0 <= minimum <= 1_000_000_000:
+        if not math.isfinite(minimum) or minimum < 0:
             raise ApiError(400, "invalid_query", "Invalid trace query")
         filters["min_duration_ms"] = minimum
     if "limit" in values:
@@ -4164,7 +4165,7 @@ ROUTES = (
                 "name": "status",
                 "in": "query",
                 "required": False,
-                "schema": {"type": "integer", "minimum": 100, "maximum": 599},
+                "schema": {"type": "integer"},
             },
             {
                 "name": "min_duration_ms",
@@ -4173,7 +4174,6 @@ ROUTES = (
                 "schema": {
                     "type": "number",
                     "minimum": 0,
-                    "maximum": 1_000_000_000,
                 },
             },
             {

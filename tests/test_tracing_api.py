@@ -136,6 +136,7 @@ class TracingApiTests(unittest.TestCase):
             "limit=1&limit=2",
             "status=200.1",
             "min_duration_ms=NaN",
+            "min_duration_ms=-1",
             "unknown=x",
         ):
             with self.subTest(query=query):
@@ -173,6 +174,25 @@ class TracingApiTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["error"]["code"], "forbidden")
         self.assertIn("traceparent", headers)
         self.assertIn("Server-Timing", headers)
+
+    def test_trace_filters_accept_unbounded_integers_and_nonnegative_durations(self):
+        admin = {"X-API-Key": ADMIN_KEY}
+        for query, expect_empty in (
+            ("status=-1", True),
+            ("status=0", True),
+            ("status=600", True),
+            ("status=1000", True),
+            ("min_duration_ms=0", False),
+            ("min_duration_ms=1000000000", True),
+            ("min_duration_ms=1000000001", True),
+        ):
+            with self.subTest(query=query):
+                status, _, body = self.request("GET", f"/admin/traces?{query}", admin)
+                self.assertEqual(status, 200)
+                result = json.loads(body)
+                self.assertEqual(len(result["items"]), result["total_matching"])
+                if expect_empty:
+                    self.assertEqual(result["items"], [])
 
     def test_invalid_parent_starts_trace_and_not_modified_response_has_headers(self):
         status, headers, _ = self.request("GET", "/health", {"traceparent": "bad"})
