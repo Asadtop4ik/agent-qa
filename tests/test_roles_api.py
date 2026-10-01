@@ -57,6 +57,15 @@ class Harness:
     def _record_response(self, status):
         Handler._record_response(self, status)
 
+    def _merge_vary(self, current, value):
+        return Handler._merge_vary(current, value)
+
+    def _header_values(self, name):
+        return Handler._header_values(self, name)
+
+    def _error_representation(self, status, body):
+        return Handler._error_representation(self, status, body)
+
     def _not_found(self):
         self._json(404, {"error": {"code": "not_found"}})
 

@@ -577,7 +577,11 @@ class ProductApiTests(unittest.TestCase):
         from agent_qa.schemas import SCHEMAS
 
         document = build_openapi(ROUTES, "products-test")
-        self.assertEqual(document["components"]["schemas"], SCHEMAS)
+        openapi_schemas = document["components"]["schemas"]
+        self.assertEqual(set(openapi_schemas), {*SCHEMAS, "Problem"})
+        self.assertEqual({name: openapi_schemas[name] for name in SCHEMAS}, SCHEMAS)
+        self.assertEqual(openapi_schemas["Problem"]["type"], "object")
+        self.assertIn("status", openapi_schemas["Problem"]["required"])
         paths = document["paths"]
         for path, method in (
             ("/products", "post"),
@@ -603,6 +607,7 @@ class ProductApiTests(unittest.TestCase):
                 "401",
                 "403",
                 "404",
+                "406",
                 "409",
                 "411",
                 "412",
