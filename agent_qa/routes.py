@@ -1,5 +1,6 @@
 """Pure route handlers for the agent QA HTTP service."""
 
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -27,8 +28,17 @@ from agent_qa.schemas import (
     PRODUCT_SORTS,
     SCHEMAS,
 )
+from agent_qa.searchdsl import (
+    FIELD_METADATA,
+    compile_predicate,
+    count_terms,
+    normalize,
+    parse,
+    supported_operators,
+)
 from agent_qa.validation import validate, validate_query_params
 from agent_qa.orders import (
+    OrderError,
     OrderStore,
     validate_create,
     validate_patch,
@@ -594,6 +604,212 @@ def list_products(
     if _if_none_match(request_headers, etag):
         return 304, None, headers
     return 200, body, headers
+
+
+_SEARCH_SORTS = {"orders": ("id", "-id"), "products": PRODUCT_SORTS}
+_SEARCH_QUERY_PARAMETERS = frozenset(("q", "sort", "limit", "offset"))
+_EXPLAIN_QUERY_PARAMETERS = frozenset(("resource", "q"))
+
+
+def _search_parameters(resource: str) -> list[dict[str, object]]:
+    sort_values = list(_SEARCH_SORTS[resource])
+    return [
+        {
+            "name": "q",
+            "in": "query",
+            "required": True,
+            "description": _search_expression_description(resource),
+            "schema": {"type": "string", "maxLength": 500},
+        },
+        {
+            "name": "sort",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string", "enum": sort_values, "default": "id"},
+        },
+        {
+            "name": "limit",
+            "in": "query",
+            "required": False,
+            "schema": {
+                "type": "integer",
+                "minimum": MIN_LIMIT,
+                "maximum": MAX_LIMIT,
+                "default": DEFAULT_LIMIT,
+            },
+        },
+        {
+            "name": "offset",
+            "in": "query",
+            "required": False,
+            "schema": {
+                "type": "integer",
+                "minimum": MIN_OFFSET,
+                "maximum": (1 << 63) - 1,
+                "default": DEFAULT_OFFSET,
+            },
+        },
+    ]
+
+
+def _search_field_descriptions(resource: str) -> list[str]:
+    field_descriptions = []
+    for field, metadata in FIELD_METADATA[resource].items():
+        description = f"{field} ({metadata['type']})"
+        if metadata.get("multi"):
+            description += "; matches any value"
+        if "enum" in metadata:
+            description += f" values {', '.join(metadata['enum'])}"
+        operators = (
+            operator.upper() if operator == "in" else operator
+            for operator in supported_operators(metadata)
+        )
+        description += "; operators " + ", ".join(operators)
+        field_descriptions.append(description)
+    return field_descriptions
+
+
+def _search_expression_description(resource: str) -> str:
+    fields = "; ".join(_search_field_descriptions(resource))
+    return (
+        f"Search expression for {resource}, at most 500 characters. Fields: {fields}."
+    )
+
+
+def _search_response_schema(resource: str) -> dict[str, object]:
+    schema = deepcopy(SCHEMAS["SearchResult"])
+    item_name = "Order" if resource == "orders" else "Product"
+    schema["properties"]["items"]["items"] = {
+        "$ref": f"#/components/schemas/{item_name}"
+    }
+    return schema
+
+
+def _search_explain_schema() -> dict[str, object]:
+    schema = deepcopy(SCHEMAS["SearchExplain"])
+    schema["properties"]["resource"]["enum"] = list(FIELD_METADATA)
+    return schema
+
+
+def _search_query(query: object, allowed: frozenset[str]) -> dict[str, str]:
+    """Validate the small, bounded query string accepted by search routes."""
+    if not isinstance(query, (list, tuple)):
+        message = "Invalid query parameters"
+        raise ApiError(
+            400, "invalid_query", message, [{"field": "q", "message": message}]
+        )
+    if len(query) > len(allowed):
+        message = "Too many query parameters"
+        raise ApiError(
+            400, "invalid_query", message, [{"field": "q", "message": message}]
+        )
+    values: dict[str, str] = {}
+    for pair in query:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            message = "Invalid query parameter"
+            raise ApiError(
+                400, "invalid_query", message, [{"field": "q", "message": message}]
+            )
+        name, value = pair
+        if not isinstance(name, str) or not isinstance(value, str):
+            message = "Invalid query parameter"
+            raise ApiError(
+                400, "invalid_query", message, [{"field": "q", "message": message}]
+            )
+        if len(name) > 20 or (name != "q" and len(value) > 500):
+            message = "Invalid query parameter"
+            raise ApiError(
+                400, "invalid_query", message, [{"field": "q", "message": message}]
+            )
+        if name not in allowed:
+            message = f"Unsupported query parameter: {name}"
+            raise ApiError(
+                400, "invalid_query", message, [{"field": "q", "message": message}]
+            )
+        if name in values:
+            message = f"The {name} parameter may appear once"
+            raise ApiError(
+                400, "invalid_query", message, [{"field": "q", "message": message}]
+            )
+        values[name] = value
+    if "q" not in values:
+        message = "The q parameter is required"
+        raise ApiError(
+            400, "invalid_query", message, [{"field": "q", "message": message}]
+        )
+    return values
+
+
+def _search_page(values: dict[str, str], resource: str) -> tuple[str, int, int]:
+    query = [
+        (name, values[name]) for name in ("sort", "limit", "offset") if name in values
+    ]
+    if resource == "orders":
+        try:
+            filters = validate_query(query)
+        except OrderError as error:
+            raise ApiError(400, error.code, error.message, error.details) from error
+    else:
+        filters = validate_product_query(query)
+    return filters["sort"], filters["limit"], filters["offset"]
+
+
+def _search(
+    query: list[tuple[str, str]], resource: str
+) -> tuple[int, object, dict[str, str]]:
+    values = _search_query(query, _SEARCH_QUERY_PARAMETERS)
+    ast = parse(values["q"], resource)
+    sort, limit, offset = _search_page(values, resource)
+    store = ORDER_STORE if resource == "orders" else PRODUCT_STORE
+    items, total = store.search(
+        compile_predicate(ast, resource), sort=sort, limit=limit, offset=offset
+    )
+    return (
+        200,
+        {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "query": {"normalized": normalize(ast), "terms": count_terms(ast)},
+        },
+        {},
+    )
+
+
+def search_orders(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Search orders using the public query DSL."""
+    return _search(query, "orders")
+
+
+def search_products(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Search products using the public query DSL."""
+    return _search(query, "products")
+
+
+def search_explain(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the deterministic parsed form of a search query."""
+    values = _search_query(query, _EXPLAIN_QUERY_PARAMETERS)
+    resource = values.get("resource", "")
+    if resource not in ("orders", "products"):
+        message = "resource must be orders or products"
+        raise ApiError(
+            400, "invalid_query", message, [{"field": "q", "message": message}]
+        )
+    ast = parse(values["q"], resource)
+    return 200, {"resource": resource, "normalized": normalize(ast), "ast": ast}, {}
 
 
 def _product_id(path_params: dict[str, str] | None) -> int | None:
@@ -1609,6 +1825,44 @@ ROUTES = (
     },
     {
         "method": "GET",
+        "path": "/search/explain",
+        "handler": search_explain,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "explainSearch",
+        "summary": "Parse and normalize a search query",
+        "parameters": [
+            {
+                "name": "resource",
+                "in": "query",
+                "required": True,
+                "schema": {"type": "string", "enum": list(FIELD_METADATA)},
+            },
+            {
+                "name": "q",
+                "in": "query",
+                "required": True,
+                "description": (
+                    "Search expression, at most 500 characters. "
+                    + " ".join(
+                        _search_expression_description(resource)
+                        for resource in FIELD_METADATA
+                    )
+                ),
+                "schema": {"type": "string", "maxLength": 500},
+            },
+        ],
+        "responses": ["200", "400", "403"],
+        "response_schemas": {"200": _search_explain_schema()},
+        "error_responses": {
+            "400": (
+                "Invalid parameters (invalid_query) or search syntax "
+                "(invalid_search_query, with details.position)."
+            )
+        },
+    },
+    {
+        "method": "GET",
         "path": "/orders",
         "handler": list_orders,
         "role": None,
@@ -1703,6 +1957,24 @@ ROUTES = (
                     "schema": {"type": "string"},
                 }
             }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/orders/search",
+        "handler": search_orders,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "searchOrders",
+        "summary": "Search orders using the query DSL",
+        "parameters": _search_parameters("orders"),
+        "responses": ["200", "400", "403"],
+        "response_schemas": {"200": _search_response_schema("orders")},
+        "error_responses": {
+            "400": (
+                "Invalid parameters (invalid_query) or search syntax "
+                "(invalid_search_query, with details.position)."
+            )
         },
     },
     {
@@ -1801,6 +2073,24 @@ ROUTES = (
         ],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
         "conditional_headers": ["If-Match"],
+    },
+    {
+        "method": "GET",
+        "path": "/products/search",
+        "handler": search_products,
+        "role": None,
+        "auth_required": False,
+        "operation_id": "searchProducts",
+        "summary": "Search products using the query DSL",
+        "parameters": _search_parameters("products"),
+        "responses": ["200", "400", "403"],
+        "response_schemas": {"200": _search_response_schema("products")},
+        "error_responses": {
+            "400": (
+                "Invalid parameters (invalid_query) or search syntax "
+                "(invalid_search_query, with details.position)."
+            )
+        },
     },
     {
         "method": "POST",

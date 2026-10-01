@@ -600,6 +600,40 @@ SCHEMAS = {
         },
         "additionalProperties": False,
     },
+    "SearchResult": {
+        "type": "object",
+        "required": ["items", "total", "limit", "offset", "query"],
+        "properties": {
+            "items": {"type": "array", "items": {"type": "object"}},
+            "total": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
+            "offset": {
+                "type": "integer",
+                "minimum": MIN_OFFSET,
+                "maximum": (1 << 63) - 1,
+            },
+            "query": {
+                "type": "object",
+                "required": ["normalized", "terms"],
+                "properties": {
+                    "normalized": {"type": "string"},
+                    "terms": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "additionalProperties": False,
+            },
+        },
+        "additionalProperties": False,
+    },
+    "SearchExplain": {
+        "type": "object",
+        "required": ["resource", "normalized", "ast"],
+        "properties": {
+            "resource": {"type": "string"},
+            "normalized": {"type": "string"},
+            "ast": {"type": "object"},
+        },
+        "additionalProperties": False,
+    },
     "Error": {
         "type": "object",
         "required": ["error"],
@@ -619,6 +653,10 @@ SCHEMAS = {
                             "properties": {
                                 "field": {"type": "string"},
                                 "message": {"type": "string"},
+                                "position": {
+                                    "type": "string",
+                                    "pattern": "^[0-9]+$",
+                                },
                             },
                             "additionalProperties": False,
                         },

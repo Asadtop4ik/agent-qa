@@ -598,6 +598,52 @@ class ProductStore:
         for product_id, product in snapshot.items():
             self._products[product_id] = product
 
+    def search(
+        self,
+        predicate: Any,
+        *,
+        sort: str = "id",
+        limit: int = DEFAULT_LIMIT,
+        offset: int = DEFAULT_OFFSET,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Return one filtered product snapshot using offset pagination."""
+        if not callable(predicate):
+            raise _invalid_store_query("q")
+        if not isinstance(sort, str) or sort not in PRODUCT_SORTS:
+            raise _invalid_query(
+                [{"field": "sort", "message": "Unsupported sort order"}]
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not MIN_LIMIT <= limit <= MAX_LIMIT
+        ):
+            raise _invalid_store_query("limit")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not MIN_OFFSET <= offset <= (1 << 63) - 1
+        ):
+            raise _invalid_store_query("offset")
+        descending = sort.startswith("-")
+        field = sort.lstrip("-")
+        with self._lock:
+            matched = [
+                product for product in self._products.values() if predicate(product)
+            ]
+            if field == "id":
+                matched.sort(key=lambda product: product["id"], reverse=descending)
+            else:
+                matched.sort(key=lambda product: product["id"])
+                matched.sort(key=lambda product: product[field], reverse=descending)
+            return (
+                [
+                    _copy_product(product)
+                    for product in matched[offset : offset + limit]
+                ],
+                len(matched),
+            )
+
     def list(
         self, **query: Any
     ) -> (

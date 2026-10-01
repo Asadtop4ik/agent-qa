@@ -7,13 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from io import BytesIO
 from unittest.mock import patch
+from urllib.parse import quote
 
 from agent_qa import schemas
 from agent_qa.errors import ApiError
 from agent_qa.openapi import build_openapi
 from agent_qa.products import ProductStore
 from agent_qa.config import GIT_SHA
-from agent_qa.routes import ROUTES
+from agent_qa.routes import ROUTES, search_products
 from agent_qa.server import Handler, allowed_methods
 
 
@@ -93,6 +94,7 @@ class ProductApiTests(unittest.TestCase):
             ("POST", "/products"),
             ("POST", "/products/bulk"),
             ("GET", "/products"),
+            ("GET", "/products/search"),
             ("GET", "/products/{id}"),
             ("PATCH", "/products/{id}"),
             ("DELETE", "/products/{id}"),
@@ -148,6 +150,143 @@ class ProductApiTests(unittest.TestCase):
         self.assertEqual(allowed_methods("/products"), "GET, POST")
         self.assertEqual(allowed_methods("/products/1"), "DELETE, GET, PATCH")
         self.assertEqual(allowed_methods("/products/1/adjust-stock"), "POST")
+
+    def test_search_returns_filtered_offset_page_and_query_summary(self):
+        self.create("SKU-1", name="Widget")
+        self.create("SKU-2", name="Gadget", active=False)
+        status, body, _ = self.dispatch(
+            "GET", "/products/search?q=active%3Dtrue&sort=-id&limit=1&offset=0"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {"items", "total", "limit", "offset", "query"})
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["limit"], 1)
+        self.assertEqual(body["offset"], 0)
+        self.assertEqual(body["items"][0]["sku"], "SKU-1")
+        self.assertEqual(body["query"], {"normalized": "active = true", "terms": 1})
+
+    def test_search_operators_compounds_date_and_offset_sorting(self):
+        self.create("SKU-1", name="Widget", price_cents=1000, tags=["featured"])
+        self.create(
+            "SKU-2",
+            name="Gadget",
+            category="books",
+            active=False,
+            price_cents=2000,
+            tags=["clearance"],
+        )
+        self.create(
+            "SKU-3",
+            name="Book",
+            category="books",
+            price_cents=2000,
+            tags=["featured"],
+        )
+        cases = (
+            ("price_cents:1000", {"SKU-1"}),
+            ("price_cents!=1000", {"SKU-2", "SKU-3"}),
+            ("price_cents>1000", {"SKU-2", "SKU-3"}),
+            ("price_cents>=2000", {"SKU-2", "SKU-3"}),
+            ("price_cents<2000", {"SKU-1"}),
+            ("price_cents<=1000", {"SKU-1"}),
+            ("name~wid", {"SKU-1"}),
+            ("tags IN (featured, clearance)", {"SKU-1", "SKU-2", "SKU-3"}),
+            (
+                "active=true AND (category:tools OR category:books) NOT active=false",
+                {"SKU-1", "SKU-3"},
+            ),
+        )
+        for expression, expected_skus in cases:
+            with self.subTest(expression=expression):
+                status, body, _ = self.dispatch(
+                    "GET", "/products/search?q=" + quote(expression, safe="")
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual({item["sku"] for item in body["items"]}, expected_skus)
+
+        date = min(item["created_at"][:10] for item in self.store.list()[0])
+        status, body, _ = self.dispatch(
+            "GET", f"/products/search?q=created_at%3E%3D{date}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["total"], 3)
+        status, page, _ = self.dispatch(
+            "GET", "/products/search?q=price_cents%3D2000&sort=-price_cents&offset=1"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(page["items"][0]["sku"], "SKU-3")
+
+    def test_search_rejects_unknown_duplicate_missing_and_malformed_query(self):
+        for path, code, field in (
+            ("/products/search?unknown=x&q=id%3D1", "invalid_query", "q"),
+            ("/products/search?q=id%3D1&q=id%3D2", "invalid_query", "q"),
+            ("/products/search", "invalid_query", "q"),
+            ("/products/search?q=id%3D1&sort=nope", "invalid_query", "sort"),
+            (
+                "/products/search?q=id%3D1&limit=99999999999999999999",
+                "invalid_query",
+                "limit",
+            ),
+            (
+                "/products/search?q=id%3D1&offset=99999999999999999999",
+                "invalid_query",
+                "offset",
+            ),
+            ("/products/search?q=id%3D1&limit=abc", "invalid_query", "limit"),
+            ("/products/search?q=", "invalid_search_query", "q"),
+            ("/products/search?q=totl_cents%3D1", "invalid_search_query", "q"),
+            ("/products/search?q=" + "x" * 501, "invalid_search_query", "q"),
+        ):
+            with self.subTest(path=path):
+                status, body, _ = self.dispatch("GET", path)
+                self.assertEqual(status, 400)
+                self.assertEqual(body["error"]["code"], code)
+                self.assertEqual(body["error"]["details"][0]["field"], field)
+                if code == "invalid_search_query":
+                    position = "500" if len(path.split("=", 1)[1]) > 500 else "0"
+                    self.assertEqual(body["error"]["details"][0]["position"], position)
+
+    def test_search_malformed_direct_query_input_is_a_400(self):
+        for query in (None, [("q", None)], [("q",)], "q=id%3D1"):
+            with self.subTest(query=query), self.assertRaises(ApiError) as error:
+                search_products(query)
+            self.assertEqual(error.exception.status, 400)
+            self.assertEqual(error.exception.code, "invalid_query")
+
+    def test_search_explain_checks_resource_and_returns_ast(self):
+        status, body, _ = self.dispatch(
+            "GET", "/search/explain?resource=products&q=active%3Dtrue"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {
+                "resource": "products",
+                "normalized": "active = true",
+                "ast": {"field": "active", "op": "=", "value": True},
+            },
+        )
+        status, repeated, _ = self.dispatch(
+            "GET", "/search/explain?resource=products&q=active%3Dtrue"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(repeated, body)
+        for path in (
+            "/search/explain?resource=products",
+            "/search/explain?q=active%3Dtrue",
+            "/search/explain?resource=products&resource=orders&q=id%3D1",
+            "/search/explain?resource=products&q=id%3D1&q=id%3D2",
+        ):
+            with self.subTest(path=path):
+                status, error, _ = self.dispatch("GET", path)
+                self.assertEqual(status, 400)
+                self.assertEqual(error["error"]["code"], "invalid_query")
+                self.assertEqual(error["error"]["details"][0]["field"], "q")
+        status, body, _ = self.dispatch(
+            "GET", "/search/explain?resource=inventory&q=id%3D1"
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_query")
 
     def test_create_duplicate_sku_and_capacity_errors(self):
         status, product, headers = self.create()
@@ -582,6 +721,8 @@ class ProductApiTests(unittest.TestCase):
         for path, method in (
             ("/products", "post"),
             ("/products", "get"),
+            ("/products/search", "get"),
+            ("/search/explain", "get"),
             ("/products/{id}", "get"),
             ("/products/{id}", "patch"),
             ("/products/{id}", "delete"),
@@ -589,6 +730,16 @@ class ProductApiTests(unittest.TestCase):
             ("/categories", "get"),
         ):
             self.assertIn(method, paths[path])
+        search_parameters = {
+            parameter["name"]: parameter
+            for parameter in paths["/products/search"]["get"]["parameters"]
+        }
+        self.assertEqual(search_parameters["q"]["schema"]["maxLength"], 500)
+        self.assertIn("active (bool)", search_parameters["q"]["description"])
+        self.assertEqual(
+            search_parameters["sort"]["schema"]["enum"],
+            list(schemas.PRODUCT_SORTS),
+        )
         self.assertEqual(
             paths["/products"]["post"]["requestBody"]["content"]["application/json"][
                 "schema"
