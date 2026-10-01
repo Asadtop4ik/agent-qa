@@ -760,6 +760,7 @@ class ProductApiTests(unittest.TestCase):
                 "401",
                 "403",
                 "404",
+                "406",
                 "409",
                 "411",
                 "412",
