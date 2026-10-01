@@ -114,6 +114,67 @@ class CsvImportTests(unittest.TestCase):
         self.assertTrue(report["applied"])
         self.assertEqual(store.get(1)["tags"], ["one", "two"])
 
+    def test_validate_reports_rows_exceeding_store_capacity(self):
+        cases = (
+            (
+                ProductStore,
+                lambda store: store.create(
+                    sku="EXIST-1", name="Existing", category="food", price_cents=1
+                ),
+                import_products_csv,
+                (
+                    self.product_csv("NEW-1,New,food,100,0,,true"),
+                    self.product_csv(
+                        "NEW-1,New,food,100,0,,true",
+                        "NEW-2,Also new,food,200,0,,true",
+                    ),
+                ),
+                "Product store is full",
+            ),
+            (
+                OrderStore,
+                lambda store: store.create("existing", 1),
+                import_orders_csv,
+                (
+                    "customer_id,total_cents\r\nnew,100\r\n",
+                    "customer_id,total_cents\r\nnew,100\r\nalso-new,200\r\n",
+                ),
+                "Order store is full",
+            ),
+        )
+        for store_type, seed, importer, data_by_capacity, full_message in cases:
+            for capacity, data, error_line in (
+                (1, data_by_capacity[0], 2),
+                (2, data_by_capacity[1], 3),
+            ):
+                with self.subTest(store=store_type.__name__, capacity=capacity):
+                    store = store_type(capacity=capacity)
+                    seed(store)
+                    existing = store.get(1)
+                    next_id = store._next_id
+
+                    validate_status, validate_report = importer(
+                        store, data, "validate", "abort"
+                    )
+                    apply_status, apply_report = importer(store, data, "apply", "abort")
+
+                    expected_error = {
+                        "line": error_line,
+                        "field": "body",
+                        "message": full_message,
+                    }
+                    self.assertEqual(validate_status, 200)
+                    self.assertEqual(
+                        (validate_report["created"], validate_report["failed"]),
+                        (0, 1),
+                    )
+                    self.assertFalse(validate_report["applied"])
+                    self.assertEqual(validate_report["errors"], [expected_error])
+                    self.assertEqual((apply_status, apply_report["created"]), (422, 0))
+                    self.assertEqual(apply_report["errors"], validate_report["errors"])
+                    self.assertEqual(store.get(1), existing)
+                    self.assertEqual(store._next_id, next_id)
+
     def test_failed_counts_rows_when_validation_returns_multiple_field_errors(self):
         store = ProductStore()
         bad_row = "BAD-1,Bad,Invalid Category,999999999,0,,true"

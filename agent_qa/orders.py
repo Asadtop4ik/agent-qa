@@ -255,9 +255,7 @@ class OrderStore:
         with self._lock:
             row_errors = [dict(error) for error in errors]
             row_errors.sort(key=lambda item: item["line"])
-            if mode == "validate":
-                return 200, 0, row_errors
-            if row_errors and on_error == "abort":
+            if mode != "validate" and row_errors and on_error == "abort":
                 return 422, 0, row_errors
 
             available = self._capacity - len(self._orders)
@@ -272,6 +270,8 @@ class OrderStore:
                     )
                 records = records[:available]
                 row_errors.sort(key=lambda item: item["line"])
+            if mode == "validate":
+                return 200, 0, row_errors
             if row_errors and on_error == "abort":
                 return 422, 0, row_errors
 
