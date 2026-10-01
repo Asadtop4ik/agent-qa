@@ -139,6 +139,19 @@ class MetricsRegistryTests(unittest.TestCase):
         self.assertIn("# TYPE agent_qa_products gauge\n", rendered)
         self.assertIn("agent_qa_products 0\n", rendered)
 
+    def test_tenant_gauges_and_total_order_gauge_render_bounded_labels(self):
+        rendered = MetricsRegistry().render(
+            4,
+            "test",
+            tenant_orders={"default": 3, "blue-1": 1},
+            tenant_products={"default": 2, "blue-1": 5},
+            tenant_count=2,
+        )
+        self.assertIn("agent_qa_orders 4\n", rendered)
+        self.assertIn('agent_qa_tenant_orders{tenant="blue-1"} 1', rendered)
+        self.assertIn('agent_qa_tenant_products{tenant="default"} 2', rendered)
+        self.assertIn("agent_qa_tenants 2\n", rendered)
+
     def test_audit_metrics_are_lazy_and_render_zero_when_available(self):
         registry = MetricsRegistry()
         rendered = registry.render(0, "test")

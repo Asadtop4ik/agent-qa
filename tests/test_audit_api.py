@@ -116,9 +116,13 @@ class AuditRequestRecordingTests(unittest.TestCase):
 
     def test_context_is_cleared_when_base_request_handler_raises(self):
         handler = object.__new__(Handler)
+        handler._tenant_scoped = True
+        handler._tenant_value = "previous"
 
         def fail_request():
             self.assertIsNotNone(get_context())
+            self.assertFalse(handler._tenant_scoped)
+            self.assertIsNone(handler._tenant_value)
             raise RuntimeError("simulated request parser failure")
 
         with patch(

@@ -193,10 +193,11 @@ def validate_query(query: list[tuple[str, str]]) -> dict[str, Any]:
 class OrderStore:
     """Thread-safe, process-local order storage with never-reused IDs."""
 
-    def __init__(self, capacity: int = MAX_ORDERS) -> None:
+    def __init__(self, capacity: int = MAX_ORDERS, *, tenant: str = "default") -> None:
         if not 1 <= capacity <= MAX_ORDERS:
             raise ValueError(f"capacity must be between 1 and {MAX_ORDERS}")
         self._capacity = capacity
+        self.tenant = tenant
         self._orders: dict[int, dict[str, Any]] = {}
         self._next_id = 1
         self._lock = threading.RLock()
@@ -432,7 +433,7 @@ class OrderStore:
             total = len(matched)
             if cursor_mode:
                 filters = {"status": status, "customer_id": customer_id}
-                fingerprint = filter_fingerprint(filters)
+                fingerprint = filter_fingerprint(filters, tenant=self.tenant)
                 cursor_key = (
                     decode_cursor(cursor, sort, fingerprint)
                     if cursor is not None
@@ -512,6 +513,12 @@ class OrderStore:
                 "by_status": by_status,
                 "revenue_cents": revenue_cents,
             }
+
+    def clear(self) -> None:
+        """Remove all tenant rows when its registry entry is purged."""
+        with self._lock:
+            self._orders.clear()
+            self._next_id = 1
 
     def get(
         self, order_id: int, *, include_version: bool = False

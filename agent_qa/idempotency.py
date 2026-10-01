@@ -138,3 +138,11 @@ class IdempotencyStore:
             entry = self._entries.pop(scope, None)
             if entry is not None:
                 entry.event.set()
+
+    def clear(self) -> None:
+        """Release all reservations and cached replies during tenant purge."""
+        with self._lock:
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            entry.event.set()

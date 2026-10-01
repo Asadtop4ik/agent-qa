@@ -687,16 +687,13 @@ class RealOutboxApiTests(unittest.TestCase):
         fake_server = FakeServer()
         with (
             patch("agent_qa.server.ThreadingHTTPServer", return_value=fake_server),
-            patch("agent_qa.server.config.port", return_value=8080),
-            patch("agent_qa.server.JOB_RUNNER.stop") as stop_jobs,
-            patch("agent_qa.server.OUTBOX.stop") as stop_outbox,
+            patch("agent_qa.server.tenants.TENANTS.shutdown") as stop_tenants,
         ):
             from agent_qa.server import main
 
             main()
         self.assertTrue(fake_server.closed)
-        stop_jobs.assert_called_once_with(timeout=5)
-        stop_outbox.assert_called_once_with(timeout=5)
+        stop_tenants.assert_called_once_with(timeout=5)
 
 
 if __name__ == "__main__":

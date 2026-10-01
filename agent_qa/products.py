@@ -332,12 +332,15 @@ def _validate_store_query(query: dict[str, Any]) -> None:
 class ProductStore:
     """Thread-safe, process-local product storage with never-reused IDs."""
 
-    def __init__(self, capacity: int = MAX_PRODUCTS) -> None:
+    def __init__(
+        self, capacity: int = MAX_PRODUCTS, *, tenant: str = "default"
+    ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int):
             raise ValueError(f"capacity must be between 1 and {MAX_PRODUCTS}")
         if not 1 <= capacity <= MAX_PRODUCTS:
             raise ValueError(f"capacity must be between 1 and {MAX_PRODUCTS}")
         self._capacity = capacity
+        self.tenant = tenant
         self._products: dict[int, dict[str, Any]] = {}
         self._next_id = 1
         self._lock = threading.RLock()
@@ -856,7 +859,7 @@ class ProductStore:
                     )
                     if name in query
                 }
-                fingerprint = filter_fingerprint(filters)
+                fingerprint = filter_fingerprint(filters, tenant=self.tenant)
                 cursor = query.get("cursor")
                 cursor_key = (
                     decode_cursor(cursor, sort, fingerprint)
@@ -947,3 +950,9 @@ class ProductStore:
                 )
                 if product["stock"] <= threshold
             ]
+
+    def clear(self) -> None:
+        """Remove all tenant rows when its registry entry is purged."""
+        with self._lock:
+            self._products.clear()
+            self._next_id = 1

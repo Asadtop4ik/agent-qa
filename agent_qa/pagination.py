@@ -27,14 +27,17 @@ _MAX_CURSOR_INT = (1 << 63) - 1
 _SUPPORTED_SORTS = frozenset(PRODUCT_SORTS) | {"id", "-id"}
 
 
-def filter_fingerprint(filters: dict[str, Any]) -> str:
-    """Return a stable digest for normalized filters, excluding paging/sort fields."""
+def filter_fingerprint(filters: dict[str, Any], *, tenant: str = "default") -> str:
+    """Return a tenant-bound digest for normalized filters."""
     excluded = {"limit", "offset", "pagination", "cursor", "sort"}
     normalized = {
         name: value for name, value in filters.items() if name not in excluded
     }
     encoded = json.dumps(
-        normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        {"tenant": tenant, "filters": normalized},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
 

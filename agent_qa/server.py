@@ -15,7 +15,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 from agent_qa.accesslog import write_access_log
 from agent_qa.audit import AUDIT_LOG
-from agent_qa import config, settings
+from agent_qa import settings
 from agent_qa.auth import api_key_from_headers, authenticate_api_key
 from agent_qa.errors import ApiError, envelope, problem
 from agent_qa.idempotency import IdempotencyStore, StoredResponse
@@ -27,9 +27,9 @@ from agent_qa.context import (
     set_context,
 )
 from agent_qa.orders import OrderError
-from agent_qa.outbox import OUTBOX
 from agent_qa.request_id import request_id
 from agent_qa.ratelimit import RATE_LIMITER
+from agent_qa import tenants
 from agent_qa.negotiation import (
     MIN_GZIP_BYTES,
     best_match,
@@ -37,16 +37,23 @@ from agent_qa.negotiation import (
     prefers_problem,
     parse_accept,
 )
-from agent_qa.routes import JOB_RUNNER, ROUTES
+from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
 from agent_qa.versioning import response_headers as version_headers
 from agent_qa.versioning import map_v2_error_body, sunset_reached
 
 LOGGER = logging.getLogger(__name__)
-IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
+IDEMPOTENCY_STORE = tenants.get("default").idempotency
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+
+def _idempotency_store() -> IdempotencyStore:
+    context = get_context()
+    if context is None or context.tenant == "default":
+        return IDEMPOTENCY_STORE
+    return tenants.current().idempotency
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -174,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
         self._request_started = perf_counter()
         self._response_recorded = False
         self._rate_headers = {}
+        self._tenant_scoped = False
+        self._tenant_value = None
         if hasattr(self, "_rate_retry_after"):
             del self._rate_retry_after
         try:
@@ -199,6 +208,9 @@ class Handler(BaseHTTPRequestHandler):
     ) -> None:
         is_empty = status in {204, 304}
         response_headers = dict(headers or {})
+        tenant_value = getattr(self, "_tenant_value", None)
+        if getattr(self, "_tenant_scoped", False) and tenant_value is not None:
+            response_headers["X-Tenant"] = tenant_value
         raw_path = getattr(self, "path", "") or ""
         try:
             instance = urlsplit(raw_path).path
@@ -357,6 +369,20 @@ class Handler(BaseHTTPRequestHandler):
             404, envelope("not_found", "Route not found", request_id=self.request_id)
         )
 
+    def _prepare_tenant(self, scoped: bool) -> None:
+        self._tenant_scoped = scoped
+        self._tenant_value = None
+        context = get_context()
+        if not scoped:
+            if context is not None:
+                context.tenant = "default"
+            return
+        raw = _joined_header(self.headers, "X-Tenant")
+        name = tenants.validate_name(raw if raw is not None else "default")
+        self._tenant_value = name
+        if context is not None:
+            context.tenant = name
+
     def _internal_error(self) -> None:
         self._json(
             500,
@@ -458,6 +484,17 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _dispatch(self) -> None:
+        self._tenant_write_pin = None
+        try:
+            Handler._dispatch_request(self)
+        finally:
+            pin = self._tenant_write_pin
+            if pin is not None:
+                self._tenant_write_pin = None
+                pin.__exit__(*sys.exc_info())
+
+    def _dispatch_request(self) -> None:
+        Handler._prepare_tenant(self, False)
         try:
             parsed = urlsplit(self.path)
         except ValueError as error:
@@ -472,6 +509,9 @@ class Handler(BaseHTTPRequestHandler):
             (match for match in matches if match[0]["method"] == self.command), None
         )
         if selected is None:
+            Handler._prepare_tenant(
+                self, any(bool(route.get("tenant_scoped")) for route, _ in matches)
+            )
             is_v2_path = any(
                 str(route.get("api_version")) == "2" for route, _ in matches
             )
@@ -493,6 +533,7 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
+        Handler._prepare_tenant(self, bool(route.get("tenant_scoped")))
         if sunset_reached(route):
             self._json(
                 410,
@@ -621,6 +662,21 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        if route.get("tenant_scoped") and identity is not None:
+            permitted_tenants = identity.get("tenants")
+            tenant_name = context.tenant if context is not None else "default"
+            if permitted_tenants is not None and tenant_name not in permitted_tenants:
+                raise ApiError(
+                    403,
+                    "forbidden",
+                    "API key is not allowed for this tenant",
+                    [
+                        {
+                            "field": "tenant",
+                            "message": "Key is not allowed for this tenant",
+                        }
+                    ],
+                )
         content_encodings = self.headers.get_all("Content-Encoding", [])
         if _has_unsupported_content_encoding(content_encodings):
             raise ApiError(
@@ -652,6 +708,19 @@ class Handler(BaseHTTPRequestHandler):
             if route.get("body")
             else None
         )
+        if route.get("tenant_scoped") and self.command in {
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+        }:
+            context = get_context()
+            bundle = tenants.ensure(
+                context.tenant if context is not None else "default"
+            )
+            pin = tenants.TENANTS.pin(bundle)
+            pin.__enter__()
+            self._tenant_write_pin = pin
         if idempotency_key is not None:
             canonical_json = json.dumps(
                 payload, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -660,12 +729,15 @@ class Handler(BaseHTTPRequestHandler):
             api_key = api_key_from_headers(self.headers) or ""
             api_key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
             idempotency_scope = (
+                get_context().tenant if get_context() is not None else "default",
                 api_key_fingerprint,
                 self.command,
                 parsed.path,
                 idempotency_key,
             )
-            decision = IDEMPOTENCY_STORE.begin(idempotency_scope, payload_fingerprint)
+            decision = _idempotency_store().begin(
+                idempotency_scope, payload_fingerprint
+            )
             if decision.kind == "replay":
                 REGISTRY.record_idempotency("replayed")
                 assert decision.response is not None
@@ -702,10 +774,7 @@ class Handler(BaseHTTPRequestHandler):
                     if route.get("sanitize_validation_errors"):
                         errors = [{"field": "body", "message": "Invalid request body"}]
                     raise ApiError(
-                        400,
-                        "validation_error",
-                        "Request validation failed",
-                        errors,
+                        400, "validation_error", "Request validation failed", errors
                     )
             conditional_headers = route.get("conditional_headers")
             if conditional_headers:
@@ -725,12 +794,12 @@ class Handler(BaseHTTPRequestHandler):
                 status, body, headers = route["handler"](query, path_params, payload)
         except Exception:
             if idempotency_scope is not None:
-                IDEMPOTENCY_STORE.abort(idempotency_scope)
+                _idempotency_store().abort(idempotency_scope)
             raise
         if idempotency_scope is not None:
             replay_statuses = route.get("idempotency_replay_statuses", ())
             if 200 <= status < 300 or status in replay_statuses:
-                IDEMPOTENCY_STORE.complete(
+                _idempotency_store().complete(
                     idempotency_scope,
                     StoredResponse(status, body, headers),
                     allowed_statuses=tuple(replay_statuses),
@@ -739,7 +808,7 @@ class Handler(BaseHTTPRequestHandler):
                 headers = dict(headers)
                 headers["Idempotency-Key"] = idempotency_key or ""
             else:
-                IDEMPOTENCY_STORE.abort(idempotency_scope)
+                _idempotency_store().abort(idempotency_scope)
         self._json(status, body, headers)
 
     def _method_not_allowed(
@@ -846,6 +915,5 @@ def main() -> None:
     try:
         server.serve_forever()
     finally:
-        JOB_RUNNER.stop(timeout=5)
-        OUTBOX.stop(timeout=5)
+        tenants.TENANTS.shutdown(timeout=5)
         server.server_close()

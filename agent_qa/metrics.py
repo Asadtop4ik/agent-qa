@@ -9,6 +9,9 @@ _REQUESTS_NAME = "agent_qa_http_requests_total"
 _DURATION_NAME = "agent_qa_http_request_duration_seconds"
 _ORDERS_NAME = "agent_qa_orders"
 _PRODUCTS_NAME = "agent_qa_products"
+_TENANT_ORDERS_NAME = "agent_qa_tenant_orders"
+_TENANT_PRODUCTS_NAME = "agent_qa_tenant_products"
+_TENANTS_NAME = "agent_qa_tenants"
 _BUILD_NAME = "agent_qa_build_info"
 _IDEMPOTENCY_NAME = "agent_qa_idempotency_total"
 _RATE_LIMITED_NAME = "agent_qa_rate_limited_total"
@@ -102,6 +105,9 @@ class MetricsRegistry:
         job_statuses: dict[str, int] | None = None,
         outbox_statuses: dict[str, int] | None = None,
         outbox_dropped: int | None = None,
+        tenant_orders: dict[str, int] | None = None,
+        tenant_products: dict[str, int] | None = None,
+        tenant_count: int | None = None,
     ) -> str:
         """Render metrics from a request snapshot and current service values."""
         with self._lock:
@@ -178,6 +184,47 @@ class MetricsRegistry:
                     "Current number of products.",
                     "gauge",
                     [(_PRODUCTS_NAME, (), str(products))],
+                )
+            )
+        if tenant_orders is not None:
+            families.append(
+                (
+                    _TENANT_ORDERS_NAME,
+                    "Current number of orders by tenant.",
+                    "gauge",
+                    [
+                        (
+                            _TENANT_ORDERS_NAME,
+                            (("tenant", tenant),),
+                            str(max(0, int(value))),
+                        )
+                        for tenant, value in tenant_orders.items()
+                    ],
+                )
+            )
+        if tenant_products is not None:
+            families.append(
+                (
+                    _TENANT_PRODUCTS_NAME,
+                    "Current number of products by tenant.",
+                    "gauge",
+                    [
+                        (
+                            _TENANT_PRODUCTS_NAME,
+                            (("tenant", tenant),),
+                            str(max(0, int(value))),
+                        )
+                        for tenant, value in tenant_products.items()
+                    ],
+                )
+            )
+        if tenant_count is not None:
+            families.append(
+                (
+                    _TENANTS_NAME,
+                    "Current number of tenants.",
+                    "gauge",
+                    [(_TENANTS_NAME, (), str(max(0, int(tenant_count))))],
                 )
             )
         if idempotency:

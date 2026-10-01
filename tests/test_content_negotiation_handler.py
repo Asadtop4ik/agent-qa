@@ -407,6 +407,15 @@ class ContentNegotiationHandlerTests(unittest.TestCase):
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual(caught.exception.code, "invalid_request_target")
 
+    def test_new_dispatch_does_not_echo_previous_request_tenant(self):
+        handler = make_handler("/missing")
+        handler._tenant_scoped = True
+        handler._tenant_value = "previous"
+        with patch("agent_qa.server.ROUTES", ()):
+            Handler._dispatch(handler)
+        self.assertEqual(handler.status, 404)
+        self.assertIsNone(response_header(handler, "X-Tenant"))
+
     def test_not_found_and_method_not_allowed_precede_accept_check(self):
         handler = make_handler("/missing", headers={"Accept": "image/jpeg"})
         responses = []

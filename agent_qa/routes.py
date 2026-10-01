@@ -9,7 +9,7 @@ from urllib.parse import quote, urlencode
 
 from agent_qa import auth, settings
 from agent_qa.audit import AUDIT_LOG
-from agent_qa.config import FIXTURE_PATH, GIT_SHA, job_retention, job_workers
+from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.conditional import etag_for, parse_etag_list, weak_match
 from agent_qa.csvio import ORDER_COLUMNS, PRODUCT_COLUMNS, parse_csv, render_csv
 from agent_qa.context import get_context
@@ -55,7 +55,6 @@ from agent_qa.jobs import (
     JOB_STATUSES,
     JOB_TYPES,
     JobRunner,
-    make_builtin_handlers,
 )
 from agent_qa.products import (
     ProductStore,
@@ -65,15 +64,33 @@ from agent_qa.products import (
     validate_query as validate_product_query,
 )
 from agent_qa.ratelimit import RATE_LIMITER
+from agent_qa import tenants
 
 
-ORDER_STORE = OrderStore()
-PRODUCT_STORE = ProductStore()
-JOB_RUNNER = JobRunner(
-    make_builtin_handlers(ORDER_STORE, PRODUCT_STORE),
-    workers=job_workers(),
-    retention=job_retention(),
-)
+ORDER_STORE = tenants.get("default").orders
+PRODUCT_STORE = tenants.get("default").products
+JOB_RUNNER = tenants.get("default").jobs
+
+
+def _tenant_name() -> str:
+    context = get_context()
+    return context.tenant if context is not None else "default"
+
+
+def _order_store() -> OrderStore:
+    return ORDER_STORE if _tenant_name() == "default" else tenants.current().orders
+
+
+def _product_store() -> ProductStore:
+    return PRODUCT_STORE if _tenant_name() == "default" else tenants.current().products
+
+
+def _job_runner() -> JobRunner:
+    return JOB_RUNNER if _tenant_name() == "default" else tenants.current().jobs
+
+
+def _outbox_store():
+    return OUTBOX if _tenant_name() == "default" else tenants.current().outbox
 
 
 def _header(headers: dict[str, str] | None, name: str) -> str | None:
@@ -185,11 +202,30 @@ def metrics(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return a Prometheus snapshot of service metrics."""
-    order_count = ORDER_STORE.list(limit=1)[1]
-    product_count = PRODUCT_STORE.list(limit=1)[1]
+    tenant_items = tenants.list_tenants()
+    tenant_orders: dict[str, int] = {}
+    tenant_products: dict[str, int] = {}
+    job_statuses: dict[str, int] = {}
+    outbox_statuses: dict[str, int] = {}
+    outbox_dropped = 0
+    for item in tenant_items:
+        name = str(item["tenant"])
+        bundle = tenants.get(name)
+        orders = ORDER_STORE if name == "default" else bundle.orders
+        products = PRODUCT_STORE if name == "default" else bundle.products
+        jobs = JOB_RUNNER if name == "default" else bundle.jobs
+        outbox = OUTBOX if name == "default" else bundle.outbox
+        tenant_orders[name] = orders.list(limit=1)[1]
+        tenant_products[name] = products.list(limit=1)[1]
+        for status, count in jobs.status_counts().items():
+            job_statuses[status] = job_statuses.get(status, 0) + count
+        statuses, dropped = outbox.metrics_snapshot()
+        for status, count in statuses.items():
+            outbox_statuses[status] = outbox_statuses.get(status, 0) + count
+        outbox_dropped += dropped
+    order_count = sum(tenant_orders.values())
+    product_count = sum(tenant_products.values())
     audit_entries, audit_dropped = AUDIT_LOG.metrics_snapshot()
-    outbox_statuses, outbox_dropped = OUTBOX.metrics_snapshot()
-    job_statuses = JOB_RUNNER.status_counts()
     return (
         200,
         REGISTRY.render(
@@ -201,6 +237,9 @@ def metrics(
             outbox_statuses=outbox_statuses,
             outbox_dropped=outbox_dropped,
             job_statuses=job_statuses,
+            tenant_orders=tenant_orders,
+            tenant_products=tenant_products,
+            tenant_count=len(tenant_items),
         ),
         {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
     )
@@ -211,12 +250,16 @@ def whoami(
     path_params: dict[str, str] | None = None,
     payload: object = None,
     *,
-    identity: dict[str, str] | None = None,
+    identity: dict[str, object] | None = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return the authenticated key's public identity fields."""
     if identity is None:
         raise ApiError(401, "unauthorized", "A valid API key is required")
-    return 200, {name: identity[name] for name in ("key_id", "role", "label")}, {}
+    return (
+        200,
+        {name: identity[name] for name in ("key_id", "role", "label", "tenants")},
+        {},
+    )
 
 
 def _key_payload(payload: object, allowed: set[str]) -> dict[str, object]:
@@ -237,7 +280,7 @@ def create_api_key(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    body = _key_payload(payload, {"role", "label"})
+    body = _key_payload(payload, {"role", "label", "tenants"})
     role, label = body.get("role"), body.get("label")
     if not isinstance(role, str) or role not in {"read", "write", "admin"}:
         raise ApiError(400, "invalid_role", "Role must be read, write, or admin")
@@ -245,7 +288,7 @@ def create_api_key(
         raise ApiError(
             400, "validation_error", "Label must be 1 to 40 non-blank characters"
         )
-    return 201, auth.KEY_STORE.create(role, label), {}
+    return 201, auth.KEY_STORE.create(role, label, body.get("tenants")), {}
 
 
 def list_api_keys(
@@ -401,11 +444,11 @@ def create_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create an order."""
     values = validate_create(payload)
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create(
-        **values, include_version=True
-    )
+    order = FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).create(**values, include_version=True)
     version = order.pop("version")
-    OUTBOX.emit("order.created", dict(order))
+    _outbox_store().emit("order.created", dict(order))
     return (
         201,
         order,
@@ -423,13 +466,13 @@ def create_orders_bulk(
 ) -> tuple[int, object, dict[str, str]]:
     """Create orders in sequence and return per-item results."""
     values = payload if isinstance(payload, dict) else {}
-    status, body = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create_bulk(
-        values.get("items"), values.get("atomic", False)
-    )
+    status, body = FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).create_bulk(values.get("items"), values.get("atomic", False))
     if isinstance(body, dict):
         for result in body.get("results", []):
             if result.get("status") == 201 and isinstance(result.get("data"), dict):
-                OUTBOX.emit("order.created", dict(result["data"]))
+                _outbox_store().emit("order.created", dict(result["data"]))
     context = get_context()
     if context is not None and isinstance(body, dict):
         context.resource = "orders"
@@ -445,7 +488,7 @@ def list_orders(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated orders."""
     filters = validate_query(query)
-    result = ORDER_STORE.list(**filters)
+    result = _order_store().list(**filters)
     if filters["pagination"] == "cursor":
         items, total, next_cursor = result
         body = {
@@ -491,7 +534,7 @@ def get_order(
     """Return one order or the standard missing-order error."""
     order_id = _order_id(path_params)
     order = (
-        ORDER_STORE.get(order_id, include_version=True)
+        _order_store().get(order_id, include_version=True)
         if order_id is not None
         else None
     )
@@ -515,16 +558,16 @@ def patch_order(
     order_id = _order_id(path_params)
     if order_id is None:
         raise ApiError(404, "order_not_found", "Order not found")
-    if ORDER_STORE.get(order_id) is None:
+    if _order_store().get(order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).update(
-        order_id, changes, expected_version=expected_version, include_version=True
-    )
+    order = FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).update(order_id, changes, expected_version=expected_version, include_version=True)
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
-    OUTBOX.emit("order.updated", dict(order))
+    _outbox_store().emit("order.updated", dict(order))
     return 200, order, {"ETag": etag_for("order", order_id, version)}
 
 
@@ -536,14 +579,14 @@ def delete_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order and return an empty response body."""
     order_id = _order_id(path_params)
-    if order_id is None or ORDER_STORE.get(order_id) is None:
+    if order_id is None or _order_store().get(order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    if not FulfillmentService(ORDER_STORE, PRODUCT_STORE).delete(
-        order_id, expected_version=expected_version
-    ):
+    if not FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).delete(order_id, expected_version=expected_version):
         raise ApiError(404, "order_not_found", "Order not found")
-    OUTBOX.emit("order.deleted", {"id": order_id})
+    _outbox_store().emit("order.deleted", {"id": order_id})
     return 204, None, {"Content-Length": "0"}
 
 
@@ -642,11 +685,11 @@ def create_order_v2(
         values["items"] = body["items"]
     else:
         values["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).create(
-        **values, include_version=True
-    )
+    order = FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).create(**values, include_version=True)
     version = order.pop("version")
-    OUTBOX.emit("order.created", dict(order))
+    _outbox_store().emit("order.created", dict(order))
     result = _v2_order(order)
     return (
         201,
@@ -667,7 +710,7 @@ def list_orders_v2(
     """Return cursor-paginated orders using the v2 representation."""
     filters = _v2_query(query)
     try:
-        orders, total, next_cursor = ORDER_STORE.list(**filters)
+        orders, total, next_cursor = _order_store().list(**filters)
     except OrderError as error:
         raise ApiError(400, error.code, error.message, error.details) from error
     body = {
@@ -693,7 +736,7 @@ def get_order_v2(
 ) -> tuple[int, object, dict[str, str]]:
     """Read an order in the v2 representation."""
     order_id = _order_id(path_params)
-    order = ORDER_STORE.get(order_id, include_version=True) if order_id else None
+    order = _order_store().get(order_id, include_version=True) if order_id else None
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
@@ -717,16 +760,16 @@ def patch_order_v2(
     if "amount" in body:
         changes["total_cents"] = body["amount"]["total_cents"]  # type: ignore[index]
     order_id = _order_id(path_params)
-    if order_id is None or ORDER_STORE.get(order_id) is None:
+    if order_id is None or _order_store().get(order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    order = FulfillmentService(ORDER_STORE, PRODUCT_STORE).update(
-        order_id, changes, expected_version=expected_version, include_version=True
-    )
+    order = FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).update(order_id, changes, expected_version=expected_version, include_version=True)
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     version = order.pop("version")
-    OUTBOX.emit("order.updated", dict(order))
+    _outbox_store().emit("order.updated", dict(order))
     return 200, _v2_order(order), {"ETag": etag_for("order", order_id, version)}
 
 
@@ -738,14 +781,14 @@ def delete_order_v2(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order using the shared fulfillment service."""
     order_id = _order_id(path_params)
-    if order_id is None or ORDER_STORE.get(order_id) is None:
+    if order_id is None or _order_store().get(order_id) is None:
         raise ApiError(404, "order_not_found", "Order not found")
     expected_version = _expected_version(request_headers)
-    if not FulfillmentService(ORDER_STORE, PRODUCT_STORE).delete(
-        order_id, expected_version=expected_version
-    ):
+    if not FulfillmentService(
+        _order_store(), _product_store(), lock=tenants.current().fulfillment_lock
+    ).delete(order_id, expected_version=expected_version):
         raise ApiError(404, "order_not_found", "Order not found")
-    OUTBOX.emit("order.deleted", {"id": order_id})
+    _outbox_store().emit("order.deleted", {"id": order_id})
     return 204, None, {"Content-Length": "0"}
 
 
@@ -755,11 +798,11 @@ def create_product(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create a product."""
-    product = PRODUCT_STORE.create(
+    product = _product_store().create(
         **validate_product_create(payload), include_version=True
     )
     version = product.pop("version")
-    OUTBOX.emit("product.created", dict(product))
+    _outbox_store().emit("product.created", dict(product))
     return (
         201,
         product,
@@ -777,13 +820,13 @@ def create_products_bulk(
 ) -> tuple[int, object, dict[str, str]]:
     """Create products in sequence and return per-item results."""
     values = payload if isinstance(payload, dict) else {}
-    status, body = PRODUCT_STORE.create_bulk(
+    status, body = _product_store().create_bulk(
         values.get("items"), values.get("atomic", False)
     )
     if isinstance(body, dict):
         for result in body.get("results", []):
             if result.get("status") == 201 and isinstance(result.get("data"), dict):
-                OUTBOX.emit("product.created", dict(result["data"]))
+                _outbox_store().emit("product.created", dict(result["data"]))
     context = get_context()
     if context is not None and isinstance(body, dict):
         context.resource = "products"
@@ -799,7 +842,7 @@ def list_products(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered and paginated products."""
     filters = validate_product_query(query)
-    result = PRODUCT_STORE.list(**filters)
+    result = _product_store().list(**filters)
     if filters["pagination"] == "cursor":
         items, total, next_cursor = result
         body = {
@@ -901,7 +944,7 @@ def export_products_csv(
     """Export filtered products as a bounded CSV representation."""
     filters = _csv_filters(query, "products")
     return _csv_response(
-        "products.csv", PRODUCT_COLUMNS, PRODUCT_STORE.export_rows(filters)
+        "products.csv", PRODUCT_COLUMNS, _product_store().export_rows(filters)
     )
 
 
@@ -912,7 +955,9 @@ def export_orders_csv(
 ) -> tuple[int, str, dict[str, str]]:
     """Export filtered orders as a bounded CSV representation."""
     filters = _csv_filters(query, "orders")
-    return _csv_response("orders.csv", ORDER_COLUMNS, ORDER_STORE.export_rows(filters))
+    return _csv_response(
+        "orders.csv", ORDER_COLUMNS, _order_store().export_rows(filters)
+    )
 
 
 def _csv_import_options(query: list[tuple[str, str]]) -> tuple[str, str]:
@@ -961,7 +1006,7 @@ def _import_csv(
         )
     mode, on_error = _csv_import_options(query)
     rows = parse_csv(payload, resource)
-    store = PRODUCT_STORE if resource == "products" else ORDER_STORE
+    store = _product_store() if resource == "products" else _order_store()
     status, report = store.import_rows(rows, mode=mode, on_error=on_error)
     context = get_context()
     if context is not None:
@@ -1147,7 +1192,7 @@ def _search(
     values = _search_query(query, _SEARCH_QUERY_PARAMETERS)
     ast = parse(values["q"], resource)
     sort, limit, offset = _search_page(values, resource)
-    store = ORDER_STORE if resource == "orders" else PRODUCT_STORE
+    store = _order_store() if resource == "orders" else _product_store()
     items, total = store.search(
         compile_predicate(ast, resource), sort=sort, limit=limit, offset=offset
     )
@@ -1219,7 +1264,7 @@ def get_product(
     """Return one product or the standard missing-product error."""
     product_id = _product_id(path_params)
     product = (
-        PRODUCT_STORE.get(product_id, include_version=True)
+        _product_store().get(product_id, include_version=True)
         if product_id is not None
         else None
     )
@@ -1243,16 +1288,16 @@ def patch_product(
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    if PRODUCT_STORE.get(product_id) is None:
+    if _product_store().get(product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    product = PRODUCT_STORE.update(
+    product = _product_store().update(
         product_id, changes, expected_version=expected_version, include_version=True
     )
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
     version = product.pop("version")
-    OUTBOX.emit("product.updated", dict(product))
+    _outbox_store().emit("product.updated", dict(product))
     return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
@@ -1264,12 +1309,12 @@ def delete_product(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete a product and return an empty response body."""
     product_id = _product_id(path_params)
-    if product_id is None or PRODUCT_STORE.get(product_id) is None:
+    if product_id is None or _product_store().get(product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    if not PRODUCT_STORE.delete(product_id, expected_version=expected_version):
+    if not _product_store().delete(product_id, expected_version=expected_version):
         raise ApiError(404, "product_not_found", "Product not found")
-    OUTBOX.emit("product.deleted", {"id": product_id})
+    _outbox_store().emit("product.deleted", {"id": product_id})
     return 204, None, {"Content-Length": "0"}
 
 
@@ -1284,10 +1329,10 @@ def adjust_product_stock(
     product_id = _product_id(path_params)
     if product_id is None:
         raise ApiError(404, "product_not_found", "Product not found")
-    if PRODUCT_STORE.get(product_id) is None:
+    if _product_store().get(product_id) is None:
         raise ApiError(404, "product_not_found", "Product not found")
     expected_version = _expected_version(request_headers)
-    product = PRODUCT_STORE.adjust_stock(
+    product = _product_store().adjust_stock(
         product_id,
         values["delta"],
         expected_version=expected_version,
@@ -1296,7 +1341,7 @@ def adjust_product_stock(
     if product is None:
         raise ApiError(404, "product_not_found", "Product not found")
     version = product.pop("version")
-    OUTBOX.emit("product.updated", dict(product))
+    _outbox_store().emit("product.updated", dict(product))
     return 200, product, {"ETag": etag_for("product", product_id, version)}
 
 
@@ -1306,7 +1351,7 @@ def categories(
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
     """Return current aggregates for categories represented by products."""
-    items = PRODUCT_STORE.categories()
+    items = _product_store().categories()
     return 200, {"items": items, "total": len(items)}, {}
 
 
@@ -1317,6 +1362,10 @@ def list_audit(
 ) -> tuple[int, object, dict[str, str]]:
     """Return bounded, filtered audit entries for administrators."""
     filters = validate_query_params(_AUDIT_QUERY_PARAMETERS, query)
+    requested_tenant = filters.pop("tenant", _tenant_name())
+    if requested_tenant != "*":
+        requested_tenant = tenants.validate_name(requested_tenant)
+    filters["tenant"] = requested_tenant
     return 200, AUDIT_LOG.query(**filters), {}
 
 
@@ -1327,6 +1376,22 @@ def get_audit_entry(
 ) -> tuple[int, object, dict[str, str]]:
     """Return one retained audit entry by its sequence number."""
     raw_seq = (path_params or {}).get("seq", "")
+    requested = validate_query_params(
+        [
+            {
+                "name": "tenant",
+                "in": "query",
+                "schema": {
+                    "type": "string",
+                    "maxLength": 24,
+                    "pattern": r"^(\*|[a-z0-9][a-z0-9-]{0,23})$",
+                },
+            }
+        ],
+        query,
+    ).get("tenant", _tenant_name())
+    if requested != "*":
+        requested = tenants.validate_name(requested)
     if len(raw_seq) > 20 or not raw_seq.isascii() or not raw_seq.isdigit():
         entry = None
     else:
@@ -1334,10 +1399,44 @@ def get_audit_entry(
             seq = int(raw_seq)
         except ValueError:
             seq = 0
-        entry = AUDIT_LOG.get(seq) if seq > 0 else None
+        entry = AUDIT_LOG.get(seq, tenant=requested) if seq > 0 else None
+    if entry is not None and requested != "*":
+        if entry.get("tenant", "default") != requested:
+            entry = None
     if entry is None:
         raise ApiError(404, "audit_entry_not_found", "Audit entry not found")
     return 200, entry, {}
+
+
+def list_tenants(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    items = [
+        {
+            key: item[key]
+            for key in (
+                "tenant",
+                "orders",
+                "products",
+                "webhooks",
+                "jobs",
+                "created_at",
+            )
+        }
+        for item in tenants.list_tenants()
+    ]
+    return 200, {"items": items, "total": len(items)}, {}
+
+
+def delete_tenant(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    tenants.delete((path_params or {}).get("tenant", ""))
+    return 204, None, {"Content-Length": "0"}
 
 
 def _rate_limit_identity(path_params: dict[str, str] | None) -> str:
@@ -1543,7 +1642,7 @@ def create_webhook(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 201, OUTBOX.create_webhook(payload), {}
+    return 201, _outbox_store().create_webhook(payload), {}
 
 
 def list_webhooks(
@@ -1551,7 +1650,7 @@ def list_webhooks(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.list_webhooks(), {}
+    return 200, _outbox_store().list_webhooks(), {}
 
 
 def get_webhook(
@@ -1559,7 +1658,7 @@ def get_webhook(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.get_webhook((path_params or {}).get("id", "")), {}
+    return 200, _outbox_store().get_webhook((path_params or {}).get("id", "")), {}
 
 
 def patch_webhook(
@@ -1567,7 +1666,11 @@ def patch_webhook(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.patch_webhook((path_params or {}).get("id", ""), payload), {}
+    return (
+        200,
+        _outbox_store().patch_webhook((path_params or {}).get("id", ""), payload),
+        {},
+    )
 
 
 def delete_webhook(
@@ -1575,7 +1678,7 @@ def delete_webhook(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    OUTBOX.delete_webhook((path_params or {}).get("id", ""))
+    _outbox_store().delete_webhook((path_params or {}).get("id", ""))
     return 204, None, {"Content-Length": "0"}
 
 
@@ -1586,7 +1689,7 @@ def list_outbox(
 ) -> tuple[int, object, dict[str, str]]:
     filters = validate_query_params(_OUTBOX_QUERY_PARAMETERS, query)
     normalized = [(name, str(value)) for name, value in filters.items()]
-    return 200, OUTBOX.list_outbox(normalized), {}
+    return 200, _outbox_store().list_outbox(normalized), {}
 
 
 def get_outbox(
@@ -1594,7 +1697,7 @@ def get_outbox(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.get_outbox((path_params or {}).get("id", "")), {}
+    return 200, _outbox_store().get_outbox((path_params or {}).get("id", "")), {}
 
 
 def process_outbox(
@@ -1605,7 +1708,7 @@ def process_outbox(
     values = payload if isinstance(payload, dict) else {}
     return (
         200,
-        OUTBOX.process_due(
+        _outbox_store().process_due(
             ignore_schedule=values.get("ignore_schedule", False),
             max_items=values.get("max", 50),
         ),
@@ -1618,7 +1721,7 @@ def requeue_outbox(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.requeue((path_params or {}).get("id", "")), {}
+    return 200, _outbox_store().requeue((path_params or {}).get("id", "")), {}
 
 
 def get_dispatcher(
@@ -1626,7 +1729,7 @@ def get_dispatcher(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.get_dispatcher(), {}
+    return 200, _outbox_store().get_dispatcher(), {}
 
 
 def put_dispatcher(
@@ -1634,7 +1737,7 @@ def put_dispatcher(
     path_params: dict[str, str] | None = None,
     payload: object = None,
 ) -> tuple[int, object, dict[str, str]]:
-    return 200, OUTBOX.configure_dispatcher(payload), {}
+    return 200, _outbox_store().configure_dispatcher(payload), {}
 
 
 def create_job(
@@ -1644,7 +1747,7 @@ def create_job(
 ) -> tuple[int, object, dict[str, str]]:
     """Queue a validated background job."""
     values = payload if isinstance(payload, dict) else {}
-    job = JOB_RUNNER.submit(values["type"], values.get("params"))
+    job = _job_runner().submit(values["type"], values.get("params"))
     return 202, job, {"Location": f"/jobs/{job['id']}"}
 
 
@@ -1655,7 +1758,7 @@ def list_jobs(
 ) -> tuple[int, object, dict[str, str]]:
     """Return filtered, paginated jobs in creation order."""
     filters = validate_query_params(_JOB_LIST_QUERY_PARAMETERS, query)
-    return 200, JOB_RUNNER.list_jobs(**filters), {}
+    return 200, _job_runner().list_jobs(**filters), {}
 
 
 def _job_id(path_params: dict[str, str] | None) -> int | None:
@@ -1679,7 +1782,7 @@ def get_job(
     job_id = _job_id(path_params)
     if job_id is None:
         raise ApiError(404, "job_not_found", "Job not found")
-    job = JOB_RUNNER.get(job_id, wait_ms=filters.get("wait_ms", 0))
+    job = _job_runner().get(job_id, wait_ms=filters.get("wait_ms", 0))
     if job is None:
         raise ApiError(404, "job_not_found", "Job not found")
     return 200, job, {}
@@ -1694,7 +1797,7 @@ def cancel_job(
     job_id = _job_id(path_params)
     if job_id is None:
         raise ApiError(404, "job_not_found", "Job not found")
-    job = JOB_RUNNER.cancel(job_id)
+    job = _job_runner().cancel(job_id)
     if job is None:
         raise ApiError(404, "job_not_found", "Job not found")
     return 200, job, {}
@@ -1842,6 +1945,16 @@ _ADJUST_STOCK_SCHEMA = SCHEMAS["AdjustStock"]
 _CATEGORY_LIST_RESPONSE_SCHEMA = SCHEMAS["CategoryList"]
 _AUDIT_QUERY_PARAMETERS = [
     {
+        "name": "tenant",
+        "in": "query",
+        "schema": {
+            "type": "string",
+            "maxLength": 24,
+            "pattern": r"^(\*|[a-z0-9][a-z0-9-]{0,23})$",
+        },
+        "description": "Filter by tenant; '*' includes all tenants.",
+    },
+    {
         "name": "method",
         "in": "query",
         "schema": {"type": "string", "enum": ["POST", "PUT", "PATCH", "DELETE"]},
@@ -1917,6 +2030,7 @@ _AUDIT_ENTRY_SCHEMA = {
         "status",
         "outcome",
         "request_id",
+        "tenant",
         "changes",
     ],
     "properties": {
@@ -1945,6 +2059,10 @@ _AUDIT_ENTRY_SCHEMA = {
             "enum": ["success", "denied", "rejected", "error"],
         },
         "request_id": {"type": "string"},
+        "tenant": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,23}$",
+        },
         "changes": {"type": "object", "nullable": True},
         "replay": {"type": "boolean", "enum": [True]},
     },
@@ -2106,13 +2224,14 @@ _FIXTURE_RESPONSE_SCHEMA = {
 }
 _KEY_CREATION_RESPONSE_SCHEMA = {
     "type": "object",
-    "required": ["key_id", "role", "label", "key", "created_at"],
+    "required": ["key_id", "role", "label", "key", "created_at", "tenants"],
     "properties": {
         "key_id": {"type": "string"},
         "role": {"type": "string", "enum": ["read", "write", "admin"]},
         "label": {"type": "string"},
         "key": {"type": "string"},
         "created_at": {"type": "string", "format": "date-time"},
+        "tenants": {"type": "array", "items": {"type": "string"}, "nullable": True},
     },
     "additionalProperties": False,
 }
@@ -2132,6 +2251,7 @@ _KEY_LIST_RESPONSE_SCHEMA = {
                     "last_used_at",
                     "fingerprint",
                     "status",
+                    "tenants",
                 ],
                 "properties": {
                     "key_id": {"type": "string"},
@@ -2151,6 +2271,11 @@ _KEY_LIST_RESPONSE_SCHEMA = {
                         "pattern": "^[0-9a-f]{8}$",
                     },
                     "status": {"type": "string", "enum": ["active", "grace"]},
+                    "tenants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "nullable": True,
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -3195,11 +3320,16 @@ ROUTES = (
         "response_schemas": {
             "200": {
                 "type": "object",
-                "required": ["key_id", "role", "label"],
+                "required": ["key_id", "role", "label", "tenants"],
                 "properties": {
                     "key_id": {"type": "string"},
                     "role": {"type": "string", "enum": ["read", "write", "admin"]},
                     "label": {"type": "string"},
+                    "tenants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "nullable": True,
+                    },
                 },
                 "additionalProperties": False,
             }
@@ -3394,6 +3524,13 @@ ROUTES = (
                     "enum": ["read", "write", "admin"],
                 },
                 "label": {"type": "string", "minLength": 1, "maxLength": 40},
+                "tenants": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,23}$"},
+                },
             },
             "additionalProperties": False,
         },
@@ -3755,7 +3892,18 @@ ROUTES = (
                     "minimum": 1,
                     "maximum": (1 << 63) - 1,
                 },
-            }
+            },
+            {
+                "name": "tenant",
+                "in": "query",
+                "required": False,
+                "description": "Filter by tenant; '*' includes all tenants.",
+                "schema": {
+                    "type": "string",
+                    "maxLength": 24,
+                    "pattern": "^(\\*|[a-z0-9][a-z0-9-]{0,23})$",
+                },
+            },
         ],
         "responses": ["200", "401", "403", "404"],
         "response_schemas": {"200": _AUDIT_ENTRY_SCHEMA},
@@ -3763,5 +3911,94 @@ ROUTES = (
             "404": "The sequence is not retained (audit_entry_not_found)."
         },
     },
+    {
+        "method": "GET",
+        "path": "/admin/tenants",
+        "handler": list_tenants,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "listTenants",
+        "summary": "List tenants and resource counts",
+        "responses": ["200", "401", "403"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["items", "total"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": [
+                                "tenant",
+                                "orders",
+                                "products",
+                                "webhooks",
+                                "jobs",
+                                "created_at",
+                            ],
+                            "properties": {
+                                "tenant": {"type": "string"},
+                                "orders": {"type": "integer", "minimum": 0},
+                                "products": {"type": "integer", "minimum": 0},
+                                "webhooks": {"type": "integer", "minimum": 0},
+                                "jobs": {"type": "integer", "minimum": 0},
+                                "created_at": {"type": "string"},
+                            },
+                        },
+                    },
+                    "total": {"type": "integer", "minimum": 0},
+                },
+            }
+        },
+    },
+    {
+        "method": "DELETE",
+        "path": "/admin/tenants/{tenant}",
+        "handler": delete_tenant,
+        "role": "admin",
+        "auth_required": True,
+        "rate_limited": False,
+        "operation_id": "deleteTenant",
+        "summary": "Delete a tenant and its data",
+        "parameters": [
+            {
+                "name": "tenant",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,23}$"},
+            }
+        ],
+        "responses": ["204", "400", "401", "403", "404", "409"],
+        "error_responses": {
+            "404": "The tenant does not exist (tenant_not_found).",
+            "409": "The default tenant is protected (default_tenant_protected).",
+        },
+    },
     *_CSV_ROUTES,
+)
+
+_TENANT_SCOPED_PREFIXES = (
+    "/orders",
+    "/products",
+    "/categories",
+    "/jobs",
+    "/webhooks",
+    "/outbox",
+    "/audit",
+    "/exports",
+    "/imports",
+    "/search",
+    "/v2/orders",
+)
+ROUTES = tuple(
+    {
+        **route,
+        "tenant_scoped": any(
+            str(route["path"]) == prefix or str(route["path"]).startswith(prefix + "/")
+            for prefix in _TENANT_SCOPED_PREFIXES
+        ),
+    }
+    for route in ROUTES
 )

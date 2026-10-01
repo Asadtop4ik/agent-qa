@@ -31,7 +31,7 @@ class AuditRouteTests(unittest.TestCase):
                 [(name, str(value)) for name, value in expected.items()]
             )
         self.assertEqual((status, body, headers), (200, {"items": []}, {}))
-        query.assert_called_once_with(**expected)
+        query.assert_called_once_with(**expected, tenant="default")
 
     def test_list_rejects_unknown_duplicate_and_out_of_range_values(self):
         for query in (
@@ -58,14 +58,14 @@ class AuditRouteTests(unittest.TestCase):
             status, body, headers = list_audit([("resource", "jobs")])
         self.assertEqual((status, body, headers), (200, {"items": []}, {}))
         query.assert_called_once_with(
-            resource="jobs", since_seq=0, limit=50, order="desc"
+            resource="jobs", since_seq=0, limit=50, order="desc", tenant="default"
         )
 
     def test_get_entry_returns_retained_entry_and_rejects_invalid_or_missing_seq(self):
         entry = {"seq": 7}
         with patch("agent_qa.routes.AUDIT_LOG.get", return_value=entry) as get:
             self.assertEqual(get_audit_entry([], {"seq": "7"}), (200, entry, {}))
-            get.assert_called_once_with(7)
+            get.assert_called_once_with(7, tenant="default")
         with patch("agent_qa.routes.AUDIT_LOG.get", return_value=None):
             for seq in ("0", "99999999999999999999999", "nope"):
                 with self.subTest(seq=seq), self.assertRaises(ApiError) as error:

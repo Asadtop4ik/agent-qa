@@ -13,7 +13,7 @@ from agent_qa.routes import ROUTES
 from agent_qa.server import Handler, allowed_methods
 
 
-AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test"}
+AUTH_IDENTITY = {"key_id": "test", "role": "admin", "label": "test", "tenants": None}
 
 
 class BulkApiDispatchTests(unittest.TestCase):

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from agent_qa.audit import AuditLog
-from agent_qa.context import RequestContext
+from agent_qa.context import RequestContext, clear_context, set_context
 
 
 class AuditLogTests(unittest.TestCase):
@@ -152,6 +152,27 @@ class AuditLogTests(unittest.TestCase):
         ):
             with self.subTest(params=params), self.assertRaises(ValueError):
                 log.query(**params)
+
+    def test_audit_entries_are_filtered_by_request_tenant(self):
+        log = AuditLog(10)
+        log.append(RequestContext("default-write"), "POST", "/orders", "/orders", 201)
+        log.append(
+            RequestContext("tenant-write", tenant="acme"),
+            "POST",
+            "/orders",
+            "/orders",
+            201,
+        )
+        self.assertEqual(log.query()["total_matching"], 1)
+        self.assertEqual(log.query(tenant="acme")["items"][0]["tenant"], "acme")
+        self.assertIsNone(log.get(2))
+        self.assertEqual(log.get(2, tenant="acme")["tenant"], "acme")
+        self.assertEqual(log.query(tenant="*")["total_matching"], 2)
+        set_context(RequestContext("tenant-read", tenant="acme"))
+        try:
+            self.assertEqual(log.query()["items"][0]["tenant"], "acme")
+        finally:
+            clear_context()
 
 
 if __name__ == "__main__":
