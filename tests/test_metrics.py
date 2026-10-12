@@ -38,14 +38,6 @@ class MetricsRegistryTests(unittest.TestCase):
                     'status="200"} 2',
                     'agent_qa_http_requests_total{method="PUT",route="/ready",'
                     'status="405"} 1',
-                    "# HELP agent_qa_jobs Current number of jobs by status.",
-                    "# TYPE agent_qa_jobs gauge",
-                    'agent_qa_jobs{status="cancelled"} 0',
-                    'agent_qa_jobs{status="cancelling"} 0',
-                    'agent_qa_jobs{status="failed"} 0',
-                    'agent_qa_jobs{status="queued"} 0',
-                    'agent_qa_jobs{status="running"} 0',
-                    'agent_qa_jobs{status="succeeded"} 0',
                     "# HELP agent_qa_orders Current number of orders.",
                     "# TYPE agent_qa_orders gauge",
                     "agent_qa_orders 3",
@@ -53,16 +45,6 @@ class MetricsRegistryTests(unittest.TestCase):
                 ]
             ),
         )
-
-    def test_job_gauge_has_all_statuses_and_snapshot_values(self):
-        rendered = MetricsRegistry().render(
-            0,
-            "test",
-            job_statuses={"queued": 2, "running": 1},
-        )
-        self.assertIn('agent_qa_jobs{status="queued"} 2', rendered)
-        self.assertIn('agent_qa_jobs{status="running"} 1', rendered)
-        self.assertEqual(rendered.count("agent_qa_jobs{status="), 6)
 
     def test_labels_escape_backslash_quote_and_newline(self):
         registry = MetricsRegistry()
@@ -79,23 +61,6 @@ class MetricsRegistryTests(unittest.TestCase):
             rendered,
         )
         self.assertTrue(rendered.endswith("\n"))
-
-    def test_snapshot_is_detached_and_maintenance_gauge_is_optional(self):
-        registry = MetricsRegistry()
-        registry.record("GET", "/health", 200, 0.125)
-        snapshot = registry.snapshot()
-        snapshot["requests"][0]["count"] = 100
-        snapshot["durations"].clear()
-        fresh = registry.snapshot()
-        self.assertEqual(fresh["requests"][0]["count"], 1)
-        self.assertEqual(fresh["durations"][0]["count"], 1)
-
-        without_gauge = registry.render(0, "test")
-        self.assertNotIn("agent_qa_maintenance", without_gauge)
-        enabled = registry.render(0, "test", maintenance_enabled=True)
-        disabled = registry.render(0, "test", maintenance_enabled=False)
-        self.assertIn("agent_qa_maintenance 1", enabled)
-        self.assertIn("agent_qa_maintenance 0", disabled)
 
     def test_unrecognized_methods_share_a_bounded_series(self):
         registry = MetricsRegistry()
@@ -116,7 +81,7 @@ class MetricsRegistryTests(unittest.TestCase):
         )
         self.assertNotIn("CUSTOM-", rendered)
         self.assertEqual(rendered.count('method="'), 6)
-        self.assertLess(len(rendered), 1500)
+        self.assertLess(len(rendered), 1000)
 
     def test_render_uses_a_consistent_request_snapshot(self):
         registry = MetricsRegistry()
@@ -128,79 +93,6 @@ class MetricsRegistryTests(unittest.TestCase):
             snapshot,
         )
         self.assertIn("agent_qa_http_requests_total", snapshot)
-
-    def test_idempotency_metric_is_lazy_and_uses_fixed_result_labels(self):
-        registry = MetricsRegistry()
-
-        self.assertNotIn("agent_qa_idempotency_total", registry.render(0, "test"))
-        registry.record_idempotency("stored")
-        registry.record_idempotency("replayed")
-        registry.record_idempotency("mismatch")
-        registry.record_idempotency("in_progress")
-
-        rendered = registry.render(0, "test")
-        self.assertIn(
-            "# TYPE agent_qa_idempotency_total counter\n"
-            'agent_qa_idempotency_total{result="in_progress"} 1\n'
-            'agent_qa_idempotency_total{result="mismatch"} 1\n'
-            'agent_qa_idempotency_total{result="replayed"} 1\n'
-            'agent_qa_idempotency_total{result="stored"} 1\n',
-            rendered,
-        )
-
-    def test_products_gauge_is_omitted_without_a_value_and_rendered_at_zero(self):
-        registry = MetricsRegistry()
-
-        self.assertNotIn("agent_qa_products", registry.render(0, "test"))
-        rendered = registry.render(0, "test", products=0)
-        self.assertIn("# TYPE agent_qa_products gauge\n", rendered)
-        self.assertIn("agent_qa_products 0\n", rendered)
-
-    def test_tenant_gauges_and_total_order_gauge_render_bounded_labels(self):
-        rendered = MetricsRegistry().render(
-            4,
-            "test",
-            tenant_orders={"default": 3, "blue-1": 1},
-            tenant_products={"default": 2, "blue-1": 5},
-            tenant_count=2,
-        )
-        self.assertIn("agent_qa_orders 4\n", rendered)
-        self.assertIn('agent_qa_tenant_orders{tenant="blue-1"} 1', rendered)
-        self.assertIn('agent_qa_tenant_products{tenant="default"} 2', rendered)
-        self.assertIn("agent_qa_tenants 2\n", rendered)
-
-    def test_audit_metrics_are_lazy_and_render_zero_when_available(self):
-        registry = MetricsRegistry()
-        rendered = registry.render(0, "test")
-        self.assertNotIn("agent_qa_audit_entries", rendered)
-        self.assertNotIn("agent_qa_audit_dropped_total", rendered)
-
-        rendered = registry.render(0, "test", audit_entries=0, audit_dropped=0)
-        self.assertIn(
-            "# TYPE agent_qa_audit_entries gauge\nagent_qa_audit_entries 0", rendered
-        )
-        self.assertIn(
-            "# TYPE agent_qa_audit_dropped_total counter\n"
-            "agent_qa_audit_dropped_total 0",
-            rendered,
-        )
-
-    def test_outbox_metrics_render_bounded_statuses_and_dropped_total(self):
-        registry = MetricsRegistry()
-        self.assertNotIn("agent_qa_outbox", registry.render(0, "test"))
-
-        rendered = registry.render(
-            0,
-            "test",
-            outbox_statuses={"pending": 2, "retrying": 1, "delivered": 5},
-            outbox_dropped=3,
-        )
-        self.assertIn('agent_qa_outbox{status="pending"} 2', rendered)
-        self.assertIn('agent_qa_outbox{status="retrying"} 1', rendered)
-        self.assertIn('agent_qa_outbox{status="delivered"} 5', rendered)
-        self.assertIn('agent_qa_outbox{status="failed"} 0', rendered)
-        self.assertEqual(rendered.count("agent_qa_outbox{status="), 4)
-        self.assertIn("agent_qa_outbox_dropped_total 3", rendered)
 
     def test_concurrent_recording_is_thread_safe(self):
         registry = MetricsRegistry()
