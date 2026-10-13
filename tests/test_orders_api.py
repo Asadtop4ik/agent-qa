@@ -155,6 +155,20 @@ class OrdersApiTests(unittest.TestCase):
 
     def test_post_validation_and_body_errors(self):
         customer = self.customer_id()
+        error = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {"customer_id": 3, "total_cents": True, "z": 1},
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            [item["field"] for item in error["details"]],
+            ["z", "customer_id", "total_cents"],
+        )
+
         invalid_payloads = (
             {},
             {"customer_id": customer, "total_cents": True},

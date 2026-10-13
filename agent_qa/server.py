@@ -228,6 +228,14 @@ class Handler(BaseHTTPRequestHandler):
         if request_schema is not None:
             errors = validate(request_schema, payload)
             if errors:
+                if parsed.path == "/orders" or parsed.path.startswith("/orders/"):
+                    errors = sorted(
+                        errors,
+                        key=lambda detail: (
+                            detail["message"] != "Unknown field",
+                            detail["field"],
+                        ),
+                    )
                 raise ApiError(
                     400,
                     "validation_error",
