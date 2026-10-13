@@ -16,6 +16,10 @@ Write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before sta
 
 `GET /schemas` lists the named request and response schemas. `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks a JSON value and returns its validation errors. These endpoints are public; the same named schemas appear in `GET /openapi.json` under `components.schemas`.
 
+## Products
+
+`POST /products` creates products, while `GET /products` supports category, tag, stock, price, text, sorting, and pagination filters. Product writes require the configured API key. `GET /products/{id}` reads a product, `PATCH` updates its editable fields, and `DELETE` removes it. Use `POST /products/{id}/adjust-stock` for atomic inventory changes and `GET /categories` for current category totals.
+
 ## Layout
 
 - `app.py` starts the HTTP service.

@@ -278,6 +278,9 @@ class Handler(BaseHTTPRequestHandler):
                 "validation_error": 400,
                 "invalid_query": 400,
                 "store_full": 409,
+                "duplicate_sku": 409,
+                "insufficient_stock": 409,
+                "product_not_found": 404,
                 "order_locked": 409,
                 "invalid_transition": 409,
             }.get(error.code, 500)

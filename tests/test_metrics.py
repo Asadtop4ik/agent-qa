@@ -5,6 +5,15 @@ from agent_qa.metrics import MetricsRegistry, _escape_label
 
 
 class MetricsRegistryTests(unittest.TestCase):
+    def test_products_gauge_is_rendered_only_when_a_value_is_supplied(self):
+        registry = MetricsRegistry()
+
+        self.assertNotIn("agent_qa_products", registry.render(0, "test"))
+
+        populated = registry.render(0, "test", 3)
+        self.assertIn("# TYPE agent_qa_products gauge", populated)
+        self.assertIn("agent_qa_products 3", populated)
+
     def test_render_includes_metric_metadata_and_sorted_samples(self):
         registry = MetricsRegistry()
         registry.record("PUT", "/ready", 405, 0.25)
