@@ -228,23 +228,6 @@ class Handler(BaseHTTPRequestHandler):
         if request_schema is not None:
             errors = validate(request_schema, payload)
             if errors:
-                if (
-                    route.get("method") == "POST"
-                    and parsed.path == "/orders"
-                    and isinstance(payload, dict)
-                    and "items" not in payload
-                    and "total_cents" not in payload
-                ):
-                    errors = [
-                        (
-                            {"field": "total_cents", "message": "Required"}
-                            if detail["field"] == "items"
-                            and detail["message"]
-                            == "Either items or total_cents is required"
-                            else detail
-                        )
-                        for detail in errors
-                    ]
                 if parsed.path == "/orders" or parsed.path.startswith("/orders/"):
                     errors = sorted(
                         errors,
