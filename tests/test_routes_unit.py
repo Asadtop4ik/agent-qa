@@ -257,7 +257,7 @@ class RouteUnitTests(unittest.TestCase):
                 {},
                 [
                     ("customer_id", "Required"),
-                    ("items", "Either items or total_cents is required"),
+                    ("total_cents", "Required"),
                 ],
             ),
             ("POST", "/orders", {"total_cents": 1}, [("customer_id", "Required")]),
@@ -265,7 +265,7 @@ class RouteUnitTests(unittest.TestCase):
                 "POST",
                 "/orders",
                 {"customer_id": "abc"},
-                [("items", "Either items or total_cents is required")],
+                [("total_cents", "Required")],
             ),
             (
                 "POST",
