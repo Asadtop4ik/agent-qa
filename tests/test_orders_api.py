@@ -155,6 +155,20 @@ class OrdersApiTests(unittest.TestCase):
 
     def test_post_validation_and_body_errors(self):
         customer = self.customer_id()
+        error = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {"customer_id": 3, "total_cents": True, "z": 1},
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            [item["field"] for item in error["details"]],
+            ["z", "customer_id", "total_cents"],
+        )
+
         invalid_payloads = (
             {},
             {"customer_id": customer, "total_cents": True},
@@ -176,8 +190,13 @@ class OrdersApiTests(unittest.TestCase):
 
         status, _, body = self.request("POST", "/orders", raw_body=b"not json")
         self.assert_error((status, _, body), 400, "invalid_json")
-        self.assert_error(
-            self.request("POST", "/orders", raw_body=b"[]"), 400, "invalid_json"
+        error = self.assert_error(
+            self.request("POST", "/orders", raw_body=b"[]"),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            error["details"], [{"field": "body", "message": "Must be a JSON object"}]
         )
         self.assert_error(
             self.request(

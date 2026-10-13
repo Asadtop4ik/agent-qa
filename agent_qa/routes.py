@@ -12,17 +12,17 @@ from agent_qa.orders import (
     DEFAULT_OFFSET,
     MAX_CUSTOMER_ID_LENGTH,
     MAX_LIMIT,
-    MAX_TOTAL_CENTS,
     MIN_CUSTOMER_ID_LENGTH,
     MIN_LIMIT,
     MIN_OFFSET,
-    MIN_TOTAL_CENTS,
     STATUSES,
     OrderStore,
     validate_create,
     validate_patch,
     validate_query,
 )
+from agent_qa.schemas import SCHEMAS
+from agent_qa.validation import validate
 
 
 ORDER_STORE = OrderStore()
@@ -178,6 +178,42 @@ def openapi(
     return 200, build_openapi(ROUTES, GIT_SHA), {}
 
 
+def list_schemas(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return the names of all registered request and response schemas."""
+    return 200, {"items": sorted(SCHEMAS)}, {}
+
+
+def get_schema(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Return a named schema from the registry."""
+    name = (path_params or {}).get("name", "")
+    schema = SCHEMAS.get(name)
+    if schema is None:
+        raise ApiError(404, "schema_not_found", "Schema not found")
+    return 200, schema, {}
+
+
+def validate_schema(
+    query: list[tuple[str, str]],
+    path_params: dict[str, str] | None = None,
+    payload: object = None,
+) -> tuple[int, object, dict[str, str]]:
+    """Validate a JSON value against a named schema."""
+    name = (path_params or {}).get("name", "")
+    schema = SCHEMAS.get(name)
+    if schema is None:
+        raise ApiError(404, "schema_not_found", "Schema not found")
+    errors = validate(schema, payload)
+    return 200, {"valid": not errors, "errors": errors}, {}
+
+
 def create_order(
     query: list[tuple[str, str]],
     path_params: dict[str, str] | None = None,
@@ -211,7 +247,7 @@ def list_orders(
 
 def _order_id(path_params: dict[str, str] | None) -> int | None:
     raw_id = (path_params or {}).get("id", "")
-    if not raw_id.isascii() or not raw_id.isdigit():
+    if len(raw_id) > 32 or not raw_id.isascii() or not raw_id.isdigit():
         return None
     order_id = int(raw_id)
     return order_id if order_id > 0 else None
@@ -270,53 +306,9 @@ _CUSTOMER_ID_SCHEMA = {
     "minLength": MIN_CUSTOMER_ID_LENGTH,
     "maxLength": MAX_CUSTOMER_ID_LENGTH,
 }
-_TOTAL_CENTS_SCHEMA = {
-    "type": "integer",
-    "minimum": MIN_TOTAL_CENTS,
-    "maximum": MAX_TOTAL_CENTS,
-}
 _STATUS_SCHEMA = {"type": "string", "enum": list(STATUSES)}
-_CREATE_ORDER_SCHEMA = {
-    "type": "object",
-    "required": ["customer_id", "total_cents"],
-    "properties": {
-        "customer_id": _CUSTOMER_ID_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-    },
-    "additionalProperties": False,
-}
-_UPDATE_ORDER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "status": _STATUS_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-    },
-    "minProperties": 1,
-    "additionalProperties": False,
-}
-_ORDER_RESPONSE_SCHEMA = {
-    "type": "object",
-    "required": ["id", "customer_id", "total_cents", "status", "created_at"],
-    "properties": {
-        "id": {"type": "integer", "minimum": 1},
-        "customer_id": _CUSTOMER_ID_SCHEMA,
-        "total_cents": _TOTAL_CENTS_SCHEMA,
-        "status": _STATUS_SCHEMA,
-        "created_at": {"type": "string", "format": "date-time"},
-    },
-    "additionalProperties": False,
-}
-_ORDER_LIST_RESPONSE_SCHEMA = {
-    "type": "object",
-    "required": ["items", "total", "limit", "offset"],
-    "properties": {
-        "items": {"type": "array", "items": _ORDER_RESPONSE_SCHEMA},
-        "total": {"type": "integer", "minimum": 0},
-        "limit": {"type": "integer", "minimum": MIN_LIMIT, "maximum": MAX_LIMIT},
-        "offset": {"type": "integer", "minimum": MIN_OFFSET},
-    },
-    "additionalProperties": False,
-}
+_ORDER_RESPONSE_SCHEMA = SCHEMAS["Order"]
+_ORDER_LIST_RESPONSE_SCHEMA = SCHEMAS["OrderList"]
 _OPENAPI_RESPONSE_SCHEMA = {
     "type": "object",
     "required": ["openapi", "info", "paths", "components"],
@@ -511,6 +503,87 @@ ROUTES = (
     },
     {
         "method": "GET",
+        "path": "/schemas",
+        "handler": list_schemas,
+        "auth_required": False,
+        "operation_id": "listSchemas",
+        "summary": "List registered schemas",
+        "responses": ["200"],
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["items"],
+                "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+                "additionalProperties": False,
+            }
+        },
+    },
+    {
+        "method": "GET",
+        "path": "/schemas/{name}",
+        "handler": get_schema,
+        "auth_required": False,
+        "operation_id": "getSchema",
+        "summary": "Read a registered schema",
+        "parameters": [
+            {
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"},
+            }
+        ],
+        "responses": ["200", "404"],
+        "response_schemas": {
+            "200": {"type": "object"},
+            "404": {"$ref": "#/components/schemas/Error"},
+        },
+    },
+    {
+        "method": "POST",
+        "path": "/schemas/{name}/validate",
+        "handler": validate_schema,
+        "body": True,
+        "auth_required": False,
+        "operation_id": "validateSchema",
+        "summary": "Validate a JSON value against a registered schema",
+        "parameters": [
+            {
+                "name": "name",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "string"},
+            }
+        ],
+        "responses": ["200", "400", "404", "411", "413", "415"],
+        "request_schema": {},
+        "response_schemas": {
+            "200": {
+                "type": "object",
+                "required": ["valid", "errors"],
+                "properties": {
+                    "valid": {"type": "boolean"},
+                    "errors": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["field", "message"],
+                            "properties": {
+                                "field": {"type": "string"},
+                                "message": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+            "400": {"$ref": "#/components/schemas/Error"},
+            "404": {"$ref": "#/components/schemas/Error"},
+        },
+    },
+    {
+        "method": "GET",
         "path": "/orders",
         "handler": list_orders,
         "auth_required": False,
@@ -566,7 +639,7 @@ ROUTES = (
         "auth_required": True,
         "operation_id": "createOrder",
         "summary": "Create an order",
-        "request_schema": _CREATE_ORDER_SCHEMA,
+        "request_schema": SCHEMAS["CreateOrder"],
         "responses": ["201", "400", "401", "409", "411", "413", "415"],
         "response_schemas": {"201": _ORDER_RESPONSE_SCHEMA},
     },
@@ -600,7 +673,7 @@ ROUTES = (
         "operation_id": "updateOrder",
         "summary": "Update an order",
         "parameters": [_ORDER_ID],
-        "request_schema": _UPDATE_ORDER_SCHEMA,
+        "request_schema": SCHEMAS["UpdateOrder"],
         "responses": ["200", "400", "401", "404", "409", "413", "415"],
         "response_schemas": {"200": _ORDER_RESPONSE_SCHEMA},
     },

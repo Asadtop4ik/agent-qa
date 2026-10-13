@@ -14,6 +14,8 @@ curl http://127.0.0.1:8080/ready
 
 Write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before starting the service to configure the key. If the variable is unset or empty, the service uses the documented synthetic fallback `qa-synthetic-key`; this fallback is for synthetic QA environments only. Read endpoints remain public.
 
+`GET /schemas` lists the named request and response schemas. `GET /schemas/{name}` returns one schema, and `POST /schemas/{name}/validate` checks a JSON value and returns its validation errors. These endpoints are public; the same named schemas appear in `GET /openapi.json` under `components.schemas`.
+
 ## Layout
 
 - `app.py` starts the HTTP service.
