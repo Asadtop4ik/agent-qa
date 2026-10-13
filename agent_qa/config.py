@@ -16,3 +16,17 @@ API_KEY = os.environ.get("AGENT_QA_API_KEY") or "qa-synthetic-key"
 def port() -> int:
     """Return the configured HTTP port."""
     return int(os.environ.get("APP_PORT", "8080"))
+
+
+def idempotency_ttl_seconds() -> int:
+    """Return the validated idempotency response lifetime."""
+    raw_value = os.environ.get("AGENT_QA_IDEMPOTENCY_TTL_SECONDS", "600")
+    try:
+        value = int(raw_value)
+    except (ValueError, TypeError) as error:
+        raise ValueError(
+            "AGENT_QA_IDEMPOTENCY_TTL_SECONDS must be between 1 and 86400"
+        ) from error
+    if not 1 <= value <= 86400:
+        raise ValueError("AGENT_QA_IDEMPOTENCY_TTL_SECONDS must be between 1 and 86400")
+    return value

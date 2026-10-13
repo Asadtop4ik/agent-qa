@@ -104,6 +104,35 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertIn("/synthetic-openapi-drift", spec["paths"])
         self.assertIn("get", spec["paths"]["/synthetic-openapi-drift"])
 
+    def test_idempotent_routes_document_optional_key_and_conflicts(self):
+        spec = build_openapi(ROUTES, "synthetic-sha")
+        for path in ("/orders", "/products"):
+            operation = spec["paths"][path]["post"]
+            key = next(
+                parameter
+                for parameter in operation["parameters"]
+                if parameter["name"] == "Idempotency-Key"
+            )
+            self.assertEqual(key["in"], "header")
+            self.assertFalse(key["required"])
+            self.assertEqual(key["schema"]["minLength"], 1)
+            self.assertEqual(key["schema"]["maxLength"], 64)
+            self.assertEqual(key["schema"]["pattern"], "^[A-Za-z0-9._:-]+$")
+            self.assertIn("422", operation["responses"])
+            self.assertIn("409", operation["responses"])
+            self.assertIn(
+                "idempotency_key_reused",
+                operation["responses"]["422"]["description"],
+            )
+            self.assertIn(
+                "idempotency_in_progress",
+                operation["responses"]["409"]["description"],
+            )
+            success_headers = operation["responses"]["201"]["headers"]
+            self.assertIn("Idempotent-Replay", success_headers)
+            self.assertIn("Idempotency-Key", success_headers)
+            self.assertIn("X-Request-Id", success_headers)
+
     def test_named_schemas_are_published_and_schema_routes_are_public(self):
         spec = build_openapi(ROUTES, "synthetic-sha")
         self.assertEqual(spec["components"]["schemas"], SCHEMAS)

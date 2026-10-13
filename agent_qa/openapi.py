@@ -13,6 +13,28 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
         method = route["method"].lower()
         path = route["path"]
         response_schemas = route.get("response_schemas", {})
+        responses = list(route["responses"])
+        parameters = deepcopy(route.get("parameters", []))
+        if route.get("idempotent"):
+            for status in ("422", "409"):
+                if status not in responses:
+                    responses.append(status)
+            parameters.append(
+                {
+                    "name": "Idempotency-Key",
+                    "in": "header",
+                    "required": False,
+                    "description": (
+                        "Optional key used to replay a successful request safely."
+                    ),
+                    "schema": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64,
+                        "pattern": "^[A-Za-z0-9._:-]+$",
+                    },
+                }
+            )
         operation: dict[str, Any] = {
             "operationId": route["operation_id"],
             "summary": route["summary"],
@@ -31,11 +53,53 @@ def build_openapi(routes: Iterable[dict[str, Any]], git_sha: str) -> dict[str, A
                         else {}
                     ),
                 }
-                for status in route["responses"]
+                for status in responses
             },
         }
-        if route.get("parameters"):
-            operation["parameters"] = deepcopy(route["parameters"])
+        if route.get("idempotent"):
+            success_headers = {
+                "Idempotent-Replay": {
+                    "description": (
+                        "Present as true when the response replays a stored result."
+                    ),
+                    "schema": {"type": "string", "enum": ["true"]},
+                },
+                "Idempotency-Key": {
+                    "description": "Echo of the supplied idempotency key.",
+                    "schema": {"type": "string"},
+                },
+                "X-Request-Id": {
+                    "description": "Request ID for this request, including replays.",
+                    "schema": {"type": "string"},
+                },
+            }
+            for status in route["responses"]:
+                if status.startswith("2"):
+                    response = operation["responses"][status]
+                    response["headers"] = deepcopy(success_headers)
+            for status, description in (
+                (
+                    "422",
+                    "Request error with code idempotency_key_reused when the key "
+                    "was used with a different request body.",
+                ),
+                (
+                    "409",
+                    "Request error with code idempotency_in_progress when a request "
+                    "using this key is still in progress; other route conflicts may "
+                    "also return 409.",
+                ),
+            ):
+                operation["responses"][status] = {
+                    "description": description,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }
+                    },
+                }
+        if parameters:
+            operation["parameters"] = parameters
         if route.get("request_schema") is not None:
             operation["requestBody"] = {
                 "required": True,

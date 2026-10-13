@@ -5,6 +5,20 @@ from agent_qa.metrics import MetricsRegistry, _escape_label
 
 
 class MetricsRegistryTests(unittest.TestCase):
+    def test_idempotency_counter_is_absent_until_recorded_and_labels_are_bounded(self):
+        registry = MetricsRegistry()
+        self.assertNotIn("agent_qa_idempotency_total", registry.render(0, "test"))
+
+        registry.record_idempotency("stored")
+        registry.record_idempotency("stored")
+        registry.record_idempotency("replayed")
+        rendered = registry.render(0, "test")
+        self.assertIn("# TYPE agent_qa_idempotency_total counter", rendered)
+        self.assertIn('agent_qa_idempotency_total{result="stored"} 2', rendered)
+        self.assertIn('agent_qa_idempotency_total{result="replayed"} 1', rendered)
+        with self.assertRaises(ValueError):
+            registry.record_idempotency("unbounded-label")
+
     def test_products_gauge_is_rendered_only_when_a_value_is_supplied(self):
         registry = MetricsRegistry()
 
