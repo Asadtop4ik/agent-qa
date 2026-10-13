@@ -206,6 +206,57 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(customer_schema["maxLength"], orders.MAX_CUSTOMER_ID_LENGTH)
         self.assertEqual(total_schema["minimum"], orders.MIN_TOTAL_CENTS)
         self.assertEqual(total_schema["maximum"], orders.MAX_TOTAL_CENTS)
+        self.assertEqual(
+            create_schema["x-exactlyOne"],
+            {
+                "fields": ["items", "total_cents"],
+                "errorField": "items",
+                "bothMessage": "Cannot be combined with total_cents",
+                "neitherMessage": "Either items or total_cents is required",
+            },
+        )
+        self.assertEqual(
+            create_schema["properties"]["items"]["minItems"],
+            schemas.MIN_ORDER_ITEMS,
+        )
+        self.assertEqual(
+            create_schema["properties"]["items"]["maxItems"],
+            schemas.MAX_ORDER_ITEMS,
+        )
+        create_item_properties = create_schema["properties"]["items"]["items"][
+            "properties"
+        ]
+        self.assertEqual(
+            create_item_properties["product_id"]["minimum"], schemas.MIN_PRODUCT_ID
+        )
+        self.assertEqual(
+            create_item_properties["quantity"]["minimum"],
+            schemas.MIN_ORDER_QUANTITY,
+        )
+        self.assertEqual(
+            create_item_properties["quantity"]["maximum"],
+            schemas.MAX_ORDER_QUANTITY,
+        )
+        order_item_schema = schemas.SCHEMAS["Order"]["properties"]["items"]["items"]
+        item_properties = order_item_schema["properties"]
+        self.assertEqual(
+            set(item_properties),
+            {
+                "product_id",
+                "sku",
+                "name",
+                "quantity",
+                "unit_price_cents",
+                "line_total_cents",
+            },
+        )
+        self.assertEqual(
+            item_properties["quantity"]["maximum"], schemas.MAX_ORDER_QUANTITY
+        )
+        self.assertEqual(
+            schemas.SCHEMAS["Order"]["properties"]["items"]["maxItems"],
+            schemas.MAX_ORDER_ITEMS,
+        )
 
         patch_schema = spec["paths"]["/orders/{id}"]["patch"]["requestBody"]
         patch_schema = patch_schema["content"]["application/json"]["schema"]

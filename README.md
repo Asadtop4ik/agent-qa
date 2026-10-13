@@ -20,6 +20,10 @@ Write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before sta
 
 `POST /products` creates products, while `GET /products` supports category, tag, stock, price, text, sorting, and pagination filters. Product writes require the configured API key. `GET /products/{id}` reads a product, `PATCH` updates its editable fields, and `DELETE` removes it. Use `POST /products/{id}/adjust-stock` for atomic inventory changes and `GET /categories` for current category totals.
 
+## Orders
+
+`POST /orders` accepts exactly one of the legacy `{"customer_id":"...","total_cents":123}` body and an item-based body such as `{"customer_id":"...","items":[{"product_id":1,"quantity":2}]}`. Item orders contain 1–20 lines, each with a quantity from 1 to 1000. They reserve stock atomically and calculate their total from product prices; each returned item keeps the product name, SKU, and unit price captured when the order was created. Updating `total_cents` on an item order returns `409 total_computed`. Cancelling or deleting an unshipped item order releases its reservation once; deleting a shipped order does not restore stock.
+
 ## Layout
 
 - `app.py` starts the HTTP service.

@@ -5,6 +5,7 @@ import platform
 
 from agent_qa.config import FIXTURE_PATH, GIT_SHA
 from agent_qa.errors import ApiError
+from agent_qa.fulfillment import Fulfillment
 from agent_qa.metrics import REGISTRY
 from agent_qa.openapi import build_openapi
 from agent_qa import products as product_api
@@ -230,7 +231,7 @@ def create_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Validate and create an order."""
     values = validate_create(payload)
-    order = ORDER_STORE.create(**values)
+    order = Fulfillment(ORDER_STORE, PRODUCT_STORE).create(**values)
     return 201, order, {"Location": f"/orders/{order['id']}"}
 
 
@@ -285,7 +286,7 @@ def patch_order(
     if order_id is None:
         raise ApiError(404, "order_not_found", "Order not found")
     changes = validate_patch(payload)
-    order = ORDER_STORE.update(order_id, changes)
+    order = Fulfillment(ORDER_STORE, PRODUCT_STORE).update(order_id, changes)
     if order is None:
         raise ApiError(404, "order_not_found", "Order not found")
     return 200, order, {}
@@ -298,7 +299,7 @@ def delete_order(
 ) -> tuple[int, object, dict[str, str]]:
     """Delete an order and return an empty response body."""
     order_id = _order_id(path_params)
-    if order_id is None or not ORDER_STORE.delete(order_id):
+    if order_id is None or not Fulfillment(ORDER_STORE, PRODUCT_STORE).delete(order_id):
         raise ApiError(404, "order_not_found", "Order not found")
     return 204, None, {"Content-Length": "0"}
 

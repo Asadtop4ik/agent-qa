@@ -48,7 +48,12 @@ def validate_create(payload: Any) -> dict[str, Any]:
     if errors:
         raise _validation_error(errors)
     customer_id = payload["customer_id"]
-    return {"customer_id": customer_id, "total_cents": payload["total_cents"]}
+    fields = {"customer_id": customer_id}
+    if "total_cents" in payload:
+        fields["total_cents"] = payload["total_cents"]
+    if "items" in payload:
+        fields["items"] = [dict(item) for item in payload["items"]]
+    return fields
 
 
 def validate_patch(payload: Any) -> dict[str, Any]:
@@ -125,27 +130,35 @@ class OrderStore:
         self._capacity = capacity
         self._orders: dict[int, dict[str, Any]] = {}
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def create(self, customer_id: str, total_cents: int) -> dict[str, Any]:
         fields = validate_create(
             {"customer_id": customer_id, "total_cents": total_cents}
         )
         with self._lock:
-            if len(self._orders) >= self._capacity:
-                raise OrderError("store_full", "Order store is full")
-            order_id = self._next_id
-            self._next_id += 1
-            order = {
-                "id": order_id,
-                **fields,
-                "status": "new",
-                "created_at": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            }
-            self._orders[order_id] = order
-            return dict(order)
+            return self._create_locked(fields)
+
+    def _create_locked(self, fields: dict[str, Any]) -> dict[str, Any]:
+        if len(self._orders) >= self._capacity:
+            raise OrderError("store_full", "Order store is full")
+        order_id = self._next_id
+        order = {
+            "id": order_id,
+            **fields,
+            "items": [dict(item) for item in fields.get("items", [])],
+            "status": "new",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        self._orders[order_id] = order
+        self._next_id += 1
+        return self._copy_order(order)
+
+    @staticmethod
+    def _copy_order(order: dict[str, Any]) -> dict[str, Any]:
+        copied = dict(order)
+        copied["items"] = [dict(item) for item in order.get("items", [])]
+        return copied
 
     def list(
         self,
@@ -165,14 +178,17 @@ class OrderStore:
                 )
             ]
             total = len(matched)
-            return [dict(order) for order in matched[offset : offset + limit]], total
+            return (
+                [self._copy_order(order) for order in matched[offset : offset + limit]],
+                total,
+            )
 
     def get(self, order_id: int) -> dict[str, Any] | None:
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:
             return None
         with self._lock:
             order = self._orders.get(order_id)
-            return dict(order) if order is not None else None
+            return self._copy_order(order) if order is not None else None
 
     def update(self, order_id: int, changes: dict[str, Any]) -> dict[str, Any] | None:
         fields = validate_patch(changes)
@@ -180,6 +196,8 @@ class OrderStore:
             current = self._orders.get(order_id)
             if current is None:
                 return None
+            if "total_cents" in fields and current.get("items"):
+                raise OrderError("total_computed", "Order total is computed from items")
             if "total_cents" in fields and current["status"] != "new":
                 raise OrderError(
                     "order_locked", "Order total can only change while new"
@@ -197,8 +215,9 @@ class OrderStore:
                         "Order status transition is not allowed",
                     )
             updated = {**current, **fields}
+            updated["items"] = [dict(item) for item in updated.get("items", [])]
             self._orders[order_id] = updated
-            return dict(updated)
+            return self._copy_order(updated)
 
     def delete(self, order_id: int) -> bool:
         if isinstance(order_id, bool) or not isinstance(order_id, int) or order_id <= 0:

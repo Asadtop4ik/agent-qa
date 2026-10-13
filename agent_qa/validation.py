@@ -221,6 +221,24 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
                     add(field, f"Must be at most {maximum}")
 
         if isinstance(value, dict):
+            exactly_one = current_schema.get("x-exactlyOne")
+            if isinstance(exactly_one, dict):
+                fields = exactly_one.get("fields")
+                error_field = exactly_one.get("errorField")
+                if (
+                    isinstance(fields, list)
+                    and 1 < len(fields) <= MAX_VALIDATION_NODES
+                    and all(isinstance(name, str) for name in fields)
+                    and isinstance(error_field, str)
+                ):
+                    present_count = sum(name in value for name in fields)
+                    if present_count != 1:
+                        message_key = (
+                            "bothMessage" if present_count > 1 else "neitherMessage"
+                        )
+                        message = exactly_one.get(message_key)
+                        if isinstance(message, str):
+                            add(error_field, message)
             minimum = current_schema.get("minProperties")
             maximum = current_schema.get("maxProperties")
             if isinstance(minimum, int) and len(value) < minimum:

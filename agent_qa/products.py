@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 import re
 import threading
 from typing import Any
@@ -36,6 +37,8 @@ from agent_qa.validation import (
     MAX_QUERY_VALUE_LENGTH,
     validate,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ProductError(OrderError):
@@ -220,8 +223,9 @@ class ProductStore:
         self._capacity = capacity
         self._products: dict[int, dict[str, Any]] = {}
         self._sku_ids: dict[str, int] = {}
+        self._reserved: dict[int, int] = {}
         self._next_id = 1
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def create(self, **payload: Any) -> dict[str, Any]:
         fields = validate_create(payload)
@@ -326,7 +330,27 @@ class ProductStore:
             if product is None:
                 return False
             self._sku_ids.pop(product["sku"], None)
+            self._reserved.pop(product_id, None)
             return True
+
+    def _set_stock_locked(
+        self, product_id: int, stock: int, reserved: int
+    ) -> dict[str, Any]:
+        if stock < MIN_STOCK:
+            raise ProductError("insufficient_stock", "Insufficient stock")
+        if stock + reserved > MAX_STOCK:
+            raise _validation_error(
+                [{"field": "stock", "message": f"Must be at most {MAX_STOCK}"}]
+            )
+        updated = dict(self._products[product_id])
+        updated["stock"] = stock
+        updated["updated_at"] = _timestamp()
+        self._products[product_id] = updated
+        if reserved:
+            self._reserved[product_id] = reserved
+        else:
+            self._reserved.pop(product_id, None)
+        return updated
 
     def adjust_stock(self, product_id: int, delta: int) -> dict[str, Any] | None:
         delta = validate_adjust_stock({"delta": delta})["delta"]
@@ -337,17 +361,127 @@ class ProductStore:
             if current is None:
                 return None
             adjusted = current["stock"] + delta
-            if adjusted < 0:
-                raise ProductError("insufficient_stock", "Insufficient stock")
-            if adjusted > MAX_STOCK:
-                raise _validation_error(
-                    [{"field": "stock", "message": f"Must be at most {MAX_STOCK}"}]
-                )
-            updated = dict(current)
-            updated["stock"] = adjusted
-            updated["updated_at"] = _timestamp()
-            self._products[product_id] = updated
+            updated = self._set_stock_locked(
+                product_id, adjusted, self._reserved.get(product_id, 0)
+            )
             return _copy_product(updated)
+
+    def reserve(self, lines: list[dict[str, int]]) -> None:
+        """Atomically move available stock into reservations for order lines."""
+        with self._lock:
+            details: list[dict[str, str]] = []
+            products: list[tuple[dict[str, Any], int, int]] = []
+            for index, line in enumerate(lines):
+                product_id = line["product_id"]
+                quantity = line["quantity"]
+                current = self._products.get(product_id)
+                if current is None:
+                    raise ProductError(
+                        "product_not_found",
+                        "Product not found",
+                        [
+                            {
+                                "field": f"items[{index}].product_id",
+                                "message": "Unknown product",
+                            }
+                        ],
+                    )
+                products.append((current, product_id, quantity))
+                if current["stock"] < quantity:
+                    details.append(
+                        {
+                            "field": f"items[{index}].quantity",
+                            "message": f"Only {current['stock']} in stock",
+                        }
+                    )
+            if details:
+                raise ProductError("insufficient_stock", "Insufficient stock", details)
+            for current, product_id, quantity in products:
+                self._set_stock_locked(
+                    product_id,
+                    current["stock"] - quantity,
+                    self._reserved.get(product_id, 0) + quantity,
+                )
+
+    def _reservation_snapshot(
+        self, lines: list[dict[str, int]]
+    ) -> dict[int, tuple[dict[str, Any], int]]:
+        """Capture exact catalog state for a transactional reservation rollback."""
+        with self._lock:
+            product_ids = {line["product_id"] for line in lines}
+            return {
+                product_id: (
+                    _copy_product(self._products[product_id]),
+                    self._reserved.get(product_id, 0),
+                )
+                for product_id in product_ids
+            }
+
+    def _restore_reservation_snapshot(
+        self, snapshot: dict[int, tuple[dict[str, Any], int]]
+    ) -> None:
+        """Restore catalog rows and reservation counts without changing timestamps."""
+        with self._lock:
+            for product_id, (product, reserved) in snapshot.items():
+                self._products[product_id] = _copy_product(product)
+                if reserved:
+                    self._reserved[product_id] = reserved
+                else:
+                    self._reserved.pop(product_id, None)
+
+    def release(self, lines: list[dict[str, int]]) -> None:
+        """Atomically return previously reserved stock to the catalog."""
+        with self._lock:
+            products: list[tuple[dict[str, Any], int, int]] = []
+            for line in lines:
+                product_id = line["product_id"]
+                quantity = line["quantity"]
+                current = self._products.get(product_id)
+                reserved = self._reserved.get(product_id, 0)
+                if current is None:
+                    raise ProductError("product_not_found", "Product not found")
+                if reserved < quantity:
+                    LOGGER.error(
+                        "Inventory reservation is inconsistent for product %s: "
+                        "requested release %s, reserved %s",
+                        product_id,
+                        quantity,
+                        reserved,
+                    )
+                    raise RuntimeError("Reserved stock is unavailable")
+                products.append((current, product_id, quantity))
+            for current, product_id, quantity in products:
+                self._set_stock_locked(
+                    product_id,
+                    current["stock"] + quantity,
+                    self._reserved[product_id] - quantity,
+                )
+
+    def consume(self, lines: list[dict[str, int]]) -> None:
+        """Finalize reservations when orders ship."""
+        with self._lock:
+            for line in lines:
+                product_id = line["product_id"]
+                quantity = line["quantity"]
+                if product_id not in self._products:
+                    raise ProductError("product_not_found", "Product not found")
+                reserved = self._reserved.get(product_id, 0)
+                if reserved < quantity:
+                    LOGGER.error(
+                        "Inventory reservation is inconsistent for product %s: "
+                        "requested consume %s, reserved %s",
+                        product_id,
+                        quantity,
+                        reserved,
+                    )
+                    raise RuntimeError("Reserved stock is unavailable")
+            for line in lines:
+                product_id = line["product_id"]
+                remaining = self._reserved[product_id] - line["quantity"]
+                if remaining:
+                    self._reserved[product_id] = remaining
+                else:
+                    self._reserved.pop(product_id, None)
 
     def categories(self) -> list[dict[str, Any]]:
         with self._lock:
