@@ -1,6 +1,8 @@
 """HTTP server adapter for the route handlers."""
 
 import json
+import logging
+import math
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -14,6 +16,33 @@ from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
 from agent_qa.routes import ROUTES
+from agent_qa.validation import validate
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("JSON number is outside the supported range")
+    return parsed
+
+
+def _has_bounded_json_depth(payload: object, maximum: int = 64) -> bool:
+    pending = [(payload, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, (dict, list)):
+            if depth >= maximum:
+                return False
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((child, depth + 1) for child in children)
+    return True
 
 
 def _match_path(template: str, path: str) -> dict[str, str] | None:
@@ -151,13 +180,22 @@ class Handler(BaseHTTPRequestHandler):
             )
         try:
             body = self.rfile.read(length).decode("utf-8")
-            payload = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            payload = json.loads(
+                body,
+                parse_constant=_reject_json_constant,
+                parse_float=_parse_finite_float,
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            ValueError,
+        ) as error:
             raise ApiError(
                 400, "invalid_json", "Request body must be valid JSON"
             ) from error
-        if not isinstance(payload, dict):
-            raise ApiError(400, "invalid_json", "Request body must be a JSON object")
+        if not _has_bounded_json_depth(payload):
+            raise ApiError(400, "invalid_json", "Request body must be valid JSON")
         return payload
 
     def _dispatch(self) -> None:
@@ -186,6 +224,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = self._read_json_body() if route.get("body") else None
+        request_schema = route.get("request_schema")
+        if request_schema is not None:
+            errors = validate(request_schema, payload)
+            if errors:
+                raise ApiError(
+                    400,
+                    "validation_error",
+                    "Request validation failed",
+                    errors,
+                )
         status, body, headers = route["handler"](query, path_params, payload)
         self._json(status, body, headers)
 
@@ -235,6 +283,15 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         except Exception:
+            try:
+                path = urlsplit(getattr(self, "path", "")).path
+            except ValueError:
+                path = "<invalid>"
+            LOGGER.exception(
+                "Unhandled request error method=%s path=%s",
+                getattr(self, "command", ""),
+                path,
+            )
             self._internal_error()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API

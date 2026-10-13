@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from agent_qa import orders
 from agent_qa.openapi import build_openapi
 from agent_qa.routes import ROUTES
+from agent_qa.schemas import SCHEMAS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +102,36 @@ class OpenApiDriftTests(unittest.TestCase):
         spec = build_openapi((*ROUTES, synthetic), "synthetic-sha")
         self.assertIn("/synthetic-openapi-drift", spec["paths"])
         self.assertIn("get", spec["paths"]["/synthetic-openapi-drift"])
+
+    def test_named_schemas_are_published_and_schema_routes_are_public(self):
+        spec = build_openapi(ROUTES, "synthetic-sha")
+        self.assertEqual(spec["components"]["schemas"], SCHEMAS)
+        for path, method in (
+            ("/schemas", "get"),
+            ("/schemas/{name}", "get"),
+            ("/schemas/{name}/validate", "post"),
+        ):
+            with self.subTest(path=path):
+                self.assertNotIn("security", spec["paths"][path][method])
+        validate_operation = spec["paths"]["/schemas/{name}/validate"]["post"]
+        request_schema = validate_operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        self.assertEqual(request_schema, {})
+        self.assertIn("400", validate_operation["responses"])
+        self.assertEqual(
+            validate_operation["responses"]["400"]["content"]["application/json"][
+                "schema"
+            ]["$ref"],
+            "#/components/schemas/Error",
+        )
+        get_schema_operation = spec["paths"]["/schemas/{name}"]["get"]
+        self.assertEqual(
+            get_schema_operation["responses"]["404"]["content"]["application/json"][
+                "schema"
+            ]["$ref"],
+            "#/components/schemas/Error",
+        )
 
     def test_live_405_allow_headers_match_spec_methods(self):
         spec = self.live_spec()

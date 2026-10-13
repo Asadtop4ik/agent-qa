@@ -176,8 +176,13 @@ class OrdersApiTests(unittest.TestCase):
 
         status, _, body = self.request("POST", "/orders", raw_body=b"not json")
         self.assert_error((status, _, body), 400, "invalid_json")
-        self.assert_error(
-            self.request("POST", "/orders", raw_body=b"[]"), 400, "invalid_json"
+        error = self.assert_error(
+            self.request("POST", "/orders", raw_body=b"[]"),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            error["details"], [{"field": "body", "message": "Must be a JSON object"}]
         )
         self.assert_error(
             self.request(
