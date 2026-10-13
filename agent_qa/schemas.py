@@ -10,6 +10,11 @@ MIN_TOTAL_CENTS = 0
 MAX_TOTAL_CENTS = 100_000_000
 MIN_CUSTOMER_ID_LENGTH = 1
 MAX_CUSTOMER_ID_LENGTH = 64
+MIN_ORDER_ITEMS = 1
+MAX_ORDER_ITEMS = 20
+MIN_PRODUCT_ID = 1
+MIN_ORDER_QUANTITY = 1
+MAX_ORDER_QUANTITY = 1000
 MAX_ORDERS = 1000
 MAX_PRODUCTS = 500
 MAX_NAME_LENGTH = 120
@@ -112,15 +117,51 @@ _TOTAL_CENTS = {
     "maximum": MAX_TOTAL_CENTS,
 }
 _STATUS = {"type": "string", "enum": list(STATUSES)}
+_ORDER_ITEM = {
+    "type": "object",
+    "required": [
+        "product_id",
+        "sku",
+        "name",
+        "quantity",
+        "unit_price_cents",
+        "line_total_cents",
+    ],
+    "properties": {
+        "product_id": {"type": "integer", "minimum": MIN_PRODUCT_ID},
+        "sku": _SKU,
+        "name": _NAME,
+        "quantity": {
+            "type": "integer",
+            "minimum": MIN_ORDER_QUANTITY,
+            "maximum": MAX_ORDER_QUANTITY,
+        },
+        "unit_price_cents": _PRICE_CENTS,
+        "line_total_cents": _TOTAL_CENTS,
+    },
+    "additionalProperties": False,
+}
 _ORDER_SCHEMA = {
     "type": "object",
-    "required": ["id", "customer_id", "total_cents", "status", "created_at"],
+    "required": [
+        "id",
+        "customer_id",
+        "total_cents",
+        "status",
+        "created_at",
+        "items",
+    ],
     "properties": {
         "id": {"type": "integer", "minimum": 1},
         "customer_id": _CUSTOMER_ID,
         "total_cents": _TOTAL_CENTS,
         "status": _STATUS,
         "created_at": {"type": "string", "format": "date-time"},
+        "items": {
+            "type": "array",
+            "maxItems": MAX_ORDER_ITEMS,
+            "items": _ORDER_ITEM,
+        },
     },
     "additionalProperties": False,
 }
@@ -128,10 +169,37 @@ _ORDER_SCHEMA = {
 SCHEMAS = {
     "CreateOrder": {
         "type": "object",
-        "required": ["customer_id", "total_cents"],
+        "required": ["customer_id"],
+        "x-exactlyOne": {
+            "fields": ["items", "total_cents"],
+            "errorField": "items",
+            "bothMessage": "Cannot be combined with total_cents",
+            "neitherMessage": "Either items or total_cents is required",
+        },
         "properties": {
             "customer_id": _CUSTOMER_ID,
             "total_cents": _TOTAL_CENTS,
+            "items": {
+                "type": "array",
+                "minItems": MIN_ORDER_ITEMS,
+                "maxItems": MAX_ORDER_ITEMS,
+                "items": {
+                    "type": "object",
+                    "required": ["product_id", "quantity"],
+                    "properties": {
+                        "product_id": {
+                            "type": "integer",
+                            "minimum": MIN_PRODUCT_ID,
+                        },
+                        "quantity": {
+                            "type": "integer",
+                            "minimum": MIN_ORDER_QUANTITY,
+                            "maximum": MAX_ORDER_QUANTITY,
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+            },
         },
         "additionalProperties": False,
     },

@@ -106,6 +106,7 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["customer_id"], customer_id)
         self.assertEqual(body["status"], "new")
         self.assertTrue(body["created_at"].endswith("Z"))
+        self.assertEqual(body["items"], [])
         return body
 
     def assert_error(self, response, status, code):
@@ -198,6 +199,40 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(
             error["details"], [{"field": "body", "message": "Must be a JSON object"}]
         )
+        self.assertEqual(
+            self.assert_error(
+                self.request("POST", "/orders", {"customer_id": customer}),
+                400,
+                "validation_error",
+            )["details"],
+            [
+                {
+                    "field": "items",
+                    "message": "Either items or total_cents is required",
+                }
+            ],
+        )
+        self.assertEqual(
+            self.assert_error(
+                self.request(
+                    "POST",
+                    "/orders",
+                    {
+                        "customer_id": customer,
+                        "total_cents": 1,
+                        "items": [{"product_id": 1, "quantity": 1}],
+                    },
+                ),
+                400,
+                "validation_error",
+            )["details"],
+            [
+                {
+                    "field": "items",
+                    "message": "Cannot be combined with total_cents",
+                }
+            ],
+        )
         self.assert_error(
             self.request(
                 "POST",
@@ -218,6 +253,142 @@ class OrdersApiTests(unittest.TestCase):
             411,
             "length_required",
         )
+
+    def test_item_order_snapshot_and_product_stock_errors(self):
+        def create_product(*, stock, active=True):
+            status, _, product = self.request(
+                "POST",
+                "/products",
+                {
+                    "sku": "T-" + uuid.uuid4().hex[:12].upper(),
+                    "name": "Order snapshot",
+                    "category": "orders-test",
+                    "price_cents": 125,
+                    "stock": stock,
+                    "active": active,
+                },
+            )
+            self.assertEqual(status, 201)
+            return product
+
+        snapshot_product = create_product(stock=4)
+        status, _, order = self.request(
+            "POST",
+            "/orders",
+            {
+                "customer_id": self.customer_id(),
+                "items": [{"product_id": snapshot_product["id"], "quantity": 2}],
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(order["total_cents"], 250)
+        self.assertEqual(
+            order["items"],
+            [
+                {
+                    "product_id": snapshot_product["id"],
+                    "sku": snapshot_product["sku"],
+                    "name": "Order snapshot",
+                    "quantity": 2,
+                    "unit_price_cents": 125,
+                    "line_total_cents": 250,
+                }
+            ],
+        )
+        self.assertEqual(
+            self.request(
+                "PATCH",
+                f"/products/{snapshot_product['id']}",
+                {"name": "Changed name", "price_cents": 999},
+            )[0],
+            200,
+        )
+        status, _, fetched = self.request("GET", f"/orders/{order['id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["items"], order["items"])
+        self.assertEqual(fetched["total_cents"], 250)
+        self.assert_error(
+            self.request("PATCH", f"/orders/{order['id']}", {"total_cents": 1}),
+            409,
+            "total_computed",
+        )
+
+        unknown = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [{"product_id": 999999999, "quantity": 1}],
+                },
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            unknown["details"],
+            [{"field": "items[0].product_id", "message": "Unknown product"}],
+        )
+        duplicate = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [
+                        {"product_id": snapshot_product["id"], "quantity": 1},
+                        {"product_id": snapshot_product["id"], "quantity": 1},
+                    ],
+                },
+            ),
+            400,
+            "validation_error",
+        )
+        self.assertEqual(
+            duplicate["details"],
+            [{"field": "items[1].product_id", "message": "Duplicate product"}],
+        )
+        inactive = create_product(stock=3, active=False)
+        unavailable = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [{"product_id": inactive["id"], "quantity": 1}],
+                },
+            ),
+            409,
+            "product_unavailable",
+        )
+        self.assertEqual(unavailable["details"][0]["field"], "items[0].product_id")
+
+        short = create_product(stock=2)
+        empty = create_product(stock=0)
+        insufficient = self.assert_error(
+            self.request(
+                "POST",
+                "/orders",
+                {
+                    "customer_id": self.customer_id(),
+                    "items": [
+                        {"product_id": short["id"], "quantity": 3},
+                        {"product_id": empty["id"], "quantity": 1},
+                    ],
+                },
+            ),
+            409,
+            "insufficient_stock",
+        )
+        self.assertEqual(
+            insufficient["details"],
+            [
+                {"field": "items[0].quantity", "message": "Only 2 in stock"},
+                {"field": "items[1].quantity", "message": "Only 0 in stock"},
+            ],
+        )
+        self.assertEqual(self.request("GET", f"/products/{short['id']}")[2]["stock"], 2)
+        self.assertEqual(self.request("GET", f"/products/{empty['id']}")[2]["stock"], 0)
 
     def test_patch_transitions_and_locked_price(self):
         order = self.create_order()

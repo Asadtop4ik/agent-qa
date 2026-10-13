@@ -66,6 +66,7 @@ class OrderStoreTests(unittest.TestCase):
         self.assertEqual(first["status"], "new")
         self.assertTrue(first["created_at"].endswith("Z"))
         self.assertIsInstance(first["total_cents"], int)
+        self.assertEqual(first["items"], [])
 
         self.assertTrue(store.delete(first["id"]))
         second = store.create("customer-b", 2000)
@@ -78,6 +79,8 @@ class OrderStoreTests(unittest.TestCase):
         copy = store.get(order["id"])
         copy["status"] = "paid"
         self.assertEqual(store.get(order["id"])["status"], "new")
+        copy["items"].append({"name": "outside"})
+        self.assertEqual(store.get(order["id"])["items"], [])
         for invalid_id in (0, -1, "1", True):
             self.assertIsNone(store.get(invalid_id))
             self.assertFalse(store.delete(invalid_id))
@@ -119,6 +122,35 @@ class OrderStoreTests(unittest.TestCase):
         with self.assertRaises(OrderError) as error:
             store.update(order["id"], {"status": "cancelled"})
         self.assertEqual(error.exception.code, "invalid_transition")
+
+    def test_item_order_total_cannot_be_patched(self):
+        store = OrderStore()
+        snapshot = {
+            "product_id": 1,
+            "sku": "TEST-ONE",
+            "name": "Snapshot",
+            "quantity": 1,
+            "unit_price_cents": 100,
+            "line_total_cents": 100,
+        }
+        order = store._create_locked(
+            {
+                "customer_id": "customer-a",
+                "total_cents": 100,
+                "items": [snapshot],
+            }
+        )
+        order["items"][0]["name"] = "Changed outside"
+        self.assertEqual(store.get(order["id"])["items"][0]["name"], "Snapshot")
+        fetched = store.get(order["id"])
+        fetched["items"][0]["name"] = "Changed from get"
+        listed, _ = store.list()
+        self.assertEqual(listed[0]["items"][0]["name"], "Snapshot")
+        listed[0]["items"][0]["name"] = "Changed from list"
+        self.assertEqual(store.get(order["id"])["items"][0]["name"], "Snapshot")
+        with self.assertRaises(OrderError) as error:
+            store.update(order["id"], {"total_cents": 200})
+        self.assertEqual(error.exception.code, "total_computed")
 
     def test_capacity_is_limited_to_1000_active_orders(self):
         store = OrderStore()

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import unittest
 
 from agent_qa.products import ProductError, ProductStore
+from agent_qa.schemas import MAX_STOCK
 
 
 def product(sku: str, **changes):
@@ -107,6 +108,38 @@ class ProductStoreTests(unittest.TestCase):
         self.assertFalse(store.delete(True))
         self.assertEqual(store.get(created["id"])["name"], "Test product")
         self.assertEqual(store.get(created["id"])["stock"], 5)
+
+    def test_reserve_release_keeps_stock_limit_and_is_atomic(self):
+        store = ProductStore()
+        created = store.create(**product("RESERVE-ITEM", stock=MAX_STOCK))
+        lines = [{"product_id": created["id"], "quantity": 1}]
+        store.reserve(lines)
+        self.assertEqual(store.get(created["id"])["stock"], MAX_STOCK - 1)
+        with self.assertRaises(ProductError) as error:
+            store.adjust_stock(created["id"], 1)
+        self.assertEqual(error.exception.code, "validation_error")
+        self.assertEqual(store.get(created["id"])["stock"], MAX_STOCK - 1)
+        store.release(lines)
+        self.assertEqual(store.get(created["id"])["stock"], MAX_STOCK)
+
+    def test_reserve_reports_all_short_lines_without_mutation(self):
+        store = ProductStore()
+        first = store.create(**product("RESERVE-ONE", stock=2))
+        second = store.create(**product("RESERVE-TWO", stock=0))
+        with self.assertRaises(ProductError) as error:
+            store.reserve(
+                [
+                    {"product_id": first["id"], "quantity": 3},
+                    {"product_id": second["id"], "quantity": 1},
+                ]
+            )
+        self.assertEqual(error.exception.code, "insufficient_stock")
+        self.assertEqual(
+            [item["field"] for item in error.exception.details],
+            ["items[0].quantity", "items[1].quantity"],
+        )
+        self.assertEqual(store.get(first["id"])["stock"], 2)
+        self.assertEqual(store.get(second["id"])["stock"], 0)
 
 
 if __name__ == "__main__":

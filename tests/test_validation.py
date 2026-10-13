@@ -86,6 +86,36 @@ class ValidationTests(unittest.TestCase):
         self.assertIn({"field": "unexpected", "message": "Unknown field"}, errors)
         self.assertIn({"field": "name", "message": "Must not be blank"}, errors)
 
+    def test_exactly_one_extension_reports_configured_messages(self):
+        from agent_qa.schemas import SCHEMAS
+
+        schema = SCHEMAS["CreateOrder"]
+        self.assertEqual(
+            validate(schema, {"customer_id": "abc"}),
+            [
+                {
+                    "field": "items",
+                    "message": "Either items or total_cents is required",
+                }
+            ],
+        )
+        self.assertEqual(
+            validate(
+                schema,
+                {
+                    "customer_id": "abc",
+                    "total_cents": 1,
+                    "items": [{"product_id": 1, "quantity": 1}],
+                },
+            ),
+            [
+                {
+                    "field": "items",
+                    "message": "Cannot be combined with total_cents",
+                }
+            ],
+        )
+
     def test_unique_items_schema_keyword(self):
         schema = {"type": "array", "uniqueItems": True}
         self.assertEqual(
@@ -127,7 +157,10 @@ class ValidationTests(unittest.TestCase):
                 {},
                 [
                     {"field": "customer_id", "message": "Required"},
-                    {"field": "total_cents", "message": "Required"},
+                    {
+                        "field": "items",
+                        "message": "Either items or total_cents is required",
+                    },
                 ],
             ),
             (

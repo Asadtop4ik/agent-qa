@@ -280,8 +280,10 @@ class Handler(BaseHTTPRequestHandler):
                 "store_full": 409,
                 "duplicate_sku": 409,
                 "insufficient_stock": 409,
+                "product_unavailable": 409,
                 "product_not_found": 404,
                 "order_locked": 409,
+                "total_computed": 409,
                 "invalid_transition": 409,
             }.get(error.code, 500)
             self._json(
