@@ -54,18 +54,34 @@ def _enum_message(values: list[Any]) -> str:
     return "Must be one of: " + ", ".join(display)
 
 
+def _json_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values, keeping booleans distinct from numbers."""
+    pending = [(left, right)]
+    while pending:
+        left_value, right_value = pending.pop()
+        if (
+            isinstance(left_value, (int, float))
+            and not isinstance(left_value, bool)
+            and isinstance(right_value, (int, float))
+            and not isinstance(right_value, bool)
+        ):
+            if left_value != right_value:
+                return False
+        elif isinstance(left_value, dict) and isinstance(right_value, dict):
+            if left_value.keys() != right_value.keys():
+                return False
+            pending.extend((left_value[key], right_value[key]) for key in left_value)
+        elif isinstance(left_value, list) and isinstance(right_value, list):
+            if len(left_value) != len(right_value):
+                return False
+            pending.extend(zip(left_value, right_value))
+        elif type(left_value) is not type(right_value) or left_value != right_value:
+            return False
+    return True
+
+
 def _enum_contains(values: list[Any], instance: Any) -> bool:
-    return any(
-        (
-            isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and isinstance(instance, (int, float))
-            and not isinstance(instance, bool)
-            and value == instance
-        )
-        or (type(value) is type(instance) and value == instance)
-        for value in values
-    )
+    return any(_json_equal(value, instance) for value in values)
 
 
 def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:

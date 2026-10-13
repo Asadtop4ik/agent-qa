@@ -12,13 +12,13 @@ from agent_qa.orders import (
 
 
 class OrderValidationTests(unittest.TestCase):
-    def test_create_reports_all_errors_in_field_order(self):
+    def test_create_reports_unknown_fields_before_known_field_errors(self):
         with self.assertRaises(OrderError) as error:
             validate_create({"status": "paid", "total_cents": True})
         self.assertEqual(error.exception.code, "validation_error")
         self.assertEqual(
             [detail["field"] for detail in error.exception.details],
-            ["customer_id", "status", "total_cents"],
+            ["status", "customer_id", "total_cents"],
         )
 
     def test_create_validates_customer_and_total(self):

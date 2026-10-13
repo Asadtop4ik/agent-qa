@@ -38,7 +38,7 @@ class OrderError(Exception):
 
 
 def _validation_error(details: list[dict[str, str]]) -> OrderError:
-    details.sort(key=lambda item: item["field"])
+    details.sort(key=lambda item: (item["message"] != "Unknown field", item["field"]))
     return OrderError("validation_error", "Request validation failed", details)
 
 

@@ -108,6 +108,15 @@ class ValidationTests(unittest.TestCase):
             ),
             (
                 validate_create,
+                {"customer_id": 3, "total_cents": True, "z": 1},
+                [
+                    {"field": "z", "message": "Unknown field"},
+                    {"field": "customer_id", "message": "Must be a string"},
+                    {"field": "total_cents", "message": "Must be an integer"},
+                ],
+            ),
+            (
+                validate_create,
                 {"customer_id": "x" * 65, "total_cents": 1},
                 [
                     {
@@ -233,6 +242,37 @@ class ValidationTests(unittest.TestCase):
             [{"field": "body", "message": "Must contain 1 to 3 characters"}],
         )
         self.assertEqual(validate({"type": "number", "enum": [1]}, 1.0), [])
+
+    def test_nested_enum_uses_recursive_json_equality(self):
+        enum_value = {
+            "label": "ok",
+            "nested": {"items": [1, {"flag": True}]},
+        }
+        schema = {"enum": [enum_value]}
+
+        self.assertEqual(
+            validate(
+                schema,
+                {"nested": {"items": [1.0, {"flag": True}]}, "label": "ok"},
+            ),
+            [],
+        )
+
+        invalid_values = (
+            {"label": "ok", "nested": {"items": [True, {"flag": True}]}},
+            {"label": "ok", "nested": {"items": [1, {"flag": 1}]}},
+            {"label": "ok", "nested": {"items": [1, {"flag": True}, 2]}},
+            {"label": "ok", "nested": {"items": [{"flag": True}, 1]}},
+            {"label": "ok", "nested": {"items": [1, {"other": True}]}},
+        )
+        for value in invalid_values:
+            with self.subTest(value=value):
+                errors = validate(schema, value)
+                self.assertEqual([error["field"] for error in errors], ["body"])
+
+        reverse_schema = {"enum": [{"nested": [{"qty": True}]}]}
+        errors = validate(reverse_schema, {"nested": [{"qty": 1}]})
+        self.assertEqual([error["field"] for error in errors], ["body"])
 
     def test_container_size_limits_and_typed_additional_properties(self):
         schema = {
