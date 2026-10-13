@@ -169,6 +169,14 @@ class RouteUnitTests(unittest.TestCase):
                 )
                 self.assertEqual(allowed_methods(path), ", ".join(methods))
 
+    def test_order_and_product_create_routes_are_idempotent(self):
+        flagged = {
+            route["path"]
+            for route in ROUTES
+            if route["method"] == "POST" and route.get("idempotent")
+        }
+        self.assertTrue({"/orders", "/products"}.issubset(flagged))
+
     def test_dispatch_authenticates_then_validates_before_handler(self):
         encoded = b"{}"
         unauthenticated = invoke("POST", "/orders", encoded, api_key=None)

@@ -20,6 +20,8 @@ Write endpoints require an `X-API-Key` header. Set `AGENT_QA_API_KEY` before sta
 
 `POST /products` creates products, while `GET /products` supports category, tag, stock, price, text, sorting, and pagination filters. Product writes require the configured API key. `GET /products/{id}` reads a product, `PATCH` updates its editable fields, and `DELETE` removes it. Use `POST /products/{id}/adjust-stock` for atomic inventory changes and `GET /categories` for current category totals.
 
+`POST /orders` and `POST /products` accept an optional `Idempotency-Key` header containing 1–64 characters matching `^[A-Za-z0-9._:-]+$`. Repeating a successful request with the same key and body replays its first response without repeating the write; replays include `Idempotent-Replay: true` and echo `Idempotency-Key`, while `X-Request-Id` identifies the current request. Keys are scoped to the API key, method, and path; a different body with a used key returns `422 idempotency_key_reused`, and a concurrent duplicate returns `409 idempotency_in_progress`. Only 2xx responses are retained for 600 seconds, with a 500-entry least-recently-used limit; failed requests release the key for retry. Set `AGENT_QA_IDEMPOTENCY_TTL_SECONDS` to a value from 1 to 86400 to change the retention period.
+
 ## Layout
 
 - `app.py` starts the HTTP service.

@@ -1,8 +1,10 @@
 """HTTP server adapter for the route handlers."""
 
+import hashlib
 import json
 import logging
 import math
+import re
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import perf_counter
@@ -12,14 +14,18 @@ from agent_qa.accesslog import write_access_log
 from agent_qa import config
 from agent_qa.auth import is_valid_api_key
 from agent_qa.errors import ApiError, envelope
+from agent_qa.idempotency import BeginKind, IdempotencyStore, Response
 from agent_qa.metrics import REGISTRY
 from agent_qa.orders import OrderError
 from agent_qa.request_id import request_id
+from agent_qa import routes as routes_module
 from agent_qa.routes import ROUTES
 from agent_qa.validation import validate
 
 
 LOGGER = logging.getLogger(__name__)
+IDEMPOTENCY_STORE = IdempotencyStore(config.idempotency_ttl_seconds())
+_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:-]+$")
 
 
 def _reject_json_constant(value: str) -> None:
@@ -211,7 +217,9 @@ class Handler(BaseHTTPRequestHandler):
             self._method_not_allowed(matches)
             return
         route, path_params = selected
-        if route["auth_required"] and not is_valid_api_key(self.headers):
+        if route["auth_required"] and (
+            not self.headers.get("X-API-Key") or not is_valid_api_key(self.headers)
+        ):
             self._json(
                 401,
                 envelope(
@@ -222,28 +230,107 @@ class Handler(BaseHTTPRequestHandler):
                 {"WWW-Authenticate": "X-API-Key"},
             )
             return
+        idempotency_key = self.headers.get("Idempotency-Key")
+        idempotent = bool(route.get("idempotent") and idempotency_key is not None)
+        if idempotent and (
+            not 1 <= len(idempotency_key) <= 64
+            or _IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None
+        ):
+            raise ApiError(
+                400,
+                "invalid_idempotency_key",
+                "Idempotency-Key must contain 1 to 64 valid characters",
+            )
         query = parse_qsl(parsed.query, keep_blank_values=True)
         payload = self._read_json_body() if route.get("body") else None
-        request_schema = route.get("request_schema")
-        if request_schema is not None:
-            errors = validate(request_schema, payload)
-            if errors:
-                if parsed.path == "/orders" or parsed.path.startswith("/orders/"):
-                    errors = sorted(
-                        errors,
-                        key=lambda detail: (
-                            detail["message"] != "Unknown field",
-                            detail["field"],
-                        ),
-                    )
-                raise ApiError(
-                    400,
-                    "validation_error",
-                    "Request validation failed",
-                    errors,
+        if idempotent:
+            canonical_body = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            fingerprint = hashlib.sha256(canonical_body).hexdigest()
+            api_key = self.headers.get("X-API-Key", "")
+            key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+            scope = (key_fingerprint, self.command, parsed.path, idempotency_key)
+            result = IDEMPOTENCY_STORE.begin(scope, fingerprint)
+            if result.kind is BeginKind.REPLAY:
+                routes_module.REGISTRY.record_idempotency("replayed")
+                assert result.response is not None
+                replay_headers = dict(result.response.headers)
+                replay_headers.update(
+                    {
+                        "Idempotent-Replay": "true",
+                        "Idempotency-Key": idempotency_key,
+                    }
                 )
+                self._json(
+                    result.response.status,
+                    result.response.body,
+                    replay_headers,
+                )
+                return
+            if result.kind is BeginKind.MISMATCH:
+                routes_module.REGISTRY.record_idempotency("mismatch")
+                raise ApiError(
+                    422,
+                    "idempotency_key_reused",
+                    "Idempotency-Key was already used with a different request",
+                )
+            if result.kind is BeginKind.IN_PROGRESS:
+                routes_module.REGISTRY.record_idempotency("in_progress")
+                raise ApiError(
+                    409,
+                    "idempotency_in_progress",
+                    "A request with this Idempotency-Key is still in progress",
+                )
+            try:
+                self._validate_payload(route, parsed.path, payload)
+                status, body, headers = route["handler"](query, path_params, payload)
+                response_headers = dict(headers)
+                response_headers = {
+                    name: value
+                    for name, value in response_headers.items()
+                    if name.lower() != "x-request-id"
+                }
+                response = Response(status, body, response_headers)
+            except Exception:
+                IDEMPOTENCY_STORE.abort(scope, fingerprint)
+                raise
+            if 200 <= status < 300:
+                IDEMPOTENCY_STORE.complete(scope, fingerprint, response)
+                routes_module.REGISTRY.record_idempotency("stored")
+            else:
+                IDEMPOTENCY_STORE.abort(scope, fingerprint)
+            self._json(status, body, headers)
+            return
+        self._validate_payload(route, parsed.path, payload)
         status, body, headers = route["handler"](query, path_params, payload)
         self._json(status, body, headers)
+
+    def _validate_payload(
+        self, route: dict[str, object], path: str, payload: object
+    ) -> None:
+        request_schema = route.get("request_schema")
+        if request_schema is None:
+            return
+        errors = validate(request_schema, payload)
+        if errors:
+            if path == "/orders" or path.startswith("/orders/"):
+                errors = sorted(
+                    errors,
+                    key=lambda detail: (
+                        detail["message"] != "Unknown field",
+                        detail["field"],
+                    ),
+                )
+            raise ApiError(
+                400,
+                "validation_error",
+                "Request validation failed",
+                errors,
+            )
 
     def _method_not_allowed(
         self, routes: list[tuple[dict[str, object], dict[str, str]]]
