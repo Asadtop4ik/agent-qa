@@ -12,6 +12,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from agent_qa import orders
+from agent_qa import schemas
 from agent_qa.openapi import build_openapi
 from agent_qa.routes import ROUTES
 from agent_qa.schemas import SCHEMAS
@@ -213,6 +214,78 @@ class OpenApiDriftTests(unittest.TestCase):
         self.assertEqual(patch_total["minimum"], orders.MIN_TOTAL_CENTS)
         self.assertEqual(patch_total["maximum"], orders.MAX_TOTAL_CENTS)
         self.assertEqual(patch_status, list(orders.STATUSES))
+
+    def test_product_schemas_and_query_limits_come_from_constants(self):
+        spec = self.live_spec()
+        create_schema = spec["paths"]["/products"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        self.assertEqual(create_schema, schemas.SCHEMAS["CreateProduct"])
+        self.assertEqual(
+            create_schema["properties"]["sku"]["pattern"], schemas.SKU_PATTERN
+        )
+        self.assertEqual(
+            create_schema["properties"]["category"]["pattern"],
+            schemas.CATEGORY_PATTERN,
+        )
+        self.assertEqual(
+            create_schema["properties"]["price_cents"]["maximum"],
+            schemas.MAX_PRICE_CENTS,
+        )
+        self.assertEqual(
+            create_schema["properties"]["stock"]["maximum"], schemas.MAX_STOCK
+        )
+        self.assertEqual(
+            create_schema["properties"]["tags"]["maxItems"], schemas.MAX_TAGS
+        )
+
+        parameters = {
+            parameter["name"]: parameter["schema"]
+            for parameter in spec["paths"]["/products"]["get"]["parameters"]
+        }
+        self.assertEqual(parameters["category"]["pattern"], schemas.CATEGORY_PATTERN)
+        self.assertEqual(parameters["tag"]["pattern"], schemas.TAG_PATTERN)
+        self.assertEqual(parameters["sort"]["enum"], list(schemas.PRODUCT_SORTS))
+        self.assertEqual(parameters["limit"]["minimum"], schemas.MIN_LIMIT)
+        self.assertEqual(parameters["limit"]["maximum"], schemas.MAX_LIMIT)
+        self.assertEqual(parameters["limit"]["default"], schemas.DEFAULT_LIMIT)
+        self.assertEqual(parameters["offset"]["minimum"], schemas.MIN_OFFSET)
+        self.assertEqual(parameters["offset"]["default"], schemas.DEFAULT_OFFSET)
+
+    def test_product_operations_document_auth_errors_and_schemas(self):
+        spec = self.live_spec()
+        operations = {
+            (route["path"], route["method"].lower()): route for route in ROUTES
+        }
+        for path, method in (
+            ("/products", "post"),
+            ("/products", "get"),
+            ("/products/{id}", "get"),
+            ("/products/{id}", "patch"),
+            ("/products/{id}", "delete"),
+            ("/products/{id}/adjust-stock", "post"),
+            ("/categories", "get"),
+        ):
+            with self.subTest(path=path, method=method):
+                operation = spec["paths"][path][method]
+                route = operations[(path, method)]
+                self.assertEqual(operation["operationId"], route["operation_id"])
+                self.assertEqual(
+                    bool(operation.get("security")), route["auth_required"]
+                )
+                for status in route["responses"]:
+                    self.assertIn(status, operation["responses"])
+
+        create = spec["paths"]["/products"]["post"]
+        for status in ("401", "409", "413", "415"):
+            self.assertIn(status, create["responses"])
+        stock = spec["paths"]["/products/{id}/adjust-stock"]["post"]
+        for status in ("401", "404", "409", "413", "415"):
+            self.assertIn(status, stock["responses"])
+        patch_schema = spec["paths"]["/products/{id}"]["patch"]["requestBody"][
+            "content"
+        ]["application/json"]["schema"]
+        self.assertEqual(patch_schema, schemas.SCHEMAS["UpdateProduct"])
 
     def test_response_content_documents_json_and_preserves_bodyless_responses(self):
         spec = self.live_spec()

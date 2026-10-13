@@ -80,6 +80,35 @@ def _json_equal(left: Any, right: Any) -> bool:
     return True
 
 
+def _json_equal_bounded(left: Any, right: Any, budget: list[int]) -> bool | None:
+    """Compare JSON values while charging work against a shared node budget."""
+    pending = [(left, right)]
+    while pending:
+        budget[0] -= 1
+        if budget[0] < 0:
+            return None
+        left_value, right_value = pending.pop()
+        if (
+            isinstance(left_value, (int, float))
+            and not isinstance(left_value, bool)
+            and isinstance(right_value, (int, float))
+            and not isinstance(right_value, bool)
+        ):
+            if left_value != right_value:
+                return False
+        elif isinstance(left_value, dict) and isinstance(right_value, dict):
+            if left_value.keys() != right_value.keys():
+                return False
+            pending.extend((left_value[key], right_value[key]) for key in left_value)
+        elif isinstance(left_value, list) and isinstance(right_value, list):
+            if len(left_value) != len(right_value):
+                return False
+            pending.extend(zip(left_value, right_value))
+        elif type(left_value) is not type(right_value) or left_value != right_value:
+            return False
+    return True
+
+
 def _enum_contains(values: list[Any], instance: Any) -> bool:
     return any(_json_equal(value, instance) for value in values)
 
@@ -123,6 +152,9 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
             return
 
         expected = current_schema.get("type")
+        negated_schema = current_schema.get("not")
+        if isinstance(negated_schema, dict) and not validate(negated_schema, value):
+            add(field, "Must not match the prohibited schema")
         if isinstance(expected, str) and not _matches_type(value, expected):
             enum = current_schema.get("enum")
             if (
@@ -162,7 +194,10 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
             pattern = current_schema.get("pattern")
             if isinstance(pattern, str):
                 try:
-                    matched = re.search(pattern, value) is not None
+                    matcher = (
+                        re.fullmatch if current_schema.get("x-fullMatch") else re.search
+                    )
+                    matched = matcher(pattern, value) is not None
                 except re.error:
                     LOGGER.exception(
                         "Invalid pattern in validation schema for field %s", field
@@ -213,7 +248,12 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
                 if name in properties:
                     walk(properties[name], value[name], child, depth + 1)
                 elif current_schema.get("additionalProperties") is False:
-                    add(child, "Unknown field")
+                    message = (
+                        "Cannot be changed"
+                        if name in current_schema.get("x-immutableFields", [])
+                        else "Unknown field"
+                    )
+                    add(child, message)
                 elif isinstance(current_schema.get("additionalProperties"), dict):
                     walk(
                         current_schema["additionalProperties"],
@@ -229,6 +269,28 @@ def validate(schema: dict[str, Any], instance: Any) -> list[dict[str, str]]:
                 add(field, f"Must contain at least {minimum} items")
             if isinstance(maximum, int) and len(value) > maximum:
                 add(field, f"Must contain at most {maximum} items")
+            if current_schema.get("uniqueItems") is True:
+                comparison_budget = [MAX_VALIDATION_NODES]
+                for index, item in enumerate(value):
+                    if stopped:
+                        break
+                    for previous_index in range(index):
+                        equal = _json_equal_bounded(
+                            item, value[previous_index], comparison_budget
+                        )
+                        if equal is None:
+                            add(field, "Maximum validation complexity exceeded")
+                            stopped = True
+                            break
+                        if equal:
+                            add(field, "Must contain unique items")
+                            break
+                    if errors and errors[-1]["field"] == (field or "body"):
+                        if errors[-1]["message"] in {
+                            "Must contain unique items",
+                            "Maximum validation complexity exceeded",
+                        }:
+                            break
             item_schema = current_schema.get("items")
             if isinstance(item_schema, dict):
                 for index, item in enumerate(value):

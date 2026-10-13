@@ -164,8 +164,8 @@ class RouteUnitTests(unittest.TestCase):
         paths = {route["path"] for route in ROUTES}
         for path in paths:
             with self.subTest(path=path):
-                methods = dict.fromkeys(
-                    route["method"] for route in ROUTES if route["path"] == path
+                methods = sorted(
+                    {route["method"] for route in ROUTES if route["path"] == path}
                 )
                 self.assertEqual(allowed_methods(path), ", ".join(methods))
 

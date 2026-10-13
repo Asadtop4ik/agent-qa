@@ -86,6 +86,38 @@ class ValidationTests(unittest.TestCase):
         self.assertIn({"field": "unexpected", "message": "Unknown field"}, errors)
         self.assertIn({"field": "name", "message": "Must not be blank"}, errors)
 
+    def test_unique_items_schema_keyword(self):
+        schema = {"type": "array", "uniqueItems": True}
+        self.assertEqual(
+            validate(schema, ["tag", "tag"]),
+            [{"field": "body", "message": "Must contain unique items"}],
+        )
+        self.assertEqual(validate(schema, [1, True]), [])
+
+    def test_negative_schema_and_full_match_extension(self):
+        self.assertEqual(
+            validate(
+                {"type": "integer", "not": {"enum": [0]}},
+                0,
+            ),
+            [{"field": "body", "message": "Must not match the prohibited schema"}],
+        )
+        self.assertEqual(
+            validate(
+                {"type": "string", "pattern": "^[a-z]+$", "x-fullMatch": True},
+                "valid\n",
+            ),
+            [{"field": "body", "message": "Must match the required pattern"}],
+        )
+
+    def test_product_schema_rejects_immutable_sku(self):
+        from agent_qa.schemas import SCHEMAS
+
+        self.assertEqual(
+            validate(SCHEMAS["UpdateProduct"], {"sku": "CHANGED-SKU"}),
+            [{"field": "sku", "message": "Cannot be changed"}],
+        )
+
     def test_required_unknown_and_exact_order_messages(self):
         from agent_qa.orders import OrderError, validate_create, validate_patch
 
