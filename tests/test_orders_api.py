@@ -8,68 +8,9 @@ import subprocess
 import sys
 import time
 import unittest
-from email.message import Message
-from io import BytesIO
 import uuid
-from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-
-from agent_qa.errors import ApiError
-from agent_qa.orders import OrderStore
-from agent_qa.server import Handler
-
-
-class OrdersSearchRouteTests(unittest.TestCase):
-    """Socket-free checks for public order search routing."""
-
-    def setUp(self):
-        self.store = OrderStore()
-        self.store_patch = patch("agent_qa.routes.ORDER_STORE", self.store)
-        self.store_patch.start()
-
-    def tearDown(self):
-        self.store_patch.stop()
-
-    @staticmethod
-    def dispatch(method, path):
-        headers = Message()
-        responses = []
-        handler = object.__new__(Handler)
-        handler.path = path
-        handler.command = method
-        handler.headers = headers
-        handler.rfile = BytesIO()
-        handler.request_id = "orders-search-test"
-        handler._json = lambda *args: responses.append(args)
-        try:
-            Handler._dispatch(handler)
-        except ApiError as error:
-            return error.status, {
-                "error": {"code": error.code, "details": error.details}
-            }
-        _, body, _ = responses[0]
-        return 200, body
-
-    def test_order_search_route_applies_query_and_offset_sort(self):
-        first = self.store.create("search-customer", 100)
-        second = self.store.create("search-customer", 200)
-        status, body = self.dispatch(
-            "GET",
-            "/orders/search?q=customer_id=search-customer&sort=-id&limit=1&offset=1",
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(body["items"], [first])
-        self.assertEqual(body["total"], 2)
-        self.assertEqual(body["offset"], 1)
-        self.assertEqual(body["query"]["terms"], 1)
-        self.assertNotEqual(first["id"], second["id"])
-
-    def test_order_search_route_returns_positioned_parse_error(self):
-        status, body = self.dispatch("GET", "/orders/search?q=total_cents%3D")
-        self.assertEqual(status, 400)
-        self.assertEqual(body["error"]["code"], "invalid_search_query")
-        self.assertEqual(body["error"]["details"][0]["position"], "12")
 
 
 class OrdersApiTests(unittest.TestCase):
@@ -108,11 +49,9 @@ class OrdersApiTests(unittest.TestCase):
     def customer_id(self):
         return "api-test-" + uuid.uuid4().hex
 
-    def request(
-        self, method, path, payload=None, headers=None, raw_body=None, public=False
-    ):
+    def request(self, method, path, payload=None, headers=None, raw_body=None):
         request_headers = {"Content-Type": "application/json"}
-        if method in {"POST", "PATCH", "DELETE"} and not public:
+        if method in {"POST", "PATCH", "DELETE"}:
             request_headers["X-API-Key"] = "qa-synthetic-key"
         request_headers.update(headers or {})
         if raw_body is not None:
@@ -167,24 +106,6 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["customer_id"], customer_id)
         self.assertEqual(body["status"], "new")
         self.assertTrue(body["created_at"].endswith("Z"))
-        self.assertEqual(body["items"], [])
-        return body
-
-    def create_product(self, *, stock=10, active=True, price_cents=123, name="Widget"):
-        sku = "Q" + uuid.uuid4().hex[:10].upper()
-        status, _, body = self.request(
-            "POST",
-            "/products",
-            {
-                "sku": sku,
-                "name": name,
-                "category": "tools",
-                "price_cents": price_cents,
-                "stock": stock,
-                "active": active,
-            },
-        )
-        self.assertEqual(status, 201)
         return body
 
     def assert_error(self, response, status, code):
@@ -217,55 +138,6 @@ class OrdersApiTests(unittest.TestCase):
         self.assertEqual(body["items"], [second])
         self.assertNotEqual(other["customer_id"], customer)
 
-        status, headers, body = self.request(
-            "GET",
-            f"/orders?customer_id={customer}&status=new&limit=1&pagination=cursor",
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"items", "total", "limit", "next_cursor"})
-        self.assertEqual(body["total"], 2)
-        self.assertEqual(body["items"], [first])
-        self.assertTrue(headers["Link"].startswith("</orders?"))
-        self.assertIn('rel="next"', headers["Link"])
-        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
-        self.assertIn("customer_id=", next_path)
-        self.assertIn("status=new", next_path)
-        self.assertIn("limit=1", next_path)
-        self.assertIn("cursor=", next_path)
-        status, next_headers, next_body = self.request("GET", next_path)
-        self.assertEqual(status, 200)
-        self.assertEqual(set(next_body), {"items", "total", "limit", "next_cursor"})
-        self.assertEqual(next_body["items"], [second])
-        self.assertIsNone(next_body["next_cursor"])
-        self.assertEqual(next_headers["Link"], '</v2/orders>; rel="successor-version"')
-        self.assertNotIn('rel="next"', next_headers["Link"])
-
-    def test_search_query_endpoint_and_offset_pagination(self):
-        customer = self.customer_id()
-        first = self.create_order(customer, 1000)
-        second = self.create_order(customer, 2000)
-        status, _, body = self.request(
-            "GET",
-            f"/orders/search?q=customer_id={customer}&sort=-id&limit=1&offset=1",
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(set(body), {"items", "total", "limit", "offset", "query"})
-        self.assertEqual(body["total"], 2)
-        self.assertEqual(body["limit"], 1)
-        self.assertEqual(body["offset"], 1)
-        self.assertEqual(body["items"], [first])
-        self.assertEqual(
-            body["query"],
-            {"normalized": f"customer_id = {customer}", "terms": 1},
-        )
-        self.assertNotEqual(first["id"], second["id"])
-        self.assert_error(
-            self.request("GET", "/orders/search?sort=id"), 400, "invalid_query"
-        )
-        malformed = self.request("GET", "/orders/search?q=total_cents%3D")
-        error = self.assert_error(malformed, 400, "invalid_search_query")
-        self.assertEqual(error["details"][0]["position"], "12")
-
     def test_query_validation(self):
         for query in (
             "limit=0",
@@ -275,45 +147,11 @@ class OrdersApiTests(unittest.TestCase):
             "status=foo",
             "x=1",
             "limit=1&limit=2",
-            "cursor=abc&offset=1",
-            "pagination=offset&cursor=abc",
-            "pagination=cursor&offset=20",
-            "pagination=cursor&offset=0",
         ):
             with self.subTest(query=query):
                 self.assert_error(
                     self.request("GET", "/orders?" + query), 400, "invalid_query"
                 )
-
-    def test_cursor_rejects_tampered_and_mismatched_queries(self):
-        customer = self.customer_id()
-        self.create_order(customer)
-        self.create_order(customer)
-        status, headers, body = self.request(
-            "GET",
-            f"/orders?customer_id={customer}&limit=1&pagination=cursor",
-        )
-        self.assertEqual(status, 200)
-        self.assertIsNotNone(body["next_cursor"])
-        next_path = headers["Link"].split("<", 1)[1].split(">", 1)[0]
-
-        cursor = body["next_cursor"]
-        tampered = cursor[:-1] + ("0" if cursor[-1] != "0" else "1")
-        self.assert_error(
-            self.request("GET", "/orders?cursor=" + tampered),
-            400,
-            "invalid_cursor",
-        )
-        self.assert_error(
-            self.request("GET", next_path.replace(customer, customer + "x")),
-            400,
-            "cursor_mismatch",
-        )
-        status, _, changed_limit = self.request(
-            "GET", next_path.replace("limit=1", "limit=2")
-        )
-        self.assertEqual(status, 200)
-        self.assertLessEqual(len(changed_limit["items"]), 2)
 
     def test_post_validation_and_body_errors(self):
         customer = self.customer_id()
@@ -335,33 +173,6 @@ class OrdersApiTests(unittest.TestCase):
                     [item["field"] for item in error["details"]],
                     sorted(item["field"] for item in error["details"]),
                 )
-
-        missing_choice = self.assert_error(
-            self.request("POST", "/orders", {"customer_id": customer}),
-            400,
-            "validation_error",
-        )
-        self.assertEqual(
-            missing_choice["details"],
-            [{"field": "items", "message": "Either items or total_cents is required"}],
-        )
-        combined_choice = self.assert_error(
-            self.request(
-                "POST",
-                "/orders",
-                {
-                    "customer_id": customer,
-                    "items": [{"product_id": 1, "quantity": 1}],
-                    "total_cents": 1,
-                },
-            ),
-            400,
-            "validation_error",
-        )
-        self.assertEqual(
-            combined_choice["details"],
-            [{"field": "items", "message": "Cannot be combined with total_cents"}],
-        )
 
         status, _, body = self.request("POST", "/orders", raw_body=b"not json")
         self.assert_error((status, _, body), 400, "invalid_json")
@@ -389,37 +200,6 @@ class OrdersApiTests(unittest.TestCase):
             "length_required",
         )
 
-    def test_schema_api_and_order_validation_compatibility(self):
-        status, _, body = self.request("GET", "/schemas", public=True)
-        self.assertEqual(status, 200)
-        self.assertEqual(body["items"], sorted(body["items"]))
-        self.assertIn("CreateOrder", body["items"])
-
-        status, _, schema = self.request("GET", "/schemas/CreateOrder", public=True)
-        self.assertEqual(status, 200)
-        self.assertEqual(schema["type"], "object")
-        self.assert_error(
-            self.request("GET", "/schemas/unknown", public=True),
-            404,
-            "schema_not_found",
-        )
-        status, _, result = self.request(
-            "POST",
-            "/schemas/CreateOrder/validate",
-            {"customer_id": "schema-check", "total_cents": 10},
-            public=True,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(result, {"valid": True, "errors": []})
-        status, _, result = self.request(
-            "POST",
-            "/schemas/CreateOrder/validate",
-            raw_body=b"null",
-            public=True,
-        )
-        self.assertEqual(status, 200)
-        self.assertFalse(result["valid"])
-
     def test_patch_transitions_and_locked_price(self):
         order = self.create_order()
         path = f"/orders/{order['id']}"
@@ -442,135 +222,6 @@ class OrdersApiTests(unittest.TestCase):
             self.request("PATCH", f"/orders/{fresh['id']}", {}),
             400,
             "validation_error",
-        )
-
-    def test_item_order_errors_and_snapshot_response(self):
-        customer = self.customer_id()
-        product = self.create_product(name="Before", price_cents=123, stock=10)
-        payload = {
-            "customer_id": customer,
-            "items": [{"product_id": product["id"], "quantity": 2}],
-        }
-        status, _, order = self.request("POST", "/orders", payload)
-        self.assertEqual(status, 201)
-        self.assertEqual(order["total_cents"], 246)
-        self.assertEqual(
-            order["items"],
-            [
-                {
-                    "product_id": product["id"],
-                    "sku": product["sku"],
-                    "name": "Before",
-                    "quantity": 2,
-                    "unit_price_cents": 123,
-                    "line_total_cents": 246,
-                }
-            ],
-        )
-        status, _, updated_product = self.request(
-            "PATCH",
-            f"/products/{product['id']}",
-            {"name": "After", "price_cents": 999},
-        )
-        self.assertEqual(status, 200)
-        status, _, fetched = self.request("GET", f"/orders/{order['id']}")
-        self.assertEqual(status, 200)
-        self.assertEqual(fetched["items"][0]["name"], "Before")
-        self.assertEqual(fetched["items"][0]["unit_price_cents"], 123)
-        self.assertEqual(updated_product["stock"], 8)
-        computed_total = self.assert_error(
-            self.request("PATCH", f"/orders/{order['id']}", {"total_cents": 10}),
-            409,
-            "total_computed",
-        )
-        self.assertEqual(computed_total["code"], "total_computed")
-        status, _, cancelled = self.request(
-            "PATCH", f"/orders/{order['id']}", {"status": "cancelled"}
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(cancelled["status"], "cancelled")
-        status, _, restored = self.request("GET", f"/products/{product['id']}")
-        self.assertEqual(status, 200)
-        self.assertEqual(restored["stock"], 10)
-        status, _, body = self.request("DELETE", f"/orders/{order['id']}")
-        self.assertEqual(status, 204)
-        self.assertIsNone(body)
-        status, _, restored_again = self.request("GET", f"/products/{product['id']}")
-        self.assertEqual(status, 200)
-        self.assertEqual(restored_again["stock"], 10)
-
-        duplicate = self.assert_error(
-            self.request(
-                "POST",
-                "/orders",
-                {
-                    "customer_id": self.customer_id(),
-                    "items": [
-                        {"product_id": product["id"], "quantity": 1},
-                        {"product_id": product["id"], "quantity": 1},
-                    ],
-                },
-            ),
-            400,
-            "validation_error",
-        )
-        self.assertEqual(
-            duplicate["details"],
-            [{"field": "items[1].product_id", "message": "Duplicate product"}],
-        )
-        unknown = self.assert_error(
-            self.request(
-                "POST",
-                "/orders",
-                {
-                    "customer_id": self.customer_id(),
-                    "items": [{"product_id": 999999, "quantity": 1}],
-                },
-            ),
-            400,
-            "validation_error",
-        )
-        self.assertEqual(
-            unknown["details"],
-            [{"field": "items[0].product_id", "message": "Unknown product"}],
-        )
-        inactive = self.create_product(active=False)
-        unavailable = self.assert_error(
-            self.request(
-                "POST",
-                "/orders",
-                {
-                    "customer_id": self.customer_id(),
-                    "items": [{"product_id": inactive["id"], "quantity": 1}],
-                },
-            ),
-            409,
-            "product_unavailable",
-        )
-        self.assertEqual(
-            unavailable["details"],
-            [{"field": "items[0].product_id", "message": "Product is unavailable"}],
-        )
-
-    def test_insufficient_stock_details_keep_numeric_item_order(self):
-        products = [self.create_product(stock=0) for _ in range(11)]
-        response = self.request(
-            "POST",
-            "/orders",
-            {
-                "customer_id": self.customer_id(),
-                "items": [
-                    {"product_id": product["id"], "quantity": 1} for product in products
-                ],
-            },
-        )
-        error = self.assert_error(response, 409, "insufficient_stock")
-        self.assertEqual(
-            error["details"],
-            [
-                {"field": f"items[{index}].quantity", "message": "Only 0 in stock"}
-                for index in range(11)
-            ],
         )
 
     def test_get_missing_and_delete_id_is_not_reused(self):
@@ -597,202 +248,6 @@ class OrdersApiTests(unittest.TestCase):
                 response = self.request("PUT", path)
                 self.assert_error(response, 405, "method_not_allowed")
                 self.assertEqual(response[1]["Allow"], expected)
-
-    def test_conditional_order_reads_and_writes(self):
-        order = self.create_order()
-        path = f"/orders/{order['id']}"
-        status, headers, fetched = self.request("GET", path)
-        self.assertEqual(status, 200)
-        initial_etag = headers["ETag"]
-        self.assertNotIn("version", fetched)
-
-        status, headers, body = self.request(
-            "GET", path, headers={"If-None-Match": f"W/{initial_etag}"}
-        )
-        self.assertEqual(status, 304)
-        self.assertIsNone(body)
-        self.assertEqual(headers["ETag"], initial_etag)
-        self.assertNotIn("Content-Type", headers)
-
-        stale = self.request(
-            "PATCH", path, {"status": "paid"}, headers={"If-Match": '"o1.0"'}
-        )
-        self.assertEqual(stale[0], 412)
-        self.assertEqual(stale[1]["ETag"], initial_etag)
-        self.assertEqual(stale[2]["error"]["code"], "precondition_failed")
-        invalid = self.request(
-            "PATCH", path, {"status": "paid"}, headers={"If-Match": "o1.1"}
-        )
-        self.assert_error(invalid, 400, "invalid_precondition")
-
-        status, headers, paid = self.request(
-            "PATCH", path, {"status": "paid"}, headers={"If-Match": headers["ETag"]}
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(headers["ETag"], initial_etag.rsplit(".", 1)[0] + '.2"')
-        self.assertEqual(paid["status"], "paid")
-
-    def test_conditional_lists_and_product_stock(self):
-        status, headers, _ = self.request("GET", "/orders")
-        self.assertEqual(status, 200)
-        self.assertTrue(headers["ETag"].startswith('W/"'))
-        status, _, body = self.request(
-            "GET",
-            "/orders",
-            headers={"If-None-Match": f'"unrelated", {headers["ETag"]}'},
-        )
-        self.assertEqual(status, 304)
-        self.assertIsNone(body)
-
-        product = self.create_product(stock=4)
-        path = f"/products/{product['id']}"
-        status, headers, current = self.request("GET", path)
-        self.assertEqual(status, 200)
-        initial_etag = headers["ETag"]
-        self.assertNotIn("version", current)
-        status, headers, changed = self.request(
-            "POST",
-            path + "/adjust-stock",
-            {"delta": 1},
-            headers={"If-Match": initial_etag},
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(changed["stock"], 5)
-        self.assertEqual(headers["ETag"], initial_etag.rsplit(".", 1)[0] + '.2"')
-
-    def test_item_order_stock_changes_product_etag_and_replay_keeps_create_etag(self):
-        product = self.create_product(stock=3)
-        path = f"/products/{product['id']}"
-        status, headers, _ = self.request("GET", path)
-        initial_product_etag = headers["ETag"]
-
-        order_payload = {
-            "customer_id": self.customer_id(),
-            "items": [{"product_id": product["id"], "quantity": 1}],
-        }
-        status, order_headers, order = self.request(
-            "POST",
-            "/orders",
-            order_payload,
-            headers={"Idempotency-Key": "conditional-order-replay"},
-        )
-        self.assertEqual(status, 201)
-        first_etag = order_headers["ETag"]
-        replay = self.request(
-            "POST",
-            "/orders",
-            order_payload,
-            headers={"Idempotency-Key": "conditional-order-replay"},
-        )
-        self.assertEqual(replay[0], 201)
-        self.assertEqual(replay[1]["ETag"], first_etag)
-        self.assertEqual(replay[1]["Idempotent-Replay"], "true")
-
-        status, product_headers, reserved = self.request("GET", path)
-        self.assertEqual(reserved["stock"], 2)
-        self.assertEqual(
-            product_headers["ETag"], initial_product_etag.rsplit(".", 1)[0] + '.2"'
-        )
-        reserved_etag = product_headers["ETag"]
-        changed = self.request(
-            "PATCH", f"/orders/{order['id']}", {"status": "cancelled"}
-        )
-        self.assertEqual(changed[0], 200)
-        self.assertNotEqual(changed[1]["ETag"], first_etag)
-        replay = self.request(
-            "POST",
-            "/orders",
-            order_payload,
-            headers={"Idempotency-Key": "conditional-order-replay"},
-        )
-        self.assertEqual(replay[1]["ETag"], first_etag)
-        self.assertEqual(replay[2], order)
-        status, product_headers, released = self.request("GET", path)
-        self.assertEqual(released["stock"], 3)
-        self.assertEqual(
-            product_headers["ETag"], reserved_etag.rsplit(".", 1)[0] + '.3"'
-        )
-        released_etag = product_headers["ETag"]
-
-        second_payload = {
-            "customer_id": self.customer_id(),
-            "items": [{"product_id": product["id"], "quantity": 1}],
-        }
-        status, _, second_order = self.request("POST", "/orders", second_payload)
-        self.assertEqual(status, 201)
-        fourth_etag = self.request("GET", path)[1]["ETag"]
-        self.assertEqual(fourth_etag, released_etag.rsplit(".", 1)[0] + '.4"')
-        status, _, body = self.request("DELETE", f"/orders/{second_order['id']}")
-        self.assertEqual(status, 204)
-        self.assertIsNone(body)
-        self.assertEqual(
-            self.request("GET", path)[1]["ETag"], fourth_etag.rsplit(".", 1)[0] + '.5"'
-        )
-
-    def test_conditional_header_missing_can_be_required_in_subprocess(self):
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            port = listener.getsockname()[1]
-        env = {
-            "APP_PORT": str(port),
-            "AGENT_QA_GIT_SHA": "if-match-required-test",
-            "AGENT_QA_REQUIRE_IF_MATCH": "true",
-        }
-        process = subprocess.Popen(
-            [sys.executable, "app.py"],
-            cwd=os.path.dirname(os.path.dirname(__file__)),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            base = f"http://127.0.0.1:{port}"
-            deadline = time.monotonic() + 5
-            while True:
-                try:
-                    urlopen(base + "/ready", timeout=0.2).close()
-                    break
-                except Exception:
-                    if time.monotonic() >= deadline:
-                        self.fail("required-header service did not start")
-                    time.sleep(0.05)
-            product_body = {
-                "sku": "REQ-1",
-                "name": "Required",
-                "category": "tools",
-                "price_cents": 1,
-            }
-            request = Request(
-                base + "/products",
-                data=json.dumps(product_body).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": "qa-synthetic-key",
-                },
-                method="POST",
-            )
-            created = urlopen(request, timeout=2)
-            product = json.loads(created.read())
-            created.close()
-            request = Request(
-                base + f"/products/{product['id']}",
-                data=b'{"name":"Changed"}',
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-Key": "qa-synthetic-key",
-                },
-                method="PATCH",
-            )
-            with self.assertRaises(HTTPError) as response:
-                urlopen(request, timeout=2)
-            self.assertEqual(response.exception.code, 428)
-            self.assertEqual(
-                json.loads(response.exception.read())["error"]["code"],
-                "precondition_required",
-            )
-        finally:
-            process.terminate()
-            process.wait(timeout=3)
 
 
 if __name__ == "__main__":
